@@ -1,0 +1,175 @@
+# --- Environnements virtuels ---
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Fichiers Python compilés ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# --- Distribution / packaging ---
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Fichiers de logs ---
+*.log
+logs/
+*.log.*
+results/logs/
+results/llm_logs/
+# --- Fichiers info---
+info.txt
+# --- Fichiers de données générés (à ne pas versionner) ---
+*.csv
+*.xlsx
+*.json
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+
+# On conserve uniquement les fichiers de données d'exemple ou de référence
+# (ex: si tu veux garder un scénario d'exemple, décommente la ligne ci-dessous)
+# !data/example_scenario.json
+
+# --- Fichiers de résultats (à ne pas versionner) ---
+results/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.html
+
+# --- Fichiers de figures (à ne pas versionner) ---
+figures/
+convergence_*.png
+comparison_*.png
+
+# --- Fichiers temporaires ---
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Notebooks Jupyter (optionnel, à versionner si essentiel) ---
+.ipynb_checkpoints/
+*.ipynb
+# !notebooks/example.ipynb
+
+# --- Fichiers d'IDE ---
+.vscode/
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+*.code-workspace
+
+# --- Fichiers de configuration sensibles ---
+.env
+*.key
+*.pem
+*.crt
+*.pub
+*.priv
+config_local.py
+secrets.py
+openai_key.txt
+ollama_config.txt
+
+# --- Fichiers de données volumineux ---
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.npz
+*.npy
+
+# --- Fichiers de sauvegarde (LLM) ---
+ollama_models/
+models/
+*.gguf
+*.bin
+
+# --- Fichiers de dumps ---
+dump.rdb
+mongodump/
+postgres_dump.sql
+
+# --- Fichiers de rapports (à ne pas versionner) ---
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.synctex.gz
+*.pdf
+*.fdb_latexmk
+*.fls
+*.xdv
+
+# --- Dossiers de données (à adapter selon tes données) ---
+data/
+!data/.gitkeep
+
+# --- Fichiers de tests ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# --- Fichiers de profilage ---
+*.prof
+*.gcda
+*.gcno
+*.gcov
+
+# --- Fichiers de dépendances (lock files) ---
+Pipfile.lock
+poetry.lock
+package-lock.json
+yarn.lock
+
+# --- Fichiers de configuration système ---
+*.bak
+*.orig
+*.rej
+*.patch
+*.diff
+
+# --- Fichiers de notes personnelles ---
+*.todo
+*.notes
+*.md~  # Backup du README
