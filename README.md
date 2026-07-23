@@ -1,85 +1,98 @@
-#  Attribution de canaux / fréquences avec BD-CeNN + LLM
+# Attribution de Canaux et de Fréquences par BD-CeNN et LLM
 
-##  Description du projet
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-Academic%20Use-grey.svg)](./LICENSE)
 
-Ce projet de mémoire (2e ICE/EN) propose un cadre complet pour l’attribution de canaux/fréquences dans les réseaux radio, en combinant :
 
-- Un **solveur d’optimisation discret BD-CeNN** (Binary Discrete Cellular Neural Network) pour minimiser les interférences.
-- Un **assistant LLM** (via Ollama) pour générer des rapports et interpréter les résultats.
+## Description du projet
 
-Le problème est modélisé comme une **coloration de graphe pondéré**, où les cellules radio sont des sommets, les interférences des arêtes, et les canaux des couleurs. Une **matrice d’interférence entre canaux** (M) est utilisée pour pénaliser à la fois les conflits co-canal et les interférences entre canaux adjacents.
+Ce projet, réalisé dans le cadre d'un mémoire de fin d'études (2e cycle ICE/EN), propose un cadre complet pour l'attribution dynamique de canaux et de fréquences dans les réseaux radio. L'approche hybride combine :
 
-##  Architecture du projet
+- Un **solveur d'optimisation discret BD-CeNN** (Binary Discrete Cellular Neural Network) dédié à la minimisation des interférences.
+- Un **assistant basé sur un modèle de langage (LLM)**  pour l'analyse contextuelle des résultats et la génération de rapports interprétatifs.
+
+Le problème d'attribution est modélisé comme une **coloration de graphe pondéré**. Les cellules radio sont représentées par des sommets, les interférences par des arêtes, et les canaux par des couleurs. Une **matrice d'interférence entre canaux (M)** est intégrée pour pénaliser simultanément les conflits co-canal et les interférences entre canaux adjacents.
+
+## Fonctionnalités principales
+
+- Génération automatisée des scénarios de réseaux radio.
+- Implémentation et comparaison d'algorithmes de référence (Random, Greedy, DSATUR) adaptés à la matrice d'interférence.
+- Résolution optimisée via l'architecture BD-CeNN.
+- Campagne de validation statistique robuste (30 exécutions par scénario).
+- Analyse post-traitement et génération de rapports automatisés via un LLM.
+- Visualisation complète des métriques (coût global, conflits spectraux, canaux utilisés, temps de calcul).
+
+## Architecture du projet
+
+```text
 BD_CeNN_LLM/
 │
 ├── config.py                      # Configuration centrale (chemins, seeds, paramètres globaux)
 ├── data_generator.py              # Génération des 50 scénarios (S1 à S50)
-├── visualize_scenarios.py         # Visualisation des graphes et matrices W (exploration)
-├── baselines.py                   # Random, Greedy, DSATUR (avec matrice M)
-├── bdcenn_solver.py               # Solveur BD-CeNN
-├── metrics.py                     # Métriques : coût, conflits, canaux, conflits spectraux
-├── validation.py                  # Campagne de validation (30 runs × 50 scénarios)
-├── plots.py                       # Génération du rapport final (figures, tables, heatmap)
-├── llm_assistant.py               # Assistant LLM (analyse d’un scénario via Ollama)
-├── main.py                        # Point d’entrée (orchestre tout)
-├── requirements.txt               # Dépendances Python
+├── visualize_scenarios.py         # Visualisation des graphes et matrices d'interférence (W)
+├── baselines.py                   # Implémentation des heuristiques : Random, Greedy, DSATUR
+├── bdcenn_solver.py               # Cœur du solveur BD-CeNN
+├── metrics.py                     # Calcul des métriques : coût, conflits, canaux utilisés
+├── validation.py                  # Orchestration de la campagne de validation (30 runs x 50 scénarios)
+├── plots.py                       # Génération des figures, tableaux et heatmaps du rapport final
+├── llm_assistant.py               # Interface avec le LLM local (Ollama) pour l'analyse des scénarios
+├── main.py                        # Point d'entrée principal (orchestration du pipeline complet)
+├── requirements.txt               # Dépendances Python requises
 ├── README.md                      # Documentation du projet
 │
-├── data/                          # Scénarios générés (JSON)
-│   └── scenarios_data.json
+├── data/                          # Données d'entrée générées
+│   └── scenarios_data.json        # Fichier JSON contenant les 50 scénarios
 │
-└── results/                       # Tous les résultats produits
+└── results/                       # Répertoire de sortie (généré à l'exécution)
     ├── excel/
-    │   └── validation_results.xlsx          # Résultats bruts + résumé (30 runs)
+    │   └── validation_results.xlsx          # Résultats bruts et résumé statistique
     ├── csv/
-    │   ├── comparison_full_table.csv        # Résumé des métriques
-    │   └── validation_summary_table.csv     # Moyennes et écarts-types
-    ├── figures/
-    │   ├── comparison_global_cost.png
-    │   ├── comparison_spectrum_conflicts.png
-    │   ├── comparison_used_channels.png
-    │   ├── comparison_time.png
-    │   ├── comparison_ranking.png
-    │   ├── convergence_S1.png
-    │   ├── convergence_S2.png
-    │   └── ... (S50)
-    ├── logs/                                # Logs d’exécution système
-    │   └── experiment_log_*.txt
-    └── llm_logs/                            # Logs des analyses LLM
-        └── llm_analysis_*.txt
+    │   ├── comparison_full_table.csv        # Tableau comparatif complet des métriques
+    │   └── validation_summary_table.csv     # Moyennes et écarts-types par algorithme
+    ├── figures/                             # Visualisations graphiques (comparaisons, convergences)
+    ├── logs/                                # Journaux d'exécution système
+    └── llm_logs/                            # Journaux des analyses générées par le LLM
+```
 
-
-
-## Installation et dépendances
+## Prérequis et installation
 
 ### 1. Cloner le dépôt
-
+```bash
 git clone https://github.com/Nelson-Ngombo/Attribution_canaux-frequences_avec_BDCeNN_LLM.git
-cd BD_CeNN_LLM
+cd Attribution_canaux-frequences_avec_BDCeNN_LLM
+```
 
 ### 2.  Créer et activer un environnement virtuel
+```bash
 python -m venv venv
 source venv/bin/activate   # Linux/Mac
 .\venv\Scripts\activate    # Windows
-
+```
 
 ### 3.  Installer les dépendances
-
+```bash
 pip install -r requirements.txt
-
+```
 
 ### 4.  Exécution principale
-
+Le pipeline est conçu pour être exécuté de manière séquentielle. Exécutez les commandes suivantes dans l'ordre :
+```bash
 python data_generator.py
 
 python visualize_scenarios.py
 
 python main.py
-
+```
 ## Auteur
 Nelson N. – 2e ICE/EN
-Encadrement : Prof. Kyandoghere Kyamakya, Ass. Ir. Bisuta, Ir.Gédeon Nkishi, Ir.Exaucé Maruba
-Bastion-Lab
+
+Encadreur principal : Prof. Kyandoghere Kyamakya
+
+Co-encadreur: Ass. Ir. Bisuta, Ir.Gédeon Nkishi, Ir.Exaucé Maruba
+
+Laboratoire d'attache:Bastion-Lab
 
 ## Licence : 
-Ce projet est réalisé dans le cadre d’un mémoire universitaire. Toute réutilisation doit citer l’auteur et le superviseur.
+Ce projet est réalisé dans le cadre d'un travail de mémoire universitaire. Le code source est fourni à des fins de recherche et d'évaluation académique.
+Toute réutilisation, modification ou citation de ce travail doit impérativement mentionner l'auteur et les superviseurs académiques cités ci-dessus.
+Pour toute question ou collaboration, veuillez contacter l'auteur via le dépôt GitHub.
