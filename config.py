@@ -26,7 +26,8 @@ FULL_TABLE_CSV_FILE = CSV_DIR / "comparison_full_table.csv"
 # --- 5. Paramètres généraux ---
 SEED_BASE = 42
 NUM_RUNS = 30
-MAX_ITER_BD = 10
+MAX_ITER_BD = 50          # Nombre d'itérations maximales par lancement
+NUM_RESTARTS = 10         # Nombre de redémarrages pour le BD-CeNN
 
 # --- 6. Fonction pour créer les dossiers ---
 def ensure_dirs():
@@ -61,3 +62,7 @@ def build_scenarios():
     return scenarios
 
 SCENARIOS = build_scenarios()
+
+
+
+

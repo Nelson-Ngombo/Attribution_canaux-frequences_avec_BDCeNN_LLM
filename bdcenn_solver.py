@@ -3,27 +3,9 @@ import numpy as np
 import time
 from metrics import compute_cost, count_conflicts, compute_spectrum_energy
 
-def bdcenn_allocation(N, K, W, M=None, max_iter=200, random_order=True, seed=None, verbose=False,
-                      use_sa=False, T_init=10.0, T_min=0.01, cooling_rate=0.99):
+def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=None, verbose=False):
     """
-    Solveur BD-CeNN discret (asynchrone) avec option de recuit simulé.
-  
-    Solveur BD-CeNN pour l'attribution de canaux (version ASYNCHRONE).
-    - N : nombre de cellules
-    - K : nombre de canaux (0 à K-1)
-    - W : matrice d'interférence (N x N)
-    - M : matrice d'interférence entre canaux (K x K),
-    - max_iter : nombre maximal d'itérations
-    - random_order : si True, on mélange l'ordre des cellules à chaque itération
-    - seed : pour la reproductibilité de l'initialisation aléatoire
-    - verbose : si True, affiche la progression dans le terminal
-    - use_sa : si True, active le recuit simulé (acceptation des augmentations temporaires)
-    - T_init : température initiale
-    - T_min : température minimale (arrêt si T < T_min)
-    - cooling_rate : facteur de refroidissement (ex: 0.99)
-    Retourne : (x_final, history, time_elapsed, conflicts)
-        - history : liste de tuples (itération, coût, allocation_complète)
-    
+    Une seule exécution du BD-CeNN (asynchrone, sans recuit).
     """
     if seed is not None:
         np.random.seed(seed)
@@ -41,11 +23,9 @@ def bdcenn_allocation(N, K, W, M=None, max_iter=200, random_order=True, seed=Non
         print(f"  [BD-CeNN] Init : coût = {best_cost}")
     
     start_time = time.perf_counter()
-    T = T_init
-
+    
     for iteration in range(max_iter):
         order = np.random.permutation(N) if random_order else np.arange(N)
-        x_old = x.copy()  # pour le recuit (comparaison des coûts locaux)
         
         for i in order:
             current_channel = x[i]
@@ -66,25 +46,7 @@ def bdcenn_allocation(N, K, W, M=None, max_iter=200, random_order=True, seed=Non
                     best_local_channel = c
             
             if best_local_channel != current_channel:
-                if use_sa:
-                    # Calcul du coût local actuel
-                    current_local_cost = 0
-                    for j in range(N):
-                        if W[i][j] > 0:
-                            if M is not None:
-                                current_local_cost += W[i][j] * M[current_channel][x[j]]
-                            else:
-                                if x[j] == current_channel:
-                                    current_local_cost += W[i][j]
-                    delta = best_local_cost - current_local_cost  # > 0 = augmentation
-                    if delta < 0:
-                        x[i] = best_local_channel
-                    else:
-                        proba = np.exp(-delta / T) if T > 0 else 0.0
-                        if np.random.random() < proba:
-                            x[i] = best_local_channel
-                else:
-                    x[i] = best_local_channel
+                x[i] = best_local_channel
         
         if M is not None:
             current_cost = compute_spectrum_energy(x, W, M)
@@ -96,18 +58,9 @@ def bdcenn_allocation(N, K, W, M=None, max_iter=200, random_order=True, seed=Non
             best_x = x.copy()
         
         history.append((iteration + 1, current_cost, x.copy()))
-        if verbose and (iteration % 10 == 0 or iteration == max_iter - 1):
-            if use_sa:
-                print(f"  [BD-CeNN] Itération {iteration+1}/{max_iter} : coût = {current_cost}, T = {T:.4f}")
-            else:
-                print(f"  [BD-CeNN] Itération {iteration+1}/{max_iter} : coût = {current_cost}")
         
-        if use_sa:
-            T *= cooling_rate
-            if T < T_min:
-                if verbose:
-                    print(f"  [BD-CeNN] Température minimale atteinte, arrêt.")
-                break
+        if verbose and (iteration % 10 == 0 or iteration == max_iter - 1):
+            print(f"  [BD-CeNN] Itération {iteration+1}/{max_iter} : coût = {current_cost}")
         
         if current_cost == 0:
             if verbose:
@@ -123,3 +76,42 @@ def bdcenn_allocation(N, K, W, M=None, max_iter=200, random_order=True, seed=Non
     elapsed = time.perf_counter() - start_time
     conflicts = count_conflicts(best_x, W)
     return best_x, history, elapsed, conflicts
+
+
+def bdcenn_allocation(N, K, W, M=None, num_restarts=10, max_iter=50, random_order=True, seed=None, verbose=False):
+    """
+    Solveur BD-CeNN avec redémarrages multiples :
+    exécute le solveur `num_restarts` fois avec des initialisations aléatoires différentes,
+    et retourne la meilleure solution (coût minimal).
+    """
+    if seed is None:
+        seed = 42
+    
+    best_x = None
+    best_cost = float('inf')
+    best_history = None
+    best_time = 0.0
+    best_conflicts = 0
+    
+    for i in range(num_restarts):
+        seed_i = seed + i
+        x, hist, elapsed, conf = _bdcenn_single_run(
+            N, K, W, M=M,
+            max_iter=max_iter,
+            random_order=random_order,
+            seed=seed_i,
+            verbose=verbose if i == 0 else False  # verbose seulement pour le premier
+        )
+        # Calcul du coût final
+        if M is not None:
+            cost = compute_spectrum_energy(x, W, M)
+        else:
+            cost = compute_cost(x, W)
+        if cost < best_cost:
+            best_cost = cost
+            best_x = x
+            best_history = hist
+            best_time = elapsed
+            best_conflicts = conf
+    
+    return best_x, best_history, best_time, best_conflicts

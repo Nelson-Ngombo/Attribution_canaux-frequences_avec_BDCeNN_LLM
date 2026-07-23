@@ -5,45 +5,28 @@ import numpy as np
 import os
 import validation
 import config
-from metrics import create_channel_interference_matrix 
 
 def generate_full_experiment_plots():
-    """
-    Génère le rapport final à partir des résultats de validation (30 runs).
-    - Si validation_results.xlsx n'existe pas, lance la validation.
-    - Produit les histogrammes comparatifs avec barres d'erreur :
-        * Coût global
-        * Conflits spectraux
-        * Canaux utilisés
-        * Temps d'exécution (en secondes)
-    - Produit la heatmap de classement.
-    - Sauvegarde les courbes de convergence (sans les afficher).
-    - Exporte le tableau récapitulatif en CSV.
-    """
     print("="*80)
     print("📊 GÉNÉRATION DU RAPPORT FINAL")
     print("="*80)
 
-    # --- Utiliser les chemins de config ---
     excel_file = config.VALIDATION_EXCEL_FILE
     convergence_file = config.CONVERGENCE_HISTORY_FILE
     figures_dir = config.FIGURES_DIR
     summary_csv = config.SUMMARY_CSV_FILE
 
-    # --- 1. Lancer la validation si le fichier Excel n'existe pas ---
     if not os.path.exists(excel_file):
         print("🔁 Fichier validation_results.xlsx introuvable. Lancement de la validation (30 runs)...")
         validation.run_validation()
     else:
         print("✅ Fichier validation_results.xlsx trouvé.")
 
-    # --- 2. Lire le résumé ---
     df_summary = pd.read_excel(excel_file, sheet_name="Summary")
     scenarios = df_summary['scenario'].unique()
     methods = ['Random', 'Greedy', 'DSATUR', 'BD-CeNN']
     colors = ['royalblue', 'forestgreen', 'darkorange', 'firebrick']
 
-    # --- 3. Graphiques comparatifs (avec barres d'erreur) ---
     metrics_list = [
         ('global_cost', 'Coût global'),
         ('spectrum_conflicts', 'Conflits spectraux'),
@@ -91,7 +74,7 @@ def generate_full_experiment_plots():
         plt.savefig(figures_dir / filename, dpi=300)
         plt.show()
 
-    # --- 4. Heatmap de classement (basée sur global_cost) ---
+    # Heatmap
     metric = 'global_cost'
     mean_cols = [f"{m}_{metric}_mean" for m in methods]
     if all(col in df_summary.columns for col in mean_cols):
@@ -100,7 +83,7 @@ def generate_full_experiment_plots():
         ranks.index = df_summary['scenario']
 
         fig, ax = plt.subplots(figsize=(14, 10))
-        im = ax.imshow(ranks.values, cmap='RdYlGn_r', aspect='auto', vmin=1, vmax=4)
+        im = ax.imshow(ranks.values, cmap='RdYlGn_r', aspect='auto', vmin=1, vmax=len(methods))
         ax.set_xticks(np.arange(len(methods)))
         ax.set_yticks(np.arange(len(ranks.index)))
         ax.set_xticklabels(methods, fontweight='bold')
@@ -115,17 +98,16 @@ def generate_full_experiment_plots():
         ax.set_xlabel("Méthode", fontsize=12)
         ax.set_ylabel("Scénario", fontsize=12)
         ax.set_title("Classement des méthodes par scénario (1 = meilleur coût global)", fontsize=14)
-        cbar = ax.figure.colorbar(im, ax=ax, shrink=0.6, ticks=[1, 2, 3, 4])
-        cbar.set_label('Rang (1 = meilleur, 4 = moins bon)', fontsize=10)
+        cbar = ax.figure.colorbar(im, ax=ax, shrink=0.6, ticks=np.arange(1, len(methods)+1))
+        cbar.set_label('Rang', fontsize=10)
         plt.tight_layout()
         plt.savefig(figures_dir / "comparison_ranking.png", dpi=300)
         plt.show()
 
-    # --- 5. Courbes de convergence (SAUVEGARDE UNIQUEMENT) ---
+    # Courbes de convergence
     if os.path.exists(convergence_file):
         df_hist = pd.read_csv(convergence_file)
         scenarios_hist = df_hist['scenario'].unique()
-
         scenario_info = {}
         for idx, row in df_summary.iterrows():
             scenario_info[row['scenario']] = {
@@ -133,14 +115,12 @@ def generate_full_experiment_plots():
                 'K': row['K'],
                 'seed_scenario': row['seed_scenario']
             }
-
         for scenario in scenarios_hist:
             df_scenario = df_hist[df_hist['scenario'] == scenario].sort_values('iteration')
             info = scenario_info.get(scenario, {})
             N = info.get('N', '?')
             K = info.get('K', '?')
             seed_scenario = info.get('seed_scenario', '?')
-
             fig = plt.figure(figsize=(10, 6))
             plt.plot(df_scenario['iteration'], df_scenario['global_cost'],
                      marker='o', linestyle='-', markersize=4, color='red')
@@ -151,16 +131,13 @@ def generate_full_experiment_plots():
             plt.tight_layout()
             plt.savefig(figures_dir / f"convergence_{scenario}.png", dpi=300)
             plt.close(fig)
-
         print("✅ Courbes de convergence sauvegardées (convergence_*.png) sans affichage.")
     else:
-        print("⚠️ Fichier convergence_history.csv introuvable. Pas de courbes de convergence.")
+        print("⚠️ Fichier convergence_history.csv introuvable.")
 
-    # --- 6. Exporter le tableau récapitulatif en CSV ---
     df_summary.to_csv(summary_csv, index=False)
     print(f"✅ Tableau récapitulatif : {summary_csv}")
 
-    # --- 7. Log d'exécution ---
     import datetime
     log_file = config.LOGS_DIR / f"report_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(log_file, "w", encoding="utf-8") as f:
