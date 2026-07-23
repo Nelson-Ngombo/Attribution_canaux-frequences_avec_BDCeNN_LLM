@@ -28,20 +28,20 @@ Le problème d'attribution est modélisé comme une **coloration de graphe pond�
 BD_CeNN_LLM/
 │
 ├── config.py                      # Configuration centrale (chemins, seeds, paramètres globaux)
-├── data_generator.py              # Génération des 50 scénarios (S1 à S50)
+├── data_generator.py              # Génération des scénarios
 ├── visualize_scenarios.py         # Visualisation des graphes et matrices d'interférence (W)
 ├── baselines.py                   # Implémentation des heuristiques : Random, Greedy, DSATUR
 ├── bdcenn_solver.py               # Cœur du solveur BD-CeNN
 ├── metrics.py                     # Calcul des métriques : coût, conflits, canaux utilisés
 ├── validation.py                  # Orchestration de la campagne de validation (30 runs x 50 scénarios)
 ├── plots.py                       # Génération des figures, tableaux et heatmaps du rapport final
-├── llm_assistant.py               # Interface avec le LLM local (Ollama) pour l'analyse des scénarios
+├── llm_assistant.py               # Interface avec le LLM  pour l'analyse des scénarios
 ├── main.py                        # Point d'entrée principal (orchestration du pipeline complet)
 ├── requirements.txt               # Dépendances Python requises
 ├── README.md                      # Documentation du projet
 │
 ├── data/                          # Données d'entrée générées
-│   └── scenarios_data.json        # Fichier JSON contenant les 50 scénarios
+│   └── scenarios_data.json        # Fichier JSON contenant les scénarios
 │
 └── results/                       # Répertoire de sortie (généré à l'exécution)
     ├── excel/
