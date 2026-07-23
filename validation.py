@@ -6,11 +6,10 @@ import os
 import csv
 from datetime import datetime
 from data_generator import all_data
-from baselines import greedy_allocation, dsatur_allocation, create_channel_interference_matrix
+from baselines import greedy_allocation, dsatur_allocation
 from bdcenn_solver import bdcenn_allocation
-from bdcenn_spectrum import compute_spectrum_energy
-from metrics import compute_metrics, count_spectrum_conflicts
-import config  # <-- IMPORT
+from metrics import compute_metrics, create_channel_interference_matrix, compute_spectrum_energy, count_spectrum_conflicts
+import config
 
 def run_validation():
     print("="*80)

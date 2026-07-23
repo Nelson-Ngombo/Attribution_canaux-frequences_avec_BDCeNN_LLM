@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import validation
-import config  # <-- IMPORT
+import config
+from metrics import create_channel_interference_matrix 
 
 def generate_full_experiment_plots():
     """

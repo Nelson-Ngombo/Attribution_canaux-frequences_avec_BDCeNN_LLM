@@ -3,24 +3,19 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 from data_generator import all_data
-from bdcenn_spectrum import create_channel_interference_matrix
+from metrics import create_channel_interference_matrix  
 import config
 from matplotlib.patches import Patch
 import os
 
-# On crée le dossier figures s'il n'existe pas
 fig_dir = config.FIGURES_DIR
 os.makedirs(fig_dir, exist_ok=True)
 
-# --- 1. Générer la matrice d'interférence entre canaux M (une seule fois pour K=8) ---
-# On prend K=8 comme cas représentatif
+# --- 1. Matrice M (K=8) une seule fois ---
 K_M = 8
 M = create_channel_interference_matrix(K_M, decay=0.5, cutoff=2)
-# On arrondit pour avoir des valeurs visibles (0, 0.5, 1) mais on garde les labels des axes en entiers
 plt.figure(figsize=(6, 5))
 im = plt.imshow(M, cmap='Blues', interpolation='nearest', vmin=0, vmax=1)
-
-# Ajouter les valeurs dans les cases (avec 1 décimale pour 0.5)
 for i in range(K_M):
     for j in range(K_M):
         val = M[i, j]
@@ -28,22 +23,18 @@ for i in range(K_M):
         plt.text(j, i, label, ha='center', va='center',
                  color='black' if val <= 0.5 else 'white',
                  fontsize=9, fontweight='bold')
-
 plt.colorbar(im, label="Interférence entre canaux", shrink=0.8)
 plt.title(f"Matrice d'interférence entre canaux M (K={K_M})", fontsize=14, fontweight='bold')
 plt.xlabel("Canal j", fontsize=12)
 plt.ylabel("Canal i", fontsize=12)
-
-# --- FORCER LES ÉTIQUETTES DES AXES EN ENTIERS ---
 plt.xticks(np.arange(K_M), labels=[str(i) for i in range(K_M)])
 plt.yticks(np.arange(K_M), labels=[str(i) for i in range(K_M)])
-
 plt.tight_layout()
 plt.savefig(fig_dir / "matrix_M.png", dpi=300)
 plt.close()
 print(f"✅ Matrice M sauvegardée dans {fig_dir / 'matrix_M.png'}")
 
-# --- 2. Générer les graphes et matrices W pour chaque scénario ---
+# --- 2. Graphes et matrices W pour chaque scénario (7) ---
 for name, data in all_data.items():
     N = data["N"]
     K = data["K"]
@@ -52,7 +43,7 @@ for name, data in all_data.items():
     positions = data["positions"]
     pos_dict = {i: tuple(positions[i]) for i in range(N)}
     
-    # ---------- A. Graphe d'interférence ----------
+    # A. Graphe
     plt.figure(figsize=(10, 8))
     node_size = 300 if N <= 15 else 100 if N <= 30 else 60
     nx.draw_networkx_nodes(G, pos_dict, node_size=node_size,
@@ -81,7 +72,7 @@ for name, data in all_data.items():
     plt.close()
     print(f"   - Graphe {name} sauvegardé.")
 
-    # ---------- B. Matrice d'interférence W ----------
+    # B. Matrice W
     plt.figure(figsize=(8, 6))
     W = np.array(data["W"])
     im = plt.imshow(W, cmap='Reds', interpolation='nearest', vmin=0, vmax=4)
@@ -92,7 +83,7 @@ for name, data in all_data.items():
                     plt.text(j, i, int(W[i, j]), ha='center', va='center',
                              color='black', fontsize=9, fontweight='bold')
     plt.colorbar(im, label="Niveau d'interférence", shrink=0.8)
-    plt.title(f"Scénario {name} - Matrice d'interférence W (N={N}, seed={seed})", fontsize=14, fontweight='bold')
+    plt.title(f"Scénario {name} - Matrice W (N={N}, seed={seed})", fontsize=14, fontweight='bold')
     plt.xlabel("Cellule j")
     plt.ylabel("Cellule i")
     plt.tight_layout()
@@ -100,4 +91,4 @@ for name, data in all_data.items():
     plt.close()
     print(f"   - Matrice W {name} sauvegardée.")
 
-print(f"\n✅ Visualisation terminée. Toutes les figures sont dans {fig_dir}")
+print(f"\n✅ Visualisation terminée. Figures dans {fig_dir}")
