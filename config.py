@@ -51,7 +51,7 @@ def build_scenarios():
     S7 - Réseau dynamique (N=50, K=4, threshold 35) - à utiliser pour E8
     """
     scenarios = {
-        "S1": {"N": 8, "K": 3, "area": 50, "threshold": 30},      # Petit graphe visuel
+        "S1": {"N": 8, "K": 3, "area": 100, "threshold": 30},      # Petit graphe visuel à faible densité
         "S2": {"N": 30, "K": 4, "area": 150, "threshold": 35},     # Réseau moyen
         "S3": {"N": 50, "K": 6, "area": 200, "threshold": 60},     # Réseau dense
         "S4": {"N": 50, "K": 2, "area": 200, "threshold": 40},     # Peu de canaux
