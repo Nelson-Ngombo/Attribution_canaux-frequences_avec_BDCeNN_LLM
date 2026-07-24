@@ -29,7 +29,10 @@ NUM_RUNS = 30
 MAX_ITER_BD = 50          # Nombre d'itérations maximales par lancement
 NUM_RESTARTS = 10         # Nombre de redémarrages pour le BD-CeNN
 
-# --- 6. Fonction pour créer les dossiers ---
+# --- 6. Pour l'expérience E9 (effet du nombre de redémarrages) ---
+RESTART_EXPERIMENT_VALUES = [1, 5, 10, 20]  # Nombres de redémarrages à tester
+
+# --- 7. Fonction pour créer les dossiers ---
 def ensure_dirs():
     """Crée tous les dossiers nécessaires s'ils n'existent pas."""
     dirs = [DATA_DIR, RESULTS_DIR, EXCEL_DIR, CSV_DIR, FIGURES_DIR, LOGS_DIR, LLM_LOGS_DIR]
@@ -38,7 +41,7 @@ def ensure_dirs():
 
 ensure_dirs()
 
-# --- 7. Scénarios selon le guide pratique (§4.2) ---
+# --- 8. Scénarios selon le guide pratique (§4.2) ---
 def build_scenarios():
     """
     7 familles de scénarios conformes au guide pratique :

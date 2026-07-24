@@ -27,6 +27,7 @@ def generate_full_experiment_plots():
     methods = ['Random', 'Greedy', 'DSATUR', 'BD-CeNN']
     colors = ['royalblue', 'forestgreen', 'darkorange', 'firebrick']
 
+    # ---------- 1. Graphiques comparatifs (inchangés) ----------
     metrics_list = [
         ('global_cost', 'Coût global'),
         ('spectrum_conflicts', 'Conflits spectraux'),
@@ -74,7 +75,7 @@ def generate_full_experiment_plots():
         plt.savefig(figures_dir / filename, dpi=300)
         plt.show()
 
-    # Heatmap
+    # ---------- 2. Heatmap de classement (inchangée) ----------
     metric = 'global_cost'
     mean_cols = [f"{m}_{metric}_mean" for m in methods]
     if all(col in df_summary.columns for col in mean_cols):
@@ -104,7 +105,7 @@ def generate_full_experiment_plots():
         plt.savefig(figures_dir / "comparison_ranking.png", dpi=300)
         plt.show()
 
-    # Courbes de convergence
+    # ---------- 3. Courbe de convergence MOYENNE avec zone d'écart-type (UNIQUEMENT) ----------
     if os.path.exists(convergence_file):
         df_hist = pd.read_csv(convergence_file)
         scenarios_hist = df_hist['scenario'].unique()
@@ -115,29 +116,54 @@ def generate_full_experiment_plots():
                 'K': row['K'],
                 'seed_scenario': row['seed_scenario']
             }
+
         for scenario in scenarios_hist:
-            df_scenario = df_hist[df_hist['scenario'] == scenario].sort_values('iteration')
+            df_scenario = df_hist[df_hist['scenario'] == scenario]
+            
+            # Grouper par itération et calculer moyenne et écart-type
+            grouped = df_scenario.groupby('iteration').agg({
+                'global_cost': ['mean', 'std']
+            }).reset_index()
+            grouped.columns = ['iteration', 'mean', 'std']
+            
+            # Récupérer les infos du scénario
             info = scenario_info.get(scenario, {})
             N = info.get('N', '?')
             K = info.get('K', '?')
             seed_scenario = info.get('seed_scenario', '?')
-            fig = plt.figure(figsize=(10, 6))
-            plt.plot(df_scenario['iteration'], df_scenario['global_cost'],
-                     marker='o', linestyle='-', markersize=4, color='red')
-            plt.xlabel("Itérations")
-            plt.ylabel("Coût global")
-            plt.title(f"Évolution du coût global - {scenario} (N={N}, K={K}, seed_scénario={seed_scenario}, seed_init=1)")
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(figures_dir / f"convergence_{scenario}.png", dpi=300)
-            plt.close(fig)
-        print("✅ Courbes de convergence sauvegardées (convergence_*.png) sans affichage.")
-    else:
-        print("⚠️ Fichier convergence_history.csv introuvable.")
 
+            # Tracer la courbe avec zone d'écart-type
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Ligne de moyenne
+            ax.plot(grouped['iteration'], grouped['mean'], 
+                    marker='o', linestyle='-', markersize=3, color='red', linewidth=1.5,
+                    label='Moyenne du coût global')
+            
+            # Zone d'écart-type (shaded area)
+            ax.fill_between(grouped['iteration'], 
+                            grouped['mean'] - grouped['std'], 
+                            grouped['mean'] + grouped['std'],
+                            alpha=0.25, color='red', label='Écart-type (±1σ)')
+            
+            ax.set_xlabel("Itérations")
+            ax.set_ylabel("Coût global")
+            ax.set_title(f"Convergence BD-CeNN - {scenario} (N={N}, K={K}, seed_scénario={seed_scenario})\nMoyenne sur {config.NUM_RUNS} runs")
+            ax.grid(True, linestyle='--', alpha=0.6)
+            ax.legend()
+            plt.tight_layout()
+            plt.savefig(figures_dir / f"convergence_mean_{scenario}.png", dpi=300)
+            plt.close(fig)
+            
+        print("✅ Courbes de convergence moyennes avec zone d'écart-type sauvegardées (convergence_mean_*.png) sans affichage.")
+    else:
+        print("⚠️ Fichier convergence_history.csv introuvable. Pas de courbes de convergence.")
+
+    # ---------- 4. Exporter le tableau récapitulatif ----------
     df_summary.to_csv(summary_csv, index=False)
     print(f"✅ Tableau récapitulatif : {summary_csv}")
 
+    # ---------- 5. Log d'exécution ----------
     import datetime
     log_file = config.LOGS_DIR / f"report_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(log_file, "w", encoding="utf-8") as f:
