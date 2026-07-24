@@ -32,6 +32,7 @@ BD_CeNN_LLM/
 ├── visualize_scenarios.py         # Visualisation des graphes et matrices d'interférence (W)
 ├── baselines.py                   # Implémentation des heuristiques : Random, Greedy, DSATUR
 ├── bdcenn_solver.py               # Cœur du solveur BD-CeNN
+├── experiments.py                 # Expériences à réaliser pour produire les résultats du mémoire
 ├── metrics.py                     # Calcul des métriques : coût, conflits, canaux utilisés
 ├── validation.py                  # Orchestration de la campagne de validation (30 runs x 50 scénarios)
 ├── plots.py                       # Génération des figures, tableaux et heatmaps du rapport final
@@ -39,17 +40,25 @@ BD_CeNN_LLM/
 ├── main.py                        # Point d'entrée principal (orchestration du pipeline complet)
 ├── requirements.txt               # Dépendances Python requises
 ├── README.md                      # Documentation du projet
+├──.gitignore                      # fichiers à ignorer 
 │
+├── dashboard/                     #Démonstrateur final 
+│   └── app.py
 ├── data/                          # Données d'entrée générées
 │   └── scenarios_data.json        # Fichier JSON contenant les scénarios
 │
-└── results/                       # Répertoire de sortie (généré à l'exécution)
+│
+│
+
+│
+│
+│── results/                       # Répertoire de sortie (généré à l'exécution)
     ├── excel/
     │   └── validation_results.xlsx          # Résultats bruts et résumé statistique
     ├── csv/
     │   ├── comparison_full_table.csv        # Tableau comparatif complet des métriques
     │   └── validation_summary_table.csv     # Moyennes et écarts-types par algorithme
-    ├── figures/                             # Visualisations graphiques (comparaisons, convergences)
+    ├── figures/                             # Visualisations graphiques 
     ├── logs/                                # Journaux d'exécution système
     └── llm_logs/                            # Journaux des analyses générées par le LLM
 ```
