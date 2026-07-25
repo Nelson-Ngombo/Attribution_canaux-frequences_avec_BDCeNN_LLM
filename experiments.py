@@ -31,18 +31,27 @@ os.makedirs(config.FIGURES_DIR, exist_ok=True)
 def run_experiment_E1():
     """
     E1 - Vérification visuelle
-    Vérifie que la chaîne fonctionne sur un cas contrôlable (S1).
-    Affiche l'affectation des canaux pour Random, Greedy, DSATUR, BD-CeNN.
+    Produit les sorties obligatoires :
+        - Graphe avant (Random) en une image
+        - Graphe après (BD-CeNN) en une image séparée
+        - Table cellule-canal
+        - Coût et conflits pour chaque méthode
     """
     print("\n" + "="*60)
     print("🔬 E1 - VÉRIFICATION VISUELLE (Petit graphe)")
     print("="*60)
+    
+    import networkx as nx
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
     
     scenario_name = "S1"
     data = all_data[scenario_name]
     N = data["N"]
     K = data["K"]
     W = np.array(data["W"])
+    positions = data["positions"]
+    G = data["graph"]
     M = create_channel_interference_matrix(K)
     seed = config.SEED_BASE
     
@@ -70,14 +79,14 @@ def run_experiment_E1():
     cost_bd = compute_spectrum_energy(x_bd, W, M)
     conflicts_bd = count_spectrum_conflicts(x_bd, W, M)
     
-    # Affichage des résultats
+    # --- Affichage des résultats ---
     print("\n--- ALLOCATIONS FINALES ---")
     print(f"Random   : x = {x_rand.tolist()}  | Coût = {cost_rand:.1f}  | Conflits = {conflicts_rand}")
     print(f"Greedy   : x = {x_greedy.tolist()}  | Coût = {cost_greedy:.1f}  | Conflits = {conflicts_greedy}")
     print(f"DSATUR   : x = {x_dsatur.tolist()}  | Coût = {cost_dsatur:.1f}  | Conflits = {conflicts_dsatur}")
     print(f"BD-CeNN  : x = {x_bd.tolist()}  | Coût = {cost_bd:.1f}  | Conflits = {conflicts_bd}")
     
-    # Sauvegarde des résultats
+    # --- Table cellule-canal ---
     df = pd.DataFrame({
         "Méthode": ["Random", "Greedy", "DSATUR", "BD-CeNN"],
         "Allocation": [x_rand.tolist(), x_greedy.tolist(), x_dsatur.tolist(), x_bd.tolist()],
@@ -85,7 +94,44 @@ def run_experiment_E1():
         "Conflits": [conflicts_rand, conflicts_greedy, conflicts_dsatur, conflicts_bd]
     })
     df.to_csv(config.CSV_DIR / "E1_visual_check.csv", index=False)
-    print(f"\n✅ Résultats sauvegardés dans {config.CSV_DIR / 'E1_visual_check.csv'}")
+    print(f"\n✅ Table des allocations sauvegardée dans {config.CSV_DIR / 'E1_visual_check.csv'}")
+    
+    # --- Palette de couleurs pour les canaux ---
+    channel_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    colors = {c: channel_colors[c % len(channel_colors)] for c in range(K)}
+    pos_dict = {i: tuple(positions[i]) for i in range(N)}
+    
+    # Fonction utilitaire pour dessiner un graphe
+    def draw_graph(ax, x, title):
+        node_colors = [colors[c] for c in x]
+        nx.draw_networkx_nodes(G, pos_dict, ax=ax, node_color=node_colors, node_size=500, edgecolors='black', linewidths=1)
+        nx.draw_networkx_edges(G, pos_dict, ax=ax, edge_color='gray', width=2)
+        nx.draw_networkx_labels(G, pos_dict, ax=ax, font_size=10, font_weight='bold')
+        ax.set_title(title, fontsize=12)
+        ax.axis('off')
+    
+    # --- Figure 1 : Random (avant) ---
+    fig1, ax1 = plt.subplots(figsize=(8, 6))
+    draw_graph(ax1, x_rand, f"Random (coût = {cost_rand:.1f}, conflits = {conflicts_rand})")
+    legend_elements = [Patch(facecolor=colors[c], edgecolor='black', label=f'Canal {c}') for c in range(K)]
+    fig1.legend(handles=legend_elements, loc='lower center', ncol=K, fontsize=10, bbox_to_anchor=(0.5, -0.05))
+    plt.suptitle(f"E1 - Graphe avant (Random) - S1 (N={N}, K={K})", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(config.FIGURES_DIR / "E1_graph_before_Random.png", dpi=300, bbox_inches='tight')
+    plt.close(fig1)
+    print(f"✅ Graphe avant (Random) sauvegardé dans {config.FIGURES_DIR / 'E1_graph_before_Random.png'}")
+    
+    # --- Figure 2 : BD-CeNN (après) ---
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+    draw_graph(ax2, x_bd, f"BD-CeNN (coût = {cost_bd:.1f}, conflits = {conflicts_bd})")
+    legend_elements = [Patch(facecolor=colors[c], edgecolor='black', label=f'Canal {c}') for c in range(K)]
+    fig2.legend(handles=legend_elements, loc='lower center', ncol=K, fontsize=10, bbox_to_anchor=(0.5, -0.05))
+    plt.suptitle(f"E1 - Graphe après (BD-CeNN) - S1 (N={N}, K={K})", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(config.FIGURES_DIR / "E1_graph_after_BDCeNN.png", dpi=300, bbox_inches='tight')
+    plt.close(fig2)
+    print(f"✅ Graphe après (BD-CeNN) sauvegardé dans {config.FIGURES_DIR / 'E1_graph_after_BDCeNN.png'}")
+    
     print("✅ E1 terminée.")
 
 # ============================================================================
@@ -95,23 +141,24 @@ def run_experiment_E3():
     """
     E3 - Impact du nombre de canaux
     Mesure l'évolution du coût et des conflits en fonction de K.
+    On utilise le scénario S4 (N=50, K initial=2) avec la même matrice W.
+    K varie de 2 à 8.
     """
     print("\n" + "="*60)
     print("🔬 E3 - IMPACT DU NOMBRE DE CANAUX (K)")
     print("="*60)
     
-    scenario_name = "S2"  # Réseau moyen
+    scenario_name = "S4"  # Scénario avec N=50, K=2 (peu de canaux)
     data = all_data[scenario_name]
     N = data["N"]
     W = np.array(data["W"])
-    seed = config.SEED_BASE
+    seed = data["seed"]
     K_values = [2, 3, 4, 5, 6, 8]
     
     results = []
     
     for K in K_values:
         M = create_channel_interference_matrix(K)
-        # Exécuter BD-CeNN pour ce K
         x_bd, _, t_bd, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
         cost = compute_spectrum_energy(x_bd, W, M)
         conflicts = count_spectrum_conflicts(x_bd, W, M)
@@ -145,29 +192,43 @@ def run_experiment_E3():
 def run_experiment_E4():
     """
     E4 - Impact de la densité
-    Mesure l'évolution du coût en fonction de la densité du graphe (threshold).
+    Mesure l'évolution du coût en fonction de la densité du graphe.
+    On utilise N=50 (scénario S4) avec trois densités :
+        - Faible  (threshold = 30)
+        - Moyenne (threshold = 50)
+        - Forte   (threshold = 70)
+    La distribution des poids W est conservée (même seed).
+    Sorties : courbe coût vs densité (en %), table des résultats.
     """
     print("\n" + "="*60)
-    print("🔬 E4 - IMPACT DE LA DENSITÉ")
+    print("🔬 E4 - IMPACT DE LA DENSITÉ (N=50)")
     print("="*60)
     
-    # On utilise S2 (N=30) avec différents thresholds
-    scenario_name = "S2"
+    # On utilise S4 (N=50, K=2) comme base
+    scenario_name = "S4"
     base_data = all_data[scenario_name]
-    N = base_data["N"]
-    K = base_data["K"]
-    seed = config.SEED_BASE
+    N = base_data["N"]          # 50
+    K = base_data["K"]          # 2
+    base_seed = base_data["seed"]
     
-    thresholds = [20, 30, 40, 50, 60, 80]
-    densities = []
-    costs = []
+    # Trois niveaux de densité : faible, moyenne, forte
+    density_configs = [
+        {"label": "Faible", "threshold": 30},
+        {"label": "Moyenne", "threshold": 50},
+        {"label": "Forte", "threshold": 70}
+    ]
     
-    for th in thresholds:
-        # Re-générer W avec ce threshold
-        np.random.seed(base_data["seed"])
-        positions = np.random.rand(N, 2) * 150  # area fixe
+    results = []
+    
+    for cfg in density_configs:
+        th = cfg["threshold"]
+        # Re-générer W avec ce threshold, en gardant la même seed et area
+        np.random.seed(base_seed)
+        area = 200  # area du scénario S4
+        positions = np.random.rand(N, 2) * area
         W = np.zeros((N, N))
         edge_count = 0
+        
         for i in range(N):
             for j in range(i+1, N):
                 dist = np.linalg.norm(positions[i] - positions[j])
@@ -185,74 +246,119 @@ def run_experiment_E4():
                     edge_count += 1
         
         density = 2 * edge_count / (N * (N - 1))
-        densities.append(density)
         
         M = create_channel_interference_matrix(K)
-        x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
+        x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=base_seed)
         cost = compute_spectrum_energy(x_bd, W, M)
-        costs.append(cost)
-        print(f"Threshold={th}, Densité={density:.3f}, Coût={cost:.1f}")
+        conflicts = count_spectrum_conflicts(x_bd, W, M)
+        
+        results.append({
+            "Densité (%)": density * 100,
+            "Densité (décimale)": density,
+            "Seuil": th,
+            "Coût": cost,
+            "Conflits": conflicts,
+            "Arêtes": edge_count
+        })
+        print(f"Densité={density*100:.1f}% ({cfg['label']}), Seuil={th}, Coût={cost:.1f}, Conflits={conflicts}")
     
-    df = pd.DataFrame({"Threshold": thresholds, "Densité": densities, "Coût": costs})
+    df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E4_impact_density.csv", index=False)
+    print(f"\n✅ Table des résultats sauvegardée dans {config.CSV_DIR / 'E4_impact_density.csv'}")
     
-    plt.figure(figsize=(10, 6))
-    plt.plot(df["Densité"], df["Coût"], marker='o', color='red', linestyle='-')
-    plt.xlabel("Densité du graphe")
-    plt.ylabel("Coût global")
-    plt.title(f"E4 - Impact de la densité sur le coût ({scenario_name}, N={N}, K={K})")
-    plt.grid(True, linestyle='--', alpha=0.3)
+    # --- Figure 1 : Courbe coût vs densité (en %) ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Tracé de la courbe
+    ax.plot(df["Densité (%)"], df["Coût"], marker='o', color='red', linestyle='-', linewidth=2, markersize=8)
+    
+    # Formatage de l'axe des x en pourcentage
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.1f}%"))
+    
+    # Étiquettes et titre
+    ax.set_xlabel("Densité du graphe (%)", fontsize=12)
+    ax.set_ylabel("Coût global", fontsize=12)
+    ax.set_title(f"E4 - Impact de la densité sur le coût (N={N}, K={K})", fontsize=14, fontweight='bold')
+    
+    # Grille
+    ax.grid(True, linestyle='--', alpha=0.3)
+    
+    # Annotation des points avec la densité en %
+    for i, row in df.iterrows():
+        ax.annotate(f"{row['Densité (%)']:.1f}%", 
+                    (row['Densité (%)'], row['Coût']),
+                    textcoords="offset points", xytext=(0, 10),
+                    ha='center', fontsize=9)
+    
+    # Légende explicative (texte en bas à droite)
+    note = "La densité est le rapport du nombre d'arêtes\nsur le nombre maximal d'arêtes possibles (N(N-1)/2)."
+    ax.text(0.98, 0.02, note, transform=ax.transAxes,
+            fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
     plt.tight_layout()
     plt.savefig(config.FIGURES_DIR / "E4_impact_density.png", dpi=300)
     plt.close()
     print(f"✅ Figure sauvegardée : {config.FIGURES_DIR / 'E4_impact_density.png'}")
+    
+    # --- Figure 2 : Table des résultats (avec densité en %) ---
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    table_data = [
+        ["Densité", "Seuil", "Arêtes", "Coût", "Conflits"],
+        [f"{df['Densité (%)'][0]:.1f}%", df['Seuil'][0], df['Arêtes'][0], f"{df['Coût'][0]:.1f}", df['Conflits'][0]],
+        [f"{df['Densité (%)'][1]:.1f}%", df['Seuil'][1], df['Arêtes'][1], f"{df['Coût'][1]:.1f}", df['Conflits'][1]],
+        [f"{df['Densité (%)'][2]:.1f}%", df['Seuil'][2], df['Arêtes'][2], f"{df['Coût'][2]:.1f}", df['Conflits'][2]]
+    ]
+    
+    table = ax.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.15, 0.15, 0.15, 0.15, 0.15])
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1, 2)
+    
+    # Style de l'en-tête
+    for j in range(5):
+        table[(0, j)].set_facecolor('#4472C4')
+        table[(0, j)].set_text_props(color='white', fontweight='bold')
+    
+    plt.title(f"E4 - Table des résultats (N={N}, K={K})", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(config.FIGURES_DIR / "E4_conflicts_table.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Table des conflits sauvegardée : {config.FIGURES_DIR / 'E4_conflicts_table.png'}")
+    
     print("✅ E4 terminée.")
 
 # ============================================================================
-# E6 – SCALABILITÉ (temps vs N)
+# E6 – SCALABILITÉ (temps vs N) - CORRIGÉ
 # ============================================================================
 def run_experiment_E6():
     """
-    E6 - Scalabilité
-    Mesure le temps de calcul en fonction du nombre de cellules N.
+    E6 - Scalabilité (CORRIGÉ)
+    Mesure le temps, le coût et le nombre d'itérations en fonction de N.
+    K=4 fixe, densité contrôlée.
     """
     print("\n" + "="*60)
-    print("🔬 E6 - SCALABILITÉ (temps vs N)")
+    print("🔬 E6 - SCALABILITÉ (temps, coût et itérations vs N)")
     print("="*60)
     
-    # Utiliser S2, S3, S5 et créer des cas plus grands
-    scenario_names = ["S2", "S3", "S5"]
-    N_values = []
-    times = []
-    costs = []
+    K = 4
+    area = 300
+    threshold = 50
+    num_restarts = 10
+    max_iter = 50
+    N_values = [20, 30, 50, 100, 150, 200]
     
-    for name in scenario_names:
-        data = all_data[name]
-        N = data["N"]
-        K = data["K"]
-        W = np.array(data["W"])
-        M = create_channel_interference_matrix(K)
-        seed = data["seed"]
-        
-        # Exécuter BD-CeNN et mesurer le temps
-        start = time.perf_counter()
-        x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
-        elapsed = time.perf_counter() - start
-        cost = compute_spectrum_energy(x_bd, W, M)
-        
-        N_values.append(N)
-        times.append(elapsed)
-        costs.append(cost)
-        print(f"N={N}, K={K}, Temps={elapsed:.6f}s, Coût={cost:.1f}")
+    results = []
     
-    # Ajouter N=150 et N=200 (création ad-hoc)
-    for N in [150, 200]:
-        K = 8
-        area = 400 if N > 150 else 300
+    for N in N_values:
         np.random.seed(42 + N)
         positions = np.random.rand(N, 2) * area
         W = np.zeros((N, N))
-        threshold = 50
+        edge_count = 0
+        
         for i in range(N):
             for j in range(i+1, N):
                 dist = np.linalg.norm(positions[i] - positions[j])
@@ -266,36 +372,79 @@ def run_experiment_E6():
                     w = 0
                 W[i, j] = w
                 W[j, i] = w
+                if w > 0:
+                    edge_count += 1
+        
         M = create_channel_interference_matrix(K)
         start = time.perf_counter()
-        x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=42)
-        elapsed = time.perf_counter() - start
+        x_bd, history, elapsed, _ = bdcenn_allocation(
+            N, K, W, M=M,
+            num_restarts=num_restarts,
+            max_iter=max_iter,
+            seed=42 + N,
+            verbose=False
+        )
         cost = compute_spectrum_energy(x_bd, W, M)
-        N_values.append(N)
-        times.append(elapsed)
-        costs.append(cost)
-        print(f"N={N}, K={K}, Temps={elapsed:.6f}s, Coût={cost:.1f}")
+        iterations = len(history) - 1  # Nombre d'itérations effectuées pour converger
+        density = 2 * edge_count / (N * (N - 1))
+        
+        results.append({
+            "N": N,
+            "Temps (s)": elapsed,
+            "Coût": cost,
+            "Itérations": iterations,
+            "Densité": density
+        })
+        print(f"N={N}, K={K}, Temps={elapsed:.6f}s, Coût={cost:.1f}, Itérations={iterations}")
     
-    df = pd.DataFrame({"N": N_values, "Temps": times, "Coût": costs})
-    df = df.sort_values("N")
+    df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E6_scalability.csv", index=False)
+    print(f"\n✅ Table des résultats sauvegardée dans {config.CSV_DIR / 'E6_scalability.csv'}")
     
-    # Figure
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    ax1.plot(df["N"], df["Temps"], marker='o', color='blue', label='Temps')
-    ax1.set_xlabel("Nombre de cellules N")
-    ax1.set_ylabel("Temps d'exécution (s)", color='blue')
-    ax1.tick_params(axis='y', labelcolor='blue')
+    # --- Figure avec trois sous-graphiques ---
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # 1. Temps vs N
+    ax1.plot(df["N"], df["Temps (s)"], marker='o', color='blue', linestyle='-', linewidth=2, markersize=8)
+    ax1.set_xlabel("Nombre de cellules N", fontsize=11)
+    ax1.set_ylabel("Temps d'exécution (s)", fontsize=11)
+    ax1.set_title("Temps vs N", fontsize=12)
     ax1.grid(True, linestyle='--', alpha=0.3)
-    ax2 = ax1.twinx()
-    ax2.plot(df["N"], df["Coût"], marker='s', color='red', linestyle='--', label='Coût')
-    ax2.set_ylabel("Coût global", color='red')
-    ax2.tick_params(axis='y', labelcolor='red')
-    plt.title("E6 - Scalabilité : temps et coût en fonction de N")
+    # Annotation du temps pour N=200
+    ax1.annotate(f"{df.iloc[-1]['Temps (s)']:.2f}s", 
+                 (df.iloc[-1]['N'], df.iloc[-1]['Temps (s)']), 
+                 xytext=(5, 5), textcoords='offset points', fontsize=9)
+    
+    # 2. Coût vs N
+    ax2.plot(df["N"], df["Coût"], marker='s', color='red', linestyle='-', linewidth=2, markersize=8)
+    ax2.set_xlabel("Nombre de cellules N", fontsize=11)
+    ax2.set_ylabel("Coût global", fontsize=11)
+    ax2.set_title("Coût vs N", fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.3)
+    # Annotation du coût pour N=200
+    ax2.annotate(f"{df.iloc[-1]['Coût']:.1f}", 
+                 (df.iloc[-1]['N'], df.iloc[-1]['Coût']), 
+                 xytext=(5, -15), textcoords='offset points', fontsize=9)
+    
+    # 3. Itérations vs N (nombre d'itérations effectuées pour converger)
+    ax3.plot(df["N"], df["Itérations"], marker='^', color='green', linestyle='-', linewidth=2, markersize=8)
+    ax3.set_xlabel("Nombre de cellules N", fontsize=11)
+    ax3.set_ylabel("Nombre d'itérations", fontsize=11)
+    ax3.set_title("Itérations vs N", fontsize=12)
+    ax3.grid(True, linestyle='--', alpha=0.3)
+    # Ligne horizontale pour montrer la constance
+    ax3.axhline(y=10, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+    ax3.text(0.5, 10.8, "10 itérations", fontsize=9, ha='center')
+    
+    # Supprimer les légendes (elles ne sont pas nécessaires)
+    # ax1.legend().remove() n'est pas nécessaire car on n'a pas appelé legend()
+    
+    plt.suptitle(f"E6 - Scalabilité (K={K}, densité ≈ 7.5%)", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(config.FIGURES_DIR / "E6_scalability.png", dpi=300)
     plt.close()
     print(f"✅ Figure sauvegardée : {config.FIGURES_DIR / 'E6_scalability.png'}")
+    
     print("✅ E6 terminée.")
 
 # ============================================================================
@@ -487,62 +636,124 @@ def run_experiment_E8():
 # ============================================================================
 def run_experiment_E9():
     """
-    E9 - Minima locaux
-    Compare le coût final pour 1, 5, 10, 20 redémarrages.
+    E9 - Minima locaux (effet des redémarrages)
+    Mesure l'évolution du meilleur coût et du temps total en fonction du nombre de redémarrages.
+    Utilise le scénario S4 (N=50, K=2) : réseau dense et faible nombre de canaux.
+    Compare 1, 5, 10 et 20 redémarrages.
+    Sortie : Meilleur coût et temps total selon redémarrages.
     """
     print("\n" + "="*60)
-    print("🔬 E9 - EFFET DES REDÉMARRAGES (minima locaux)")
+    print("🔬 E9 - MINIMA LOCAUX (effet des redémarrages)")
     print("="*60)
     
-    scenario_name = "S3"  # Réseau dense (difficile)
+    # On utilise S4 : réseau dense (threshold=40) et K=2 (pénurie de canaux)
+    scenario_name = "S4"
     data = all_data[scenario_name]
-    N = data["N"]
-    K = data["K"]
+    N = data["N"]          # 50
+    K = data["K"]          # 2
     W = np.array(data["W"])
     M = create_channel_interference_matrix(K)
     seed = data["seed"]
     
-    restart_values = config.RESTART_EXPERIMENT_VALUES
+    # Nombres de redémarrages à tester
+    restart_values = [1, 5, 10, 20]
     results = []
     
     for num_restarts in restart_values:
-        # Exécuter BD-CeNN avec ce nombre de redémarrages
+        # Mesurer le temps total de toutes les exécutions
         start_time = time.perf_counter()
-        x_bd, _, elapsed, _ = bdcenn_allocation(
+        x_bd, _, _, _ = bdcenn_allocation(
             N, K, W, M=M,
             num_restarts=num_restarts,
             max_iter=50,
             seed=seed,
             verbose=False
         )
+        elapsed = time.perf_counter() - start_time  # Temps total
         cost = compute_spectrum_energy(x_bd, W, M)
         conflicts = count_spectrum_conflicts(x_bd, W, M)
         results.append({
             "Redémarrages": num_restarts,
             "Coût": cost,
             "Conflits": conflicts,
-            "Temps": elapsed
+            "Temps total (s)": elapsed
         })
-        print(f"Redémarrages={num_restarts} : Coût={cost:.1f}, Conflits={conflicts}, Temps={elapsed:.6f}s")
+        print(f"Redémarrages={num_restarts} : Coût={cost:.1f}, Conflits={conflicts}, Temps total={elapsed:.6f}s")
     
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E9_restart_effect.csv", index=False)
+    print(f"\n✅ Table des résultats sauvegardée dans {config.CSV_DIR / 'E9_restart_effect.csv'}")
     
+    # --- Figure 1 : Évolution du coût et du temps avec les redémarrages ---
     fig, ax1 = plt.subplots(figsize=(10, 6))
-    ax1.plot(df["Redémarrages"], df["Coût"], marker='o', color='red', label='Coût')
-    ax1.set_xlabel("Nombre de redémarrages")
-    ax1.set_ylabel("Coût global", color='red')
+    
+    # Tracé du coût
+    ax1.plot(df["Redémarrages"], df["Coût"], marker='o', color='red', linestyle='-', linewidth=2, markersize=8, label='Coût')
+    ax1.set_xlabel("Nombre de redémarrages", fontsize=12)
+    ax1.set_ylabel("Meilleur coût global", color='red', fontsize=12)
     ax1.tick_params(axis='y', labelcolor='red')
     ax1.grid(True, linestyle='--', alpha=0.3)
+    
+    # Deuxième axe pour le temps total
     ax2 = ax1.twinx()
-    ax2.plot(df["Redémarrages"], df["Conflits"], marker='s', color='blue', linestyle='--', label='Conflits')
-    ax2.set_ylabel("Conflits spectraux", color='blue')
+    ax2.plot(df["Redémarrages"], df["Temps total (s)"], marker='s', color='blue', linestyle='--', linewidth=2, markersize=8, label='Temps total')
+    ax2.set_ylabel("Temps total d'exécution (s)", color='blue', fontsize=12)
     ax2.tick_params(axis='y', labelcolor='blue')
-    plt.title(f"E9 - Effet des redémarrages ({scenario_name}, N={N}, K={K})")
+    
+    # Annotation des points
+    for i, row in df.iterrows():
+        ax1.annotate(f"{row['Coût']:.1f}", (row['Redémarrages'], row['Coût']),
+                     textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
+        ax2.annotate(f"{row['Temps total (s)']:.3f}s", (row['Redémarrages'], row['Temps total (s)']),
+                     textcoords="offset points", xytext=(0, -15), ha='center', fontsize=9)
+    
+    # Légende combinée
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    
+    ax1.set_title(f"E9 - Effet des redémarrages sur le coût et le temps (N={N}, K={K})", fontsize=14, fontweight='bold')
+    
+    # Note explicative
+    note = "Le temps total est la somme du temps de tous les redémarrages."
+    ax1.text(0.98, 0.02, note, transform=ax1.transAxes,
+             fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
     plt.tight_layout()
     plt.savefig(config.FIGURES_DIR / "E9_restart_effect.png", dpi=300)
     plt.close()
     print(f"✅ Figure sauvegardée : {config.FIGURES_DIR / 'E9_restart_effect.png'}")
+    
+    # --- Figure 2 : Table des résultats ---
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    table_data = [
+        ["Redémarrages", "Coût", "Conflits", "Temps total (s)"],
+        [df["Redémarrages"][0], f"{df['Coût'][0]:.1f}", df["Conflits"][0], f"{df['Temps total (s)'][0]:.6f}"],
+        [df["Redémarrages"][1], f"{df['Coût'][1]:.1f}", df["Conflits"][1], f"{df['Temps total (s)'][1]:.6f}"],
+        [df["Redémarrages"][2], f"{df['Coût'][2]:.1f}", df["Conflits"][2], f"{df['Temps total (s)'][2]:.6f}"],
+        [df["Redémarrages"][3], f"{df['Coût'][3]:.1f}", df["Conflits"][3], f"{df['Temps total (s)'][3]:.6f}"]
+    ]
+    
+    table = ax.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.2, 0.2, 0.2, 0.2])
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1, 2)
+    
+    # Style de l'en-tête
+    for j in range(4):
+        table[(0, j)].set_facecolor('#4472C4')
+        table[(0, j)].set_text_props(color='white', fontweight='bold')
+    
+    plt.title(f"E9 - Table des résultats (N={N}, K={K})", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(config.FIGURES_DIR / "E9_restart_table.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Table des résultats sauvegardée : {config.FIGURES_DIR / 'E9_restart_table.png'}")
+    
     print("✅ E9 terminée.")
 
 # ============================================================================
