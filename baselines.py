@@ -1,10 +1,8 @@
-# baselines.py
 import numpy as np
 
 def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
     """
     Crée une matrice d'interférence entre canaux M (K x K).
-    (Copiée localement pour éviter une dépendance circulaire.)
     """
     M = np.zeros((K, K))
     for k in range(K):
@@ -25,22 +23,17 @@ def random_allocation(N, K):
 def greedy_allocation(N, K, W, order=None, M=None):
     """
     Allocation gloutonne séquentielle, avec prise en compte de la matrice
-    d'interférence entre canaux M (spectrum-aware).
-    - Si M est None, on utilise le comportement classique (même canal uniquement).
-    - Si M est fournie, le coût local devient :
-        cost = sum_{j voisin déjà coloré} W[i][j] * M[c][x[j]]
+    d'interférence entre canaux M (adjacent-aware).
     """
     if M is None:
-        # Comportement classique : M est une matrice identité (ou on simule)
-        # Pour éviter de créer une grosse matrice, on utilise une condition simple.
-        use_spectrum = False
+        use_adjacent = False
     else:
-        use_spectrum = True
+        use_adjacent = True
 
     if order is None:
         order = list(range(N))
     
-    x = np.full(N, -1, dtype=int)  # -1 signifie non attribué
+    x = np.full(N, -1, dtype=int)
     
     for idx, i in enumerate(order):
         best_c = -1
@@ -49,11 +42,9 @@ def greedy_allocation(N, K, W, order=None, M=None):
             local_cost = 0
             for j in order[:idx]:
                 if W[i][j] > 0:
-                    if use_spectrum:
-                        # Spectrum-aware : on utilise M
+                    if use_adjacent:
                         local_cost += W[i][j] * M[c, x[j]]
                     else:
-                        # Classique : même canal uniquement
                         if x[j] == c:
                             local_cost += W[i][j]
             if local_cost < best_cost:
@@ -65,16 +56,13 @@ def greedy_allocation(N, K, W, order=None, M=None):
 def dsatur_allocation(N, K, W, M=None):
     """
     Allocation par DSATUR, avec prise en compte de la matrice
-    d'interférence entre canaux M (spectrum-aware).
+    d'interférence entre canaux M (adjacent-aware).
     """
-    # Calcul du degré (nombre de voisins avec W > 0)
     degree = np.sum(W > 0, axis=1)
-    
     colored = np.full(N, False, dtype=bool)
     x = np.full(N, -1, dtype=int)
     neighbor_colors = [set() for _ in range(N)]
-    
-    use_spectrum = (M is not None)
+    use_adjacent = (M is not None)
     
     def select_next():
         best_vertex = -1
@@ -97,7 +85,7 @@ def dsatur_allocation(N, K, W, M=None):
             local_cost = 0
             for j in range(N):
                 if colored[j] and W[v][j] > 0:
-                    if use_spectrum:
+                    if use_adjacent:
                         local_cost += W[v][j] * M[c, x[j]]
                     else:
                         if x[j] == c:

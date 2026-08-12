@@ -8,17 +8,24 @@ from datetime import datetime
 from data_generator import all_data
 from baselines import greedy_allocation, dsatur_allocation
 from bdcenn_solver import bdcenn_allocation
-from metrics import compute_metrics, create_channel_interference_matrix, compute_spectrum_energy, count_spectrum_conflicts
+from metrics import (
+    create_channel_interference_matrix,
+    compute_cochannel_cost,
+    count_cochannel_conflicts,
+    compute_adjacent_cost,
+    count_adjacent_conflicts
+)
 import config
 
+
 def run_validation():
-    print("="*80)
+    print("=" * 80)
     print("🚀 LANCEMENT DE LA VALIDATION APPROFONDIE")
     print(f"   - {len(all_data)} scénarios")
     print(f"   - {config.NUM_RUNS} répétitions par scénario")
     print("   - Méthodes : Random, Greedy (ordres variés), DSATUR, BD-CeNN (redémarrages)")
-    print("   - Métriques : Conflits (spectraux), Canaux utilisés, Coût global (avec M)")
-    print("="*80)
+    print("   - Métriques : Co-canal (coût+conflits) et Adjacent (coût+conflits)")
+    print("=" * 80)
 
     raw_rows = []
     scenario_list = list(all_data.items())
@@ -48,15 +55,18 @@ def run_validation():
 
             greedy_order = np.random.permutation(N).tolist()
 
-            # ---------- 1. Random ----------
+            # ------------------------------------------------------------
+            # 1. Random
+            # ------------------------------------------------------------
             start = time.perf_counter()
             x_rand = np.random.randint(0, K, size=N)
             time_rand = time.perf_counter() - start
-            m_rand = compute_metrics(x_rand, W)
-            global_cost_rand = compute_spectrum_energy(x_rand, W, M)
-            spectrum_conflicts_rand = count_spectrum_conflicts(x_rand, W, M)
-            # Coût initial : avant optimisation (identique pour toutes les méthodes car random)
-            initial_cost_rand = global_cost_rand
+
+            cochannel_cost_rand = compute_cochannel_cost(x_rand, W)
+            cochannel_conf_rand = count_cochannel_conflicts(x_rand, W)
+            adjacent_cost_rand = compute_adjacent_cost(x_rand, W, M)
+            adjacent_conf_rand = count_adjacent_conflicts(x_rand, W, M)
+            used_rand = len(set(x_rand))
 
             raw_rows.append({
                 "run_seed": run_seed,
@@ -65,22 +75,32 @@ def run_validation():
                 "K": K,
                 "seed_scenario": seed_scenario,
                 "method": "Random",
-                "spectrum_conflicts": spectrum_conflicts_rand,
-                "used_channels": m_rand["used_channels"],
+                "cochannel_cost": cochannel_cost_rand,
+                "cochannel_conflicts": cochannel_conf_rand,
+                "adjacent_cost": adjacent_cost_rand,
+                "adjacent_conflicts": adjacent_conf_rand,
+                "used_channels": used_rand,
                 "time": time_rand,
-                "global_cost": global_cost_rand,
-                "initial_cost": initial_cost_rand
+                "initial_adjacent_cost": adjacent_cost_rand,   # Random initial = final
+                "initial_cochannel_cost": cochannel_cost_rand
             })
 
-            # ---------- 2. Greedy (ordre aléatoire) ----------
+            # ------------------------------------------------------------
+            # 2. Greedy
+            # ------------------------------------------------------------
             start = time.perf_counter()
             x_greedy = greedy_allocation(N, K, W, order=greedy_order, M=M)
             time_greedy = time.perf_counter() - start
-            m_greedy = compute_metrics(x_greedy, W)
-            global_cost_greedy = compute_spectrum_energy(x_greedy, W, M)
-            spectrum_conflicts_greedy = count_spectrum_conflicts(x_greedy, W, M)
-            # Coût initial : même initialisation que Random (car on part de la même allocation)
-            initial_cost_greedy = global_cost_rand
+
+            cochannel_cost_greedy = compute_cochannel_cost(x_greedy, W)
+            cochannel_conf_greedy = count_cochannel_conflicts(x_greedy, W)
+            adjacent_cost_greedy = compute_adjacent_cost(x_greedy, W, M)
+            adjacent_conf_greedy = count_adjacent_conflicts(x_greedy, W, M)
+            used_greedy = len(set(x_greedy))
+
+            # Greedy part de la même initialisation que Random (même seed)
+            initial_adj_greedy = adjacent_cost_rand
+            initial_co_greedy = cochannel_cost_rand
 
             raw_rows.append({
                 "run_seed": run_seed,
@@ -89,22 +109,28 @@ def run_validation():
                 "K": K,
                 "seed_scenario": seed_scenario,
                 "method": "Greedy",
-                "spectrum_conflicts": spectrum_conflicts_greedy,
-                "used_channels": m_greedy["used_channels"],
+                "cochannel_cost": cochannel_cost_greedy,
+                "cochannel_conflicts": cochannel_conf_greedy,
+                "adjacent_cost": adjacent_cost_greedy,
+                "adjacent_conflicts": adjacent_conf_greedy,
+                "used_channels": used_greedy,
                 "time": time_greedy,
-                "global_cost": global_cost_greedy,
-                "initial_cost": initial_cost_greedy
+                "initial_adjacent_cost": initial_adj_greedy,
+                "initial_cochannel_cost": initial_co_greedy
             })
 
-            # ---------- 3. DSATUR ----------
+            # ------------------------------------------------------------
+            # 3. DSATUR
+            # ------------------------------------------------------------
             start = time.perf_counter()
             x_dsatur = dsatur_allocation(N, K, W, M=M)
             time_dsatur = time.perf_counter() - start
-            m_dsatur = compute_metrics(x_dsatur, W)
-            global_cost_dsatur = compute_spectrum_energy(x_dsatur, W, M)
-            spectrum_conflicts_dsatur = count_spectrum_conflicts(x_dsatur, W, M)
-            # DSATUR n'utilise pas d'initialisation aléatoire, coût initial = coût final
-            initial_cost_dsatur = global_cost_dsatur
+
+            cochannel_cost_dsatur = compute_cochannel_cost(x_dsatur, W)
+            cochannel_conf_dsatur = count_cochannel_conflicts(x_dsatur, W)
+            adjacent_cost_dsatur = compute_adjacent_cost(x_dsatur, W, M)
+            adjacent_conf_dsatur = count_adjacent_conflicts(x_dsatur, W, M)
+            used_dsatur = len(set(x_dsatur))
 
             raw_rows.append({
                 "run_seed": run_seed,
@@ -113,14 +139,19 @@ def run_validation():
                 "K": K,
                 "seed_scenario": seed_scenario,
                 "method": "DSATUR",
-                "spectrum_conflicts": spectrum_conflicts_dsatur,
-                "used_channels": m_dsatur["used_channels"],
+                "cochannel_cost": cochannel_cost_dsatur,
+                "cochannel_conflicts": cochannel_conf_dsatur,
+                "adjacent_cost": adjacent_cost_dsatur,
+                "adjacent_conflicts": adjacent_conf_dsatur,
+                "used_channels": used_dsatur,
                 "time": time_dsatur,
-                "global_cost": global_cost_dsatur,
-                "initial_cost": initial_cost_dsatur
+                "initial_adjacent_cost": adjacent_cost_dsatur,
+                "initial_cochannel_cost": cochannel_cost_dsatur
             })
 
-            # ---------- 4. BD-CeNN (redémarrages multiples) ----------
+            # ------------------------------------------------------------
+            # 4. BD-CeNN
+            # ------------------------------------------------------------
             x_bd, history_bd, t_bd, conf_bd = bdcenn_allocation(
                 N, K, W, M=M,
                 num_restarts=config.NUM_RESTARTS,
@@ -129,14 +160,18 @@ def run_validation():
                 seed=run_seed,
                 verbose=False
             )
-            m_bd = compute_metrics(x_bd, W)
-            global_cost_bd = compute_spectrum_energy(x_bd, W, M)
-            spectrum_conflicts_bd = count_spectrum_conflicts(x_bd, W, M)
-            # Coût initial : calculé sur la première initialisation (avant redémarrages)
-            # On refait une initialisation avec la même seed pour obtenir le coût initial
+
+            cochannel_cost_bd = compute_cochannel_cost(x_bd, W)
+            cochannel_conf_bd = count_cochannel_conflicts(x_bd, W)
+            adjacent_cost_bd = compute_adjacent_cost(x_bd, W, M)
+            adjacent_conf_bd = count_adjacent_conflicts(x_bd, W, M)
+            used_bd = len(set(x_bd))
+
+            # Coût initial : on refait une initialisation avec la même seed
             np.random.seed(run_seed)
             x_init = np.random.randint(0, K, size=N)
-            initial_cost_bd = compute_spectrum_energy(x_init, W, M)
+            initial_adj_bd = compute_adjacent_cost(x_init, W, M)
+            initial_co_bd = compute_cochannel_cost(x_init, W)
 
             raw_rows.append({
                 "run_seed": run_seed,
@@ -145,20 +180,22 @@ def run_validation():
                 "K": K,
                 "seed_scenario": seed_scenario,
                 "method": "BD-CeNN",
-                "spectrum_conflicts": spectrum_conflicts_bd,
-                "used_channels": m_bd["used_channels"],
+                "cochannel_cost": cochannel_cost_bd,
+                "cochannel_conflicts": cochannel_conf_bd,
+                "adjacent_cost": adjacent_cost_bd,
+                "adjacent_conflicts": adjacent_conf_bd,
+                "used_channels": used_bd,
                 "time": t_bd,
-                "global_cost": global_cost_bd,
-                "initial_cost": initial_cost_bd
+                "initial_adjacent_cost": initial_adj_bd,
+                "initial_cochannel_cost": initial_co_bd
             })
 
-            # ---------- Sauvegarde de l'historique (TOUTES les runs) ----------
-            # On ajoute une colonne run_seed pour distinguer les runs
+            # --- Sauvegarde de l'historique de convergence (adjacent cost) ---
             file_exists = os.path.isfile(convergence_file)
             with open(convergence_file, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 if not file_exists:
-                    writer.writerow(['scenario', 'run_seed', 'iteration', 'global_cost', 'seed_init'])
+                    writer.writerow(['scenario', 'run_seed', 'iteration', 'adjacent_cost', 'seed_init'])
                 for it, cost, alloc in history_bd:
                     writer.writerow([name, run_seed, it, cost, run_seed])
 
@@ -167,74 +204,96 @@ def run_validation():
 
     df_raw = pd.DataFrame(raw_rows)
 
-    # Agrégation avec statistiques (incluant initial_cost)
+    # --- Agrégation par (scenario, N, K, seed_scenario, method) ---
     grouped = df_raw.groupby(["scenario", "N", "K", "seed_scenario", "method"])
     df_agg = grouped.agg({
-        "spectrum_conflicts": ["mean", "std", "min", "max", "median"],
+        "cochannel_cost": ["mean", "std", "min", "max", "median"],
+        "cochannel_conflicts": ["mean", "std", "min", "max", "median"],
+        "adjacent_cost": ["mean", "std", "min", "max", "median"],
+        "adjacent_conflicts": ["mean", "std", "min", "max", "median"],
         "used_channels": ["mean", "std", "min", "max", "median"],
         "time": ["mean", "std", "min", "max", "median"],
-        "global_cost": ["mean", "std", "min", "max", "median"],
-        "initial_cost": ["mean", "std", "min", "max", "median"]
+        "initial_adjacent_cost": ["mean", "std", "min", "max", "median"],
+        "initial_cochannel_cost": ["mean", "std", "min", "max", "median"]
     }).reset_index()
 
     # Aplatir les noms de colonnes
     df_agg.columns = [
         'scenario', 'N', 'K', 'seed_scenario', 'method',
-        'spectrum_conflicts_mean', 'spectrum_conflicts_std',
-        'spectrum_conflicts_min', 'spectrum_conflicts_max', 'spectrum_conflicts_median',
+        'cochannel_cost_mean', 'cochannel_cost_std',
+        'cochannel_cost_min', 'cochannel_cost_max', 'cochannel_cost_median',
+        'cochannel_conflicts_mean', 'cochannel_conflicts_std',
+        'cochannel_conflicts_min', 'cochannel_conflicts_max', 'cochannel_conflicts_median',
+        'adjacent_cost_mean', 'adjacent_cost_std',
+        'adjacent_cost_min', 'adjacent_cost_max', 'adjacent_cost_median',
+        'adjacent_conflicts_mean', 'adjacent_conflicts_std',
+        'adjacent_conflicts_min', 'adjacent_conflicts_max', 'adjacent_conflicts_median',
         'used_channels_mean', 'used_channels_std',
         'used_channels_min', 'used_channels_max', 'used_channels_median',
         'time_mean', 'time_std',
         'time_min', 'time_max', 'time_median',
-        'global_cost_mean', 'global_cost_std',
-        'global_cost_min', 'global_cost_max', 'global_cost_median',
-        'initial_cost_mean', 'initial_cost_std',
-        'initial_cost_min', 'initial_cost_max', 'initial_cost_median'
+        'initial_adjacent_cost_mean', 'initial_adjacent_cost_std',
+        'initial_adjacent_cost_min', 'initial_adjacent_cost_max', 'initial_adjacent_cost_median',
+        'initial_cochannel_cost_mean', 'initial_cochannel_cost_std',
+        'initial_cochannel_cost_min', 'initial_cochannel_cost_max', 'initial_cochannel_cost_median'
     ]
 
-    # Arrondi des canaux
-    for col in ['used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median']:
+    # Arrondi des canaux utilisés
+    for col in ['used_channels_mean', 'used_channels_std', 'used_channels_min',
+                'used_channels_max', 'used_channels_median']:
         df_agg[col] = df_agg[col].round(0)
 
-    # Pivot
+    # --- Pivot : une colonne par (méthode, métrique) ---
     pivot = df_agg.pivot_table(
         index=['scenario', 'N', 'K', 'seed_scenario'],
         columns='method',
         values=[
-            'spectrum_conflicts_mean', 'spectrum_conflicts_std',
-            'spectrum_conflicts_min', 'spectrum_conflicts_max', 'spectrum_conflicts_median',
+            'cochannel_cost_mean', 'cochannel_cost_std',
+            'cochannel_cost_min', 'cochannel_cost_max', 'cochannel_cost_median',
+            'cochannel_conflicts_mean', 'cochannel_conflicts_std',
+            'cochannel_conflicts_min', 'cochannel_conflicts_max', 'cochannel_conflicts_median',
+            'adjacent_cost_mean', 'adjacent_cost_std',
+            'adjacent_cost_min', 'adjacent_cost_max', 'adjacent_cost_median',
+            'adjacent_conflicts_mean', 'adjacent_conflicts_std',
+            'adjacent_conflicts_min', 'adjacent_conflicts_max', 'adjacent_conflicts_median',
             'used_channels_mean', 'used_channels_std',
             'used_channels_min', 'used_channels_max', 'used_channels_median',
             'time_mean', 'time_std',
             'time_min', 'time_max', 'time_median',
-            'global_cost_mean', 'global_cost_std',
-            'global_cost_min', 'global_cost_max', 'global_cost_median',
-            'initial_cost_mean', 'initial_cost_std',
-            'initial_cost_min', 'initial_cost_max', 'initial_cost_median'
+            'initial_adjacent_cost_mean', 'initial_adjacent_cost_std',
+            'initial_adjacent_cost_min', 'initial_adjacent_cost_max', 'initial_adjacent_cost_median',
+            'initial_cochannel_cost_mean', 'initial_cochannel_cost_std',
+            'initial_cochannel_cost_min', 'initial_cochannel_cost_max', 'initial_cochannel_cost_median'
         ]
     )
 
     pivot.columns = [f"{method}_{metric}" for metric, method in pivot.columns]
     df_summary = pivot.reset_index()
 
-    # Ordre des colonnes
+    # --- Ordre des colonnes ---
     ordered_cols = ['scenario', 'N', 'K', 'seed_scenario']
     methods = ['Random', 'Greedy', 'DSATUR', 'BD-CeNN']
-    metrics = [
-        'spectrum_conflicts_mean', 'spectrum_conflicts_std',
-        'spectrum_conflicts_min', 'spectrum_conflicts_max', 'spectrum_conflicts_median',
+    metric_suffixes = [
+        'cochannel_cost_mean', 'cochannel_cost_std',
+        'cochannel_cost_min', 'cochannel_cost_max', 'cochannel_cost_median',
+        'cochannel_conflicts_mean', 'cochannel_conflicts_std',
+        'cochannel_conflicts_min', 'cochannel_conflicts_max', 'cochannel_conflicts_median',
+        'adjacent_cost_mean', 'adjacent_cost_std',
+        'adjacent_cost_min', 'adjacent_cost_max', 'adjacent_cost_median',
+        'adjacent_conflicts_mean', 'adjacent_conflicts_std',
+        'adjacent_conflicts_min', 'adjacent_conflicts_max', 'adjacent_conflicts_median',
         'used_channels_mean', 'used_channels_std',
         'used_channels_min', 'used_channels_max', 'used_channels_median',
         'time_mean', 'time_std',
         'time_min', 'time_max', 'time_median',
-        'global_cost_mean', 'global_cost_std',
-        'global_cost_min', 'global_cost_max', 'global_cost_median',
-        'initial_cost_mean', 'initial_cost_std',
-        'initial_cost_min', 'initial_cost_max', 'initial_cost_median'
+        'initial_adjacent_cost_mean', 'initial_adjacent_cost_std',
+        'initial_adjacent_cost_min', 'initial_adjacent_cost_max', 'initial_adjacent_cost_median',
+        'initial_cochannel_cost_mean', 'initial_cochannel_cost_std',
+        'initial_cochannel_cost_min', 'initial_cochannel_cost_max', 'initial_cochannel_cost_median'
     ]
     for method in methods:
-        for metric in metrics:
-            col = f"{method}_{metric}"
+        for suf in metric_suffixes:
+            col = f"{method}_{suf}"
             if col in df_summary.columns:
                 ordered_cols.append(col)
     df_summary = df_summary[ordered_cols]
@@ -246,7 +305,8 @@ def run_validation():
 
     print(f"\n✅ Validation terminée !")
     print(f"📁 Fichier Excel : {excel_file}")
-    print(f"📁 Historique convergence (toutes les runs) : {convergence_file}")
+    print(f"📁 Historique convergence (adjacent cost) : {convergence_file}")
+
 
 if __name__ == "__main__":
     print(f"📂 Chargement des scénarios : {len(all_data)} scénarios trouvés.")

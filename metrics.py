@@ -1,11 +1,12 @@
-# metrics.py
 import numpy as np
 
-# --- Fonctions de coût et conflits (existantes) ---
+# ============================================================
+# 1. Métriques pour les conflits co-canal (même canal)
+# ============================================================
 
-def compute_cost(x, W):
+def compute_cochannel_cost(x, W):
     """
-    Coût total binaire (co-canal uniquement) :
+    Coût total pour les conflits co-canal uniquement :
     J = somme W[i][j] si x[i] == x[j]
     """
     N = len(x)
@@ -16,9 +17,9 @@ def compute_cost(x, W):
                 cost += W[i][j]
     return cost
 
-def count_conflicts(x, W):
+def count_cochannel_conflicts(x, W):
     """
-    Nombre de conflits co-canal (W[i][j] > 0 et même canal)
+    Nombre de conflits co-canal : paires (i,j) avec W[i][j] > 0 et x[i] == x[j]
     """
     N = len(x)
     conflicts = 0
@@ -28,14 +29,16 @@ def count_conflicts(x, W):
                 conflicts += 1
     return conflicts
 
-def compute_metrics(x, W):
-    """Retourne coût binaire, conflits co-canal, canaux utilisés."""
-    cost = compute_cost(x, W)
-    conflicts = count_conflicts(x, W)
+def compute_metrics_cochannel(x, W):
+    """Retourne coût co-canal, conflits co-canal, canaux utilisés."""
+    cost = compute_cochannel_cost(x, W)
+    conflicts = count_cochannel_conflicts(x, W)
     used_channels = len(set(x))
     return {"cost": cost, "conflicts": conflicts, "used_channels": used_channels}
 
-# --- interference des canaux ---
+# ============================================================
+# 2. Métriques pour les conflits avec interférences entre canaux adjacents (matrice M)
+# ============================================================
 
 def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
     """
@@ -56,9 +59,9 @@ def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
                 M[k, l] = 0.0
     return M
 
-def compute_spectrum_energy(x, W, M):
+def compute_adjacent_cost(x, W, M):
     """
-    Coût global (co-canal + canaux adjacents) :
+    Coût total prenant en compte les interférences entre canaux adjacents (via M) :
     J = somme W[i][j] * M[x[i]][x[j]]
     """
     N = len(x)
@@ -69,9 +72,10 @@ def compute_spectrum_energy(x, W, M):
                 energy += W[i, j] * M[x[i]][x[j]]
     return energy
 
-def count_spectrum_conflicts(x, W, M, threshold=0.0):
+def count_adjacent_conflicts(x, W, M, threshold=0.0):
     """
-    Nombre de conflits spectraux : paires avec W[i][j] > 0 et M[x[i]][x[j]] > threshold.
+    Nombre de conflits avec interférences entre canaux adjacents :
+    paires avec W[i][j] > 0 et M[x[i]][x[j]] > threshold.
     """
     N = len(x)
     conflicts = 0
@@ -80,3 +84,10 @@ def count_spectrum_conflicts(x, W, M, threshold=0.0):
             if W[i, j] > 0 and M[x[i]][x[j]] > threshold:
                 conflicts += 1
     return conflicts
+
+def compute_metrics_adjacent(x, W, M):
+    """Retourne coût avec adjacents, conflits avec adjacents, canaux utilisés."""
+    cost = compute_adjacent_cost(x, W, M)
+    conflicts = count_adjacent_conflicts(x, W, M)
+    used_channels = len(set(x))
+    return {"cost": cost, "conflicts": conflicts, "used_channels": used_channels}

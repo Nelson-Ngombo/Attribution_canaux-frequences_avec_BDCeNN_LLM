@@ -1,7 +1,6 @@
-# bdcenn_solver.py
 import numpy as np
 import time
-from metrics import compute_cost, count_conflicts, compute_spectrum_energy
+from metrics import compute_cochannel_cost, count_cochannel_conflicts, compute_adjacent_cost
 
 def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=None, verbose=False):
     """
@@ -14,9 +13,9 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
     best_x = x.copy()
     
     if M is not None:
-        best_cost = compute_spectrum_energy(x, W, M)
+        best_cost = compute_adjacent_cost(x, W, M)
     else:
-        best_cost = compute_cost(x, W)
+        best_cost = compute_cochannel_cost(x, W)
     
     history = [(0, best_cost, x.copy())]
     if verbose:
@@ -49,9 +48,9 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
                 x[i] = best_local_channel
         
         if M is not None:
-            current_cost = compute_spectrum_energy(x, W, M)
+            current_cost = compute_adjacent_cost(x, W, M)
         else:
-            current_cost = compute_cost(x, W)
+            current_cost = compute_cochannel_cost(x, W)
         
         if current_cost < best_cost:
             best_cost = current_cost
@@ -74,7 +73,7 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
                 break
     
     elapsed = time.perf_counter() - start_time
-    conflicts = count_conflicts(best_x, W)
+    conflicts = count_cochannel_conflicts(best_x, W)
     return best_x, history, elapsed, conflicts
 
 
@@ -100,13 +99,13 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=10, max_iter=50, random_orde
             max_iter=max_iter,
             random_order=random_order,
             seed=seed_i,
-            verbose=verbose if i == 0 else False  # verbose seulement pour le premier
+            verbose=verbose if i == 0 else False
         )
         # Calcul du coût final
         if M is not None:
-            cost = compute_spectrum_energy(x, W, M)
+            cost = compute_adjacent_cost(x, W, M)
         else:
-            cost = compute_cost(x, W)
+            cost = compute_cochannel_cost(x, W)
         if cost < best_cost:
             best_cost = cost
             best_x = x
