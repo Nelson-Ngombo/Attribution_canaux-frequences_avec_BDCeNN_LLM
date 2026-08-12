@@ -1,22 +1,11 @@
 # experiments.py
-"""
-Fichier regroupant toutes les expériences spécifiques du mémoire :
-E1 - Vérification visuelle (petit graphe)
-E3 - Impact du nombre de canaux (K)
-E4 - Impact de la densité
-E6 - Scalabilité (temps vs N)
-E7 - Robustesse au bruit
-E8 - Réseau dynamique
-E9 - Minima locaux (effet des redémarrages)
-Toutes les expériences utilisent les métriques co-canal et adjacent.
-"""
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
 import time
-from data_generator import all_data
+import json
 from baselines import greedy_allocation, dsatur_allocation, random_allocation
 from bdcenn_solver import bdcenn_allocation
 from metrics import (
@@ -27,6 +16,55 @@ from metrics import (
     count_adjacent_conflicts
 )
 import config
+"""
+Fichier regroupant toutes les expériences spécifiques du mémoire :
+E1 - Vérification visuelle (petit graphe)
+E3 - Impact du nombre de canaux (K)
+E4 - Impact de la densité
+E6 - Scalabilité (temps vs N)
+E7 - Robustesse au bruit
+E8 - Réseau dynamique
+E9 - Minima locaux (effet des redémarrages)
+Toutes les expériences utilisent les métriques co-canal et adjacent.
+Elles utilisent les topologies stockées dans scenarios_data.json (seed=1 par défaut).
+"""
+# --- Charger les données depuis le JSON ---
+try:
+    with open(config.SCENARIOS_FILE, "r") as f:
+        all_instances = json.load(f)
+    # On garde pour chaque scénario l'instance avec seed=1 (ou la première si seed=1 absente)
+    all_data = {}
+    for name, instances in all_instances.items():
+        if "1" in instances:
+            inst = instances["1"]
+        else:
+            first_key = list(instances.keys())[0]
+            inst = instances[first_key]
+        # Reconstruire le graphe
+        N = inst["N"]
+        W = np.array(inst["W"])
+        positions = np.array(inst["positions"])
+        import networkx as nx
+        G = nx.Graph()
+        G.add_nodes_from(range(N))
+        for i in range(N):
+            for j in range(i+1, N):
+                if W[i, j] > 0:
+                    G.add_edge(i, j, weight=W[i, j])
+        all_data[name] = {
+            "seed": inst["seed"],
+            "N": N,
+            "K": inst["K"],
+            "threshold": inst["threshold"],
+            "positions": positions.tolist(),
+            "W": W.tolist(),
+            "graph": G
+        }
+    # Pas d'affichage dans le terminal
+except FileNotFoundError:
+    print("❌ Fichier scenarios_data.json introuvable. Veuillez d'abord exécuter data_generator.py")
+    import sys
+    sys.exit(1)
 
 # --- Création des dossiers de sortie ---
 os.makedirs(config.CSV_DIR, exist_ok=True)
@@ -36,7 +74,7 @@ os.makedirs(config.FIGURES_DIR, exist_ok=True)
 # ============================================================================
 # E1 – VÉRIFICATION VISUELLE (Petit graphe)
 # ============================================================================
-def run_experiment_E1():
+def run_experiment_E1(verbose=False):
     """
     E1 - Vérification visuelle
     Produit les sorties obligatoires :
@@ -44,10 +82,6 @@ def run_experiment_E1():
         - Graphe après (BD-CeNN) en une image séparée
         - Table cellule-canal avec coût co-canal et adjacent
     """
-    print("\n" + "=" * 60)
-    print("🔬 E1 - VÉRIFICATION VISUELLE (Petit graphe)")
-    print("=" * 60)
-
     import networkx as nx
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
@@ -60,10 +94,7 @@ def run_experiment_E1():
     positions = data["positions"]
     G = data["graph"]
     M = create_channel_interference_matrix(K)
-    seed = config.SEED_BASE
-
-    print(f"Scénario : {scenario_name} (N={N}, K={K})")
-    print("-" * 40)
+    seed = data["seed"]  # seed=1
 
     # 1. Random
     np.random.seed(seed)
@@ -94,18 +125,6 @@ def run_experiment_E1():
     adj_cost_bd = compute_adjacent_cost(x_bd, W, M)
     adj_conf_bd = count_adjacent_conflicts(x_bd, W, M)
 
-    print("\n--- ALLOCATIONS FINALES ---")
-    print(f"Random   : x = {x_rand.tolist()}")
-    print(f"Greedy   : x = {x_greedy.tolist()}")
-    print(f"DSATUR   : x = {x_dsatur.tolist()}")
-    print(f"BD-CeNN  : x = {x_bd.tolist()}")
-
-    print("\n--- MÉTRIQUES ---")
-    print(f"Random   : co-canal coût={co_cost_rand:.1f}, conflits={co_conf_rand}  |  adjacent coût={adj_cost_rand:.1f}, conflits={adj_conf_rand}")
-    print(f"Greedy   : co-canal coût={co_cost_greedy:.1f}, conflits={co_conf_greedy}  |  adjacent coût={adj_cost_greedy:.1f}, conflits={adj_conf_greedy}")
-    print(f"DSATUR   : co-canal coût={co_cost_dsatur:.1f}, conflits={co_conf_dsatur}  |  adjacent coût={adj_cost_dsatur:.1f}, conflits={adj_conf_dsatur}")
-    print(f"BD-CeNN  : co-canal coût={co_cost_bd:.1f}, conflits={co_conf_bd}  |  adjacent coût={adj_cost_bd:.1f}, conflits={adj_conf_bd}")
-
     # Table
     df = pd.DataFrame({
         "Méthode": ["Random", "Greedy", "DSATUR", "BD-CeNN"],
@@ -116,7 +135,6 @@ def run_experiment_E1():
         "Adjacent conflits": [adj_conf_rand, adj_conf_greedy, adj_conf_dsatur, adj_conf_bd]
     })
     df.to_csv(config.CSV_DIR / "E1_visual_check.csv", index=False)
-    print(f"\n✅ Table sauvegardée dans {config.CSV_DIR / 'E1_visual_check.csv'}")
 
     # Palette de couleurs
     channel_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
@@ -157,20 +175,16 @@ def run_experiment_E1():
 # ============================================================================
 # E3 – IMPACT DU NOMBRE DE CANAUX (K)
 # ============================================================================
-def run_experiment_E3():
+def run_experiment_E3(verbose=False):
     """
     E3 - Impact du nombre de canaux
     Mesure l'évolution du coût adjacent et des conflits adjacents en fonction de K.
     """
-    print("\n" + "=" * 60)
-    print("🔬 E3 - IMPACT DU NOMBRE DE CANAUX (K)")
-    print("=" * 60)
-
     scenario_name = "S4"
     data = all_data[scenario_name]
     N = data["N"]
     W = np.array(data["W"])
-    seed = data["seed"]
+    seed = data["seed"]  # seed=1
     K_values = [2, 3, 4, 5, 6, 8]
 
     results = []
@@ -188,7 +202,6 @@ def run_experiment_E3():
             "Co-canal coût": co_cost,
             "Co-canal conflits": co_conf
         })
-        print(f"K={K} : Adj coût={adj_cost:.1f}, Adj conflits={adj_conf}  |  Co-canal coût={co_cost:.1f}, Co-conflits={co_conf}")
 
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E3_impact_K.csv", index=False)
@@ -214,19 +227,15 @@ def run_experiment_E3():
 # ============================================================================
 # E4 – IMPACT DE LA DENSITÉ
 # ============================================================================
-def run_experiment_E4():
+def run_experiment_E4(verbose=False):
     """
     E4 - Impact de la densité sur le coût adjacent.
     """
-    print("\n" + "=" * 60)
-    print("🔬 E4 - IMPACT DE LA DENSITÉ (N=50)")
-    print("=" * 60)
-
     scenario_name = "S4"
     base_data = all_data[scenario_name]
     N = base_data["N"]
     K = base_data["K"]
-    base_seed = base_data["seed"]
+    base_seed = base_data["seed"]  # seed=1
 
     density_configs = [
         {"label": "Faible", "threshold": 30},
@@ -275,7 +284,6 @@ def run_experiment_E4():
             "Co-canal coût": co_cost,
             "Co-canal conflits": co_conf
         })
-        print(f"Densité={density*100:.1f}%, Seuil={th}, Adj coût={adj_cost:.1f}, Adj conflits={adj_conf}")
 
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E4_impact_density.csv", index=False)
@@ -300,14 +308,10 @@ def run_experiment_E4():
 # ============================================================================
 # E6 – SCALABILITÉ
 # ============================================================================
-def run_experiment_E6():
+def run_experiment_E6(verbose=False):
     """
     E6 - Scalabilité : temps, coût adjacent et itérations vs N.
     """
-    print("\n" + "=" * 60)
-    print("🔬 E6 - SCALABILITÉ (temps, coût adjacent et itérations vs N)")
-    print("=" * 60)
-
     K = 4
     area = 300
     threshold = 50
@@ -355,7 +359,6 @@ def run_experiment_E6():
             "Itérations": iterations,
             "Densité": density
         })
-        print(f"N={N}, Temps={elapsed:.6f}s, Adj coût={adj_cost:.1f}, Itérations={iterations}")
 
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E6_scalability.csv", index=False)
@@ -391,35 +394,29 @@ def run_experiment_E6():
 # ============================================================================
 # E7 – ROBUSTESSE AU BRUIT
 # ============================================================================
-def run_experiment_E7():
+def run_experiment_E7(verbose=False):
     """
     E7 - Robustesse au bruit sur la matrice W.
     Compare le coût adjacent par rapport à une référence (0% bruit).
+    Utilise la topologie de S6 seed=1.
     """
-    print("\n" + "=" * 60)
-    print("🔬 E7 - ROBUSTESSE AU BRUIT")
-    print("=" * 60)
-
     scenario_name = "S6"
     data = all_data[scenario_name]
     N = data["N"]
     K = data["K"]
     W_clean = np.array(data["W"])
     M = create_channel_interference_matrix(K)
-    base_seed = data["seed"]
+    base_seed = data["seed"]  # seed=1
     num_runs = 30
     num_restarts = 10
     max_iter = 50
 
     # Référence (0% bruit)
-    print("Référence : exécution sur W_clean (0 % de bruit)...")
     x_ref, _, _, _ = bdcenn_allocation(N, K, W_clean, M=M,
                                        num_restarts=num_restarts,
                                        max_iter=max_iter,
                                        seed=base_seed)
     adj_cost_ref = compute_adjacent_cost(x_ref, W_clean, M)
-    print(f"  Coût adjacent de référence = {adj_cost_ref:.1f}")
-    print()
 
     results = [{
         "Bruit (%)": 0.0,
@@ -469,8 +466,6 @@ def run_experiment_E7():
             "Taux changement (%)": change_rate,
             "Coût relatif (%)": degradation
         })
-        print(f"Bruit={noise*100:.0f}%  Coût={mean_cost:.1f} (±{std_cost:.1f})  "
-              f"Cellules modifiées={mean_changes}  Dégradation={degradation:.1f}%")
 
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E7_noise_robustness.csv", index=False)
@@ -499,35 +494,29 @@ def run_experiment_E7():
 # ============================================================================
 # E8 – RÉSEAU DYNAMIQUE
 # ============================================================================
-def run_experiment_E8():
+def run_experiment_E8(verbose=False):
     """
     E8 - Réseau dynamique : modification de 5%, 10%, 20% des arêtes/poids.
     Compare adaptation (depuis ancienne solution) vs réinitialisation.
+    Utilise la topologie de S7 seed=1.
     """
-    print("\n" + "=" * 60)
-    print("🔬 E8 - RÉSEAU DYNAMIQUE")
-    print("=" * 60)
-
     scenario_name = "S7"
     data = all_data[scenario_name]
     N = data["N"]
     K = data["K"]
     W_original = np.array(data["W"])
     M = create_channel_interference_matrix(K)
-    base_seed = data["seed"]
+    base_seed = data["seed"]  # seed=1
     num_runs = 30
     num_restarts = 10
     max_iter = 50
 
     # Référence
-    print("Référence : exécution sur le réseau original...")
     x_ref, _, _, _ = bdcenn_allocation(N, K, W_original, M=M,
                                        num_restarts=num_restarts,
                                        max_iter=max_iter,
                                        seed=base_seed)
     adj_cost_ref = compute_adjacent_cost(x_ref, W_original, M)
-    print(f"  Coût adjacent de référence = {adj_cost_ref:.1f}")
-    print()
 
     modifications = [0.05, 0.10, 0.20]
     results = []
@@ -561,7 +550,7 @@ def run_experiment_E8():
             start = time.perf_counter()
             x_adapt, _, _, _ = bdcenn_allocation(
                 N, K, W_modified, M=M,
-                num_restarts=1,          # un seul redémarrage pour l'adaptation
+                num_restarts=1,
                 max_iter=30,
                 seed=base_seed + run_seed,
                 verbose=False
@@ -604,8 +593,6 @@ def run_experiment_E8():
             "Temps adaptation (s)": mean_time,
             "Gain (zéro - adapté)": gain
         })
-        print(f"Modif={mod*100:.0f}%  Adapté={mean_adapt:.1f} (±{std_adapt:.1f})  "
-              f"Zéro={mean_scratch:.1f} (±{std_scratch:.1f})  Réaffectations={mean_changes}  Gain={gain:+.1f}")
 
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E8_dynamic_network.csv", index=False)
@@ -636,21 +623,17 @@ def run_experiment_E8():
 # ============================================================================
 # E9 – MINIMA LOCAUX (effet des redémarrages)
 # ============================================================================
-def run_experiment_E9():
+def run_experiment_E9(verbose=False):
     """
     E9 - Minima locaux : effet du nombre de redémarrages sur le coût adjacent et le temps.
     """
-    print("\n" + "=" * 60)
-    print("🔬 E9 - MINIMA LOCAUX (effet des redémarrages)")
-    print("=" * 60)
-
     scenario_name = "S4"
     data = all_data[scenario_name]
     N = data["N"]
     K = data["K"]
     W = np.array(data["W"])
     M = create_channel_interference_matrix(K)
-    seed = data["seed"]
+    seed = data["seed"]  # seed=1
 
     restart_values = [1, 5, 10, 20]
     results = []
@@ -677,7 +660,6 @@ def run_experiment_E9():
             "Co-canal conflits": co_conf,
             "Temps total (s)": elapsed
         })
-        print(f"Redémarrages={num_restarts} : Adj coût={adj_cost:.1f}, Adj conflits={adj_conf}, Temps={elapsed:.6f}s")
 
     df = pd.DataFrame(results)
     df.to_csv(config.CSV_DIR / "E9_restart_effect.csv", index=False)
@@ -715,20 +697,20 @@ def run_experiment_E9():
 # ============================================================================
 # ORCHESTRATEUR PRINCIPAL
 # ============================================================================
-def run_all_experiments():
+def run_all_experiments(verbose=False):
     """
     Lance toutes les expériences (E1, E3, E4, E6, E7, E8, E9).
     """
     print("\n" + "🚀 LANCEMENT DES EXPÉRIENCES SPÉCIFIQUES")
     print("=" * 80)
 
-    run_experiment_E1()
-    run_experiment_E3()
-    run_experiment_E4()
-    run_experiment_E6()
-    run_experiment_E7()
-    run_experiment_E8()
-    run_experiment_E9()
+    run_experiment_E1(verbose)
+    run_experiment_E3(verbose)
+    run_experiment_E4(verbose)
+    run_experiment_E6(verbose)
+    run_experiment_E7(verbose)
+    run_experiment_E8(verbose)
+    run_experiment_E9(verbose)
 
     print("\n" + "=" * 80)
     print("✅ TOUTES LES EXPÉRIENCES SONT TERMINÉES.")

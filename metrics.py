@@ -1,3 +1,4 @@
+# metrics.py
 import numpy as np
 
 # ============================================================
@@ -91,3 +92,21 @@ def compute_metrics_adjacent(x, W, M):
     conflicts = count_adjacent_conflicts(x, W, M)
     used_channels = len(set(x))
     return {"cost": cost, "conflicts": conflicts, "used_channels": used_channels}
+
+# ============================================================
+# 3. Fonctions statistiques
+# ============================================================
+
+def compute_confidence_interval(data, confidence=0.95):
+    """
+    Calcule l'intervalle de confiance à 95% pour un tableau de données.
+    Retourne (borne_inf, borne_sup)
+    """
+    n = len(data)
+    mean = np.mean(data)
+    std_err = np.std(data, ddof=1) / np.sqrt(n)  # erreur standard
+    # Pour 95% de confiance, on utilise z=1.96 (approximation normale)
+    # Si n < 30, on pourrait utiliser la loi de Student, mais on garde 1.96 pour simplifier
+    z = 1.96
+    ci = z * std_err
+    return mean - ci, mean + ci

@@ -2,7 +2,7 @@
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-from data_generator import all_data
+import json
 from metrics import create_channel_interference_matrix  
 import config
 from matplotlib.patches import Patch
@@ -10,6 +10,10 @@ import os
 
 fig_dir = config.FIGURES_DIR
 os.makedirs(fig_dir, exist_ok=True)
+
+# --- Charger les données depuis le fichier JSON ---
+with open(config.SCENARIOS_FILE, "r") as f:
+    all_data = json.load(f)
 
 # --- 1. Matrice M (K=8) une seule fois ---
 K_M = 8
@@ -35,12 +39,29 @@ plt.close()
 print(f"✅ Matrice M sauvegardée dans {fig_dir / 'matrix_M.png'}")
 
 # --- 2. Graphes et matrices W pour chaque scénario (7) ---
-for name, data in all_data.items():
-    N = data["N"]
-    K = data["K"]
-    seed = data["seed"]
-    G = data["graph"]
-    positions = data["positions"]
+# On prend l'instance avec seed=1 pour chaque scénario
+for name, instances in all_data.items():
+    # Récupérer l'instance avec seed=1
+    instance = instances.get("1")
+    if instance is None:
+        print(f"⚠️ Seed 1 manquante pour {name}, on prend la première disponible.")
+        first_seed = list(instances.keys())[0]
+        instance = instances[first_seed]
+    
+    N = instance["N"]
+    K = instance["K"]
+    seed = instance["seed"]
+    positions = np.array(instance["positions"])
+    W = np.array(instance["W"])
+    
+    # Reconstruire le graphe à partir de W
+    G = nx.Graph()
+    G.add_nodes_from(range(N))
+    for i in range(N):
+        for j in range(i+1, N):
+            if W[i, j] > 0:
+                G.add_edge(i, j, weight=W[i, j])
+    
     pos_dict = {i: tuple(positions[i]) for i in range(N)}
     
     # A. Graphe
@@ -74,7 +95,6 @@ for name, data in all_data.items():
 
     # B. Matrice W
     plt.figure(figsize=(8, 6))
-    W = np.array(data["W"])
     im = plt.imshow(W, cmap='Reds', interpolation='nearest', vmin=0, vmax=4)
     if N <= 15:
         for i in range(N):

@@ -2,16 +2,15 @@
 import numpy as np
 import json
 import networkx as nx
-from config import SEED_BASE, SCENARIOS, SCENARIOS_FILE  # <-- utilisation de SCENARIOS_FILE
+from config import SCENARIOS, SCENARIOS_FILE, TOPOLOGY_SEEDS
 
-def generate_scenario(name, params, seed_offset=0):
-    # ... (inchangé)
-    seed = SEED_BASE + seed_offset
+def generate_network(N, K, area, threshold, seed):
+    """
+    Génère une matrice d'interférence W, les positions et le graphe G
+    à partir d'une seed donnée.
+    Retourne : (W, positions, G)
+    """
     np.random.seed(seed)
-    N = params["N"]
-    K = params["K"]
-    area = params["area"]
-    threshold = params["threshold"]
     positions = np.random.rand(N, 2) * area
     W = np.zeros((N, N))
     for i in range(N):
@@ -33,37 +32,40 @@ def generate_scenario(name, params, seed_offset=0):
         for j in range(i+1, N):
             if W[i, j] > 0:
                 G.add_edge(i, j, weight=W[i, j])
-    return {
-        "name": name,
-        "seed": seed,
-        "N": N,
-        "K": K,
-        "threshold": threshold,
-        "positions": positions.tolist(),
-        "W": W.tolist(),
-        "graph": G
-    }
+    return W, positions, G
 
+# --- Génération des 30 instances pour chaque scénario ---
 all_data = {}
-for idx, (name, params) in enumerate(SCENARIOS.items()):
-    all_data[name] = generate_scenario(name, params, seed_offset=idx)
-    print(f"✅ Scénario {name} généré avec la seed {all_data[name]['seed']} : N={params['N']}, K={params['K']}, threshold={params['threshold']}")
 
+print("🔄 Génération des 30 instances pour chaque scénario...")
+for name, params in SCENARIOS.items():
+    N = params["N"]
+    K = params["K"]
+    area = params["area"]
+    threshold = params["threshold"]
+    
+    scenario_instances = {}
+    for seed in TOPOLOGY_SEEDS:
+        W, positions, G = generate_network(N, K, area, threshold, seed)
+        scenario_instances[str(seed)] = {
+            "seed": seed,
+            "N": N,
+            "K": K,
+            "threshold": threshold,
+            "positions": positions.tolist(),
+            "W": W.tolist()
+            # Le graphe G n'est pas sauvegardé dans le JSON car il contient des objets NetworkX non sérialisables
+        }
+    all_data[name] = scenario_instances
+    print(f"   - Scénario {name} : {len(scenario_instances)} instances générées.")
+
+# Sauvegarde dans le JSON
 data_to_save = {}
-for name, data in all_data.items():
-    data_to_save[name] = {
-        "seed": data["seed"],
-        "N": data["N"],
-        "K": data["K"],
-        "threshold": data["threshold"],
-        "positions": data["positions"],
-        "W": data["W"]
-    }
+for name, instances in all_data.items():
+    # On convertit les clés en chaînes de caractères pour le JSON
+    data_to_save[name] = {str(seed): inst for seed, inst in instances.items()}
 
-# Sauvegarde dans le dossier data/ via config
 with open(SCENARIOS_FILE, "w") as f:
     json.dump(data_to_save, f, indent=4)
 
-print(f"💾 Données sauvegardées dans '{SCENARIOS_FILE}' avec les seeds suivantes :")
-for name, data in data_to_save.items():
-    print(f"   - {name} : seed {data['seed']}, threshold = {data['threshold']}")
+print(f"💾 Données sauvegardées dans '{SCENARIOS_FILE}' avec les seeds 1 à {len(TOPOLOGY_SEEDS)} pour chaque scénario.")

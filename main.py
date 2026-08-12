@@ -21,11 +21,13 @@ if __name__ == "__main__":
     else:
         print("✅ Fichier validation_results.xlsx trouvé.")
     
-    # 3. Générer le rapport final (plots)
+    # 3. Générer le rapport final (plots standard)
     plots.generate_full_experiment_plots()
     
     # 4. Lancer les expériences spécifiques (E1, E3, E4, E6, E7, E8, E9)
     experiments.run_all_experiments()
+    
+    
     
     print("\n" + "="*80)
     print("🏁 PIPELINE COMPLET TERMINÉ.")

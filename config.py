@@ -20,19 +20,29 @@ SCENARIOS_FILE = DATA_DIR / "scenarios_data.json"
 
 VALIDATION_EXCEL_FILE = EXCEL_DIR / "validation_results.xlsx"
 CONVERGENCE_HISTORY_FILE = CSV_DIR / "convergence_history.csv"
+CONVERGENCE_HISTORY_COCHANNEL_FILE = CSV_DIR / "convergence_history_cochannel.csv"
 SUMMARY_CSV_FILE = CSV_DIR / "validation_summary_table.csv"
 FULL_TABLE_CSV_FILE = CSV_DIR / "comparison_full_table.csv"
 
+# --- Fichiers CSV pour les statistiques supplémentaires ---
+STATS_MEDIAN_CSV = CSV_DIR / "stats_median.csv"
+STATS_MIN_CSV = CSV_DIR / "stats_min.csv"
+STATS_MAX_CSV = CSV_DIR / "stats_max.csv"
+STATS_CI_CSV = CSV_DIR / "stats_confidence_interval.csv"
+STATS_ITERATIONS_CSV = CSV_DIR / "stats_iterations.csv"
+
 # --- 5. Paramètres généraux ---
-SEED_BASE = 42
 NUM_RUNS = 30
-MAX_ITER_BD = 50          # Nombre d'itérations maximales par lancement
-NUM_RESTARTS = 10         # Nombre de redémarrages pour le BD-CeNN
+MAX_ITER_BD = 50
+NUM_RESTARTS = 10
 
-# --- 6. Pour l'expérience E9 (effet du nombre de redémarrages) ---
-RESTART_EXPERIMENT_VALUES = [1, 5, 10, 20]  # Nombres de redémarrages à tester
+# --- 6. Seeds de topologie pour les 30 instances ---
+TOPOLOGY_SEEDS = list(range(1, NUM_RUNS + 1))  # [1, 2, ..., 30]
 
-# --- 7. Fonction pour créer les dossiers ---
+# --- 7. Pour l'expérience E9 (effet du nombre de redémarrages) ---
+RESTART_EXPERIMENT_VALUES = [1, 5, 10, 20]
+
+# --- 8. Fonction pour créer les dossiers ---
 def ensure_dirs():
     """Crée tous les dossiers nécessaires s'ils n'existent pas."""
     dirs = [DATA_DIR, RESULTS_DIR, EXCEL_DIR, CSV_DIR, FIGURES_DIR, LOGS_DIR, LLM_LOGS_DIR]
@@ -41,7 +51,7 @@ def ensure_dirs():
 
 ensure_dirs()
 
-# --- 8. Scénarios selon le guide pratique (§4.2) ---
+# --- 9. Scénarios selon le guide pratique (§4.2) ---
 def build_scenarios():
     """
     7 familles de scénarios conformes au guide pratique :
@@ -54,18 +64,14 @@ def build_scenarios():
     S7 - Réseau dynamique (N=50, K=4, threshold 35) - à utiliser pour E8
     """
     scenarios = {
-        "S1": {"N": 8, "K": 3, "area": 100, "threshold": 30},      # Petit graphe visuel à faible densité
-        "S2": {"N": 30, "K": 4, "area": 150, "threshold": 35},     # Réseau moyen
-        "S3": {"N": 50, "K": 6, "area": 200, "threshold": 60},     # Réseau dense
-        "S4": {"N": 50, "K": 2, "area": 200, "threshold": 40},     # Peu de canaux
-        "S5": {"N": 100, "K": 8, "area": 300, "threshold": 50},    # Scalabilité
-        "S6": {"N": 50, "K": 4, "area": 200, "threshold": 35},     # Bruité (E7)
-        "S7": {"N": 50, "K": 4, "area": 200, "threshold": 35},     # Dynamique (E8)
+        "S1": {"N": 8, "K": 3, "area": 100, "threshold": 30},
+        "S2": {"N": 30, "K": 4, "area": 150, "threshold": 35},
+        "S3": {"N": 50, "K": 6, "area": 200, "threshold": 60},
+        "S4": {"N": 50, "K": 2, "area": 200, "threshold": 40},
+        "S5": {"N": 100, "K": 8, "area": 300, "threshold": 50},
+        "S6": {"N": 50, "K": 4, "area": 200, "threshold": 35},
+        "S7": {"N": 50, "K": 4, "area": 200, "threshold": 35},
     }
     return scenarios
 
 SCENARIOS = build_scenarios()
-
-
-
-
