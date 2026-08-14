@@ -29,12 +29,17 @@ STATS_MEDIAN_CSV = CSV_DIR / "stats_median.csv"
 STATS_MIN_CSV = CSV_DIR / "stats_min.csv"
 STATS_MAX_CSV = CSV_DIR / "stats_max.csv"
 STATS_CI_CSV = CSV_DIR / "stats_confidence_interval.csv"
+# --- Fichiers CSV pour les statistiques des itérations ---
 STATS_ITERATIONS_CSV = CSV_DIR / "stats_iterations.csv"
+STATS_ITERATIONS_CO_CSV = CSV_DIR / "stats_iterations_co.csv"
+STATS_ITERATIONS_ADJ_CSV = CSV_DIR / "stats_iterations_adj.csv"
 
 # --- 5. Paramètres généraux ---
 NUM_RUNS = 30
-MAX_ITER_BD = 50
-NUM_RESTARTS = 10
+MAX_ITER_BD = 50          # Nombre maximal d'itérations par redémarrage
+NUM_RESTARTS = 10         # Nombre de redémarrages pour le BD-CeNN
+PATIENCE =10            # Nombre d'itérations sans changement avant arrêt (anciennement 5)
+
 
 # --- 6. Seeds de topologie pour les 30 instances ---
 TOPOLOGY_SEEDS = list(range(1, NUM_RUNS + 1))  # [1, 2, ..., 30]
@@ -70,7 +75,7 @@ def build_scenarios():
         "S4": {"N": 50, "K": 2, "area": 200, "threshold": 40},
         "S5": {"N": 100, "K": 8, "area": 300, "threshold": 50},
         "S6": {"N": 50, "K": 4, "area": 200, "threshold": 35},
-        "S7": {"N": 50, "K": 4, "area": 200, "threshold": 35},
+        "S7": {"N": 45, "K": 5, "area": 200, "threshold": 30},
     }
     return scenarios
 

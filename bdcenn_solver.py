@@ -2,6 +2,7 @@
 import numpy as np
 import time
 from metrics import compute_cochannel_cost, count_cochannel_conflicts, compute_adjacent_cost
+import config
 
 def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=None, verbose=False):
     """
@@ -62,15 +63,19 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
         if verbose and (iteration % 10 == 0 or iteration == max_iter - 1):
             print(f"  [BD-CeNN] Itération {iteration+1}/{max_iter} : coût = {current_cost}")
         
+        # Arrêt anticipé si coût nul
         if current_cost == 0:
             if verbose:
                 print(f"  [BD-CeNN] Convergence atteinte (coût nul) à l'itération {iteration+1}")
             break
-        if len(history) > 10:
-            recent_costs = [h[1] for h in history[-5:]]
+        
+        # Vérification de la stabilisation avec la patience définie dans config
+        patience = config.PATIENCE
+        if len(history) > patience:
+            recent_costs = [h[1] for h in history[-patience:]]
             if all(c == recent_costs[0] for c in recent_costs):
                 if verbose:
-                    print(f"  [BD-CeNN] Stabilisation détectée à l'itération {iteration+1}")
+                    print(f"  [BD-CeNN] Stabilisation détectée (patience={patience}) à l'itération {iteration+1}")
                 break
     
     elapsed = time.perf_counter() - start_time
