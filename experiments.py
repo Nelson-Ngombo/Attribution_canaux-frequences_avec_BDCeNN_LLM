@@ -119,7 +119,7 @@ def run_experiment_E1(verbose=False):
     adj_conf_dsatur = count_adjacent_conflicts(x_dsatur, W, M)
 
     # 4. BD-CeNN
-    x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
+    x_bd, _, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
     co_cost_bd = compute_cochannel_cost(x_bd, W)
     co_conf_bd = count_cochannel_conflicts(x_bd, W)
     adj_cost_bd = compute_adjacent_cost(x_bd, W, M)
@@ -190,7 +190,7 @@ def run_experiment_E3(verbose=False):
     results = []
     for K in K_values:
         M = create_channel_interference_matrix(K)
-        x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
+        x_bd, _, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=seed)
         adj_cost = compute_adjacent_cost(x_bd, W, M)
         adj_conf = count_adjacent_conflicts(x_bd, W, M)
         co_cost = compute_cochannel_cost(x_bd, W)
@@ -269,7 +269,7 @@ def run_experiment_E4(verbose=False):
         density = 2 * edge_count / (N * (N - 1))
 
         M = create_channel_interference_matrix(K)
-        x_bd, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=base_seed)
+        x_bd, _, _, _, _ = bdcenn_allocation(N, K, W, M=M, num_restarts=10, max_iter=50, seed=base_seed)
         adj_cost = compute_adjacent_cost(x_bd, W, M)
         adj_conf = count_adjacent_conflicts(x_bd, W, M)
         co_cost = compute_cochannel_cost(x_bd, W)
@@ -342,7 +342,7 @@ def run_experiment_E6(verbose=False):
                     edge_count += 1
         M = create_channel_interference_matrix(K)
         start = time.perf_counter()
-        x_bd, history, elapsed, _ = bdcenn_allocation(
+        x_bd, history, elapsed, _, _ = bdcenn_allocation(
             N, K, W, M=M,
             num_restarts=num_restarts,
             max_iter=max_iter,
@@ -412,7 +412,7 @@ def run_experiment_E7(verbose=False):
     max_iter = 50
 
     # Référence (0% bruit)
-    x_ref, _, _, _ = bdcenn_allocation(N, K, W_clean, M=M,
+    x_ref, _, _, _, _ = bdcenn_allocation(N, K, W_clean, M=M,
                                        num_restarts=num_restarts,
                                        max_iter=max_iter,
                                        seed=base_seed)
@@ -443,7 +443,7 @@ def run_experiment_E7(verbose=False):
             W_noisy[W_noisy < 0] = 0
             np.fill_diagonal(W_noisy, 0)
 
-            x_bd, _, _, _ = bdcenn_allocation(N, K, W_noisy, M=M,
+            x_bd, _, _, _, _ = bdcenn_allocation(N, K, W_noisy, M=M,
                                               num_restarts=num_restarts,
                                               max_iter=max_iter,
                                               seed=base_seed + run_seed + 100)
@@ -512,7 +512,7 @@ def run_experiment_E8(verbose=False):
     max_iter = 50
 
     # Référence
-    x_ref, _, _, _ = bdcenn_allocation(N, K, W_original, M=M,
+    x_ref, _, _, _, _ = bdcenn_allocation(N, K, W_original, M=M,
                                        num_restarts=num_restarts,
                                        max_iter=max_iter,
                                        seed=base_seed)
@@ -548,7 +548,7 @@ def run_experiment_E8(verbose=False):
 
             # Adaptation (départ de x_ref)
             start = time.perf_counter()
-            x_adapt, _, _, _ = bdcenn_allocation(
+            x_adapt, _, _, _, _ = bdcenn_allocation(
                 N, K, W_modified, M=M,
                 num_restarts=1,
                 max_iter=30,
@@ -559,7 +559,7 @@ def run_experiment_E8(verbose=False):
             cost_adapt = compute_adjacent_cost(x_adapt, W_modified, M)
 
             # Depuis zéro (redémarrages multiples)
-            x_scratch, _, _, _ = bdcenn_allocation(
+            x_scratch, _, _, _, _ = bdcenn_allocation(
                 N, K, W_modified, M=M,
                 num_restarts=num_restarts,
                 max_iter=max_iter,
@@ -640,7 +640,7 @@ def run_experiment_E9(verbose=False):
 
     for num_restarts in restart_values:
         start_time = time.perf_counter()
-        x_bd, _, _, _ = bdcenn_allocation(
+        x_bd, _, _, _, _ = bdcenn_allocation(
             N, K, W, M=M,
             num_restarts=num_restarts,
             max_iter=50,

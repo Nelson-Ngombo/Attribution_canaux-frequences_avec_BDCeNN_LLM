@@ -242,8 +242,9 @@ def generate_full_experiment_plots():
         df_min = pd.read_csv(config.STATS_MIN_CSV)
         df_max = pd.read_csv(config.STATS_MAX_CSV)
         df_ci = pd.read_csv(config.STATS_CI_CSV)
-        df_iter_co = pd.read_csv(config.STATS_ITERATIONS_CO_CSV)
-        df_iter_adj = pd.read_csv(config.STATS_ITERATIONS_ADJ_CSV)
+        # Lecture des nouvelles statistiques d'itérations jusqu'au minimum
+        df_best_iter_co = pd.read_csv(config.STATS_BEST_ITERATION_CO_CSV)
+        df_best_iter_adj = pd.read_csv(config.STATS_BEST_ITERATION_ADJ_CSV)
     except FileNotFoundError as e:
         print(f"⚠️ Fichier CSV manquant : {e}. Figures supplémentaires ignorées.")
     else:
@@ -359,44 +360,63 @@ def generate_full_experiment_plots():
             plt.close(fig)
             print(f"✅ Figure confidence_interval_{metric_prefix}.png sauvegardée.")
 
-        # --- 4.2 Figure du nombre de balayages (itérations) pour co-canal et adjacent ---
+        # ================================================================
+        # 4.2 Figure des itérations jusqu'au MINIMUM LOCAL (best_iteration)
+        #     On affiche uniquement les figures bd_best_iterations_histogram_*
+        # ================================================================
+
         # Co-canal
-        if not df_iter_co.empty and 'iter_mean_co' in df_iter_co.columns:
+        if not df_best_iter_co.empty and 'best_iter_mean_co' in df_best_iter_co.columns:
             fig, ax = plt.subplots(figsize=(10, 6))
-            x = np.arange(len(df_iter_co['scenario']))
-            ax.bar(x, df_iter_co['iter_mean_co'], yerr=df_iter_co['iter_std_co'], capsize=5,
-                   color='teal', alpha=0.7, label='Moyenne ± écart-type (co-canal)')
+            x = np.arange(len(df_best_iter_co['scenario']))
+            # Arrondir la moyenne à l'entier le plus proche
+            mean_rounded = df_best_iter_co['best_iter_mean_co'].round(0)
+            # L'écart-type reste affiché avec une décimale
+            std_rounded = df_best_iter_co['best_iter_std_co'].round(1)
+            ax.bar(x, mean_rounded, 
+                   yerr=std_rounded, capsize=5,
+                   color='teal', alpha=0.7, label='Moyenne ± écart-type')
             ax.set_xticks(x)
-            ax.set_xticklabels(df_iter_co['scenario'])
+            ax.set_xticklabels(df_best_iter_co['scenario'])
             ax.set_xlabel('Scénario')
-            ax.set_ylabel("Nombre de balayages effectués")
-            ax.set_title("BD-CeNN (co-canal) - Nombre d'itérations avant arrêt")
+            ax.set_ylabel("Nombre d'itérations")
+            ax.set_title("BD-CeNN (co-canal) - Itérations jusqu'à l'atteinte du meilleur coût")
             ax.grid(axis='y', linestyle='--', alpha=0.3)
-            for i, row in df_iter_co.iterrows():
-                ax.text(i, row['iter_mean_co'] + 0.5, f"{row['iter_mean_co']:.1f}", ha='center', fontsize=9)
+            # Ajouter les valeurs avec la moyenne arrondie
+            for i, row in df_best_iter_co.iterrows():
+                mean_int = int(round(row['best_iter_mean_co']))
+                ax.text(i, mean_int + 0.5, 
+                        f"{mean_int} ± {row['best_iter_std_co']:.1f}", 
+                        ha='center', fontsize=8, rotation=0)
             plt.tight_layout()
-            plt.savefig(figures_dir / "bd_iterations_histogram_co.png", dpi=300)
+            plt.savefig(figures_dir / "bd_best_iterations_histogram_co.png", dpi=300)
             plt.close(fig)
-            print("✅ Figure bd_iterations_histogram_co.png sauvegardée.")
+            print("✅ Figure bd_best_iterations_histogram_co.png sauvegardée.")
 
         # Adjacent
-        if not df_iter_adj.empty and 'iter_mean_adj' in df_iter_adj.columns:
+        if not df_best_iter_adj.empty and 'best_iter_mean_adj' in df_best_iter_adj.columns:
             fig, ax = plt.subplots(figsize=(10, 6))
-            x = np.arange(len(df_iter_adj['scenario']))
-            ax.bar(x, df_iter_adj['iter_mean_adj'], yerr=df_iter_adj['iter_std_adj'], capsize=5,
-                   color='coral', alpha=0.7, label='Moyenne ± écart-type (adjacent)')
+            x = np.arange(len(df_best_iter_adj['scenario']))
+            mean_rounded = df_best_iter_adj['best_iter_mean_adj'].round(0)
+            std_rounded = df_best_iter_adj['best_iter_std_adj'].round(1)
+            ax.bar(x, mean_rounded, 
+                   yerr=std_rounded, capsize=5,
+                   color='coral', alpha=0.7, label='Moyenne ± écart-type')
             ax.set_xticks(x)
-            ax.set_xticklabels(df_iter_adj['scenario'])
+            ax.set_xticklabels(df_best_iter_adj['scenario'])
             ax.set_xlabel('Scénario')
-            ax.set_ylabel("Nombre de balayages effectués")
-            ax.set_title("BD-CeNN (adjacent) - Nombre d'itérations avant arrêt")
+            ax.set_ylabel("Nombre d'itérations")
+            ax.set_title("BD-CeNN (adjacent) - Itérations jusqu'à l'atteinte du meilleur coût")
             ax.grid(axis='y', linestyle='--', alpha=0.3)
-            for i, row in df_iter_adj.iterrows():
-                ax.text(i, row['iter_mean_adj'] + 0.5, f"{row['iter_mean_adj']:.1f}", ha='center', fontsize=9)
+            for i, row in df_best_iter_adj.iterrows():
+                mean_int = int(round(row['best_iter_mean_adj']))
+                ax.text(i, mean_int + 0.5, 
+                        f"{mean_int} ± {row['best_iter_std_adj']:.1f}", 
+                        ha='center', fontsize=8, rotation=0)
             plt.tight_layout()
-            plt.savefig(figures_dir / "bd_iterations_histogram_adj.png", dpi=300)
+            plt.savefig(figures_dir / "bd_best_iterations_histogram_adj.png", dpi=300)
             plt.close(fig)
-            print("✅ Figure bd_iterations_histogram_adj.png sauvegardée.")
+            print("✅ Figure bd_best_iterations_histogram_adj.png sauvegardée.")
 
     # --- 5. Exporter le tableau récapitulatif au format CSV ---
     df_summary.to_csv(summary_csv, index=False)

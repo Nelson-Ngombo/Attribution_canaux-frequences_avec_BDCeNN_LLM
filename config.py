@@ -24,6 +24,7 @@ CONVERGENCE_HISTORY_COCHANNEL_FILE = CSV_DIR / "convergence_history_cochannel.cs
 SUMMARY_CSV_FILE = CSV_DIR / "validation_summary_table.csv"
 FULL_TABLE_CSV_FILE = CSV_DIR / "comparison_full_table.csv"
 
+
 # --- Fichiers CSV pour les statistiques supplémentaires ---
 STATS_MEDIAN_CSV = CSV_DIR / "stats_median.csv"
 STATS_MIN_CSV = CSV_DIR / "stats_min.csv"
@@ -33,6 +34,8 @@ STATS_CI_CSV = CSV_DIR / "stats_confidence_interval.csv"
 STATS_ITERATIONS_CSV = CSV_DIR / "stats_iterations.csv"
 STATS_ITERATIONS_CO_CSV = CSV_DIR / "stats_iterations_co.csv"
 STATS_ITERATIONS_ADJ_CSV = CSV_DIR / "stats_iterations_adj.csv"
+STATS_BEST_ITERATION_CO_CSV = CSV_DIR / "stats_best_iteration_co.csv"
+STATS_BEST_ITERATION_ADJ_CSV = CSV_DIR / "stats_best_iteration_adj.csv"
 
 # --- 5. Paramètres généraux ---
 NUM_RUNS = 30
@@ -66,7 +69,7 @@ def build_scenarios():
     S4 - Peu de canaux (N=50, K=2)
     S5 - Scalabilité (N=100, K=8)
     S6 - Réseau bruité (N=50, K=4, threshold 35)  - à utiliser pour E7
-    S7 - Réseau dynamique (N=50, K=4, threshold 35) - à utiliser pour E8
+    S7 - Réseau dynamique (N=45, K=5, threshold 30) - à utiliser pour E8
     """
     scenarios = {
         "S1": {"N": 8, "K": 3, "area": 100, "threshold": 30},

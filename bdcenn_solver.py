@@ -7,6 +7,8 @@ import config
 def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=None, verbose=False):
     """
     Une seule exécution du BD-CeNN (asynchrone, sans recuit).
+    Retourne : (x, history, elapsed, conflicts, best_iteration)
+    où best_iteration est l'itération à laquelle le meilleur coût a été atteint pour la première fois.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -18,6 +20,9 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
         best_cost = compute_adjacent_cost(x, W, M)
     else:
         best_cost = compute_cochannel_cost(x, W)
+    
+    # L'itération 0 est l'initialisation, c'est le point de départ
+    best_iteration = 0  # Itération du meilleur coût trouvé
     
     history = [(0, best_cost, x.copy())]
     if verbose:
@@ -54,9 +59,11 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
         else:
             current_cost = compute_cochannel_cost(x, W)
         
+        # Si le coût courant est meilleur que le meilleur connu, on le met à jour
         if current_cost < best_cost:
             best_cost = current_cost
             best_x = x.copy()
+            best_iteration = iteration + 1  # L'itération courante (1-indexée)
         
         history.append((iteration + 1, current_cost, x.copy()))
         
@@ -80,7 +87,7 @@ def _bdcenn_single_run(N, K, W, M=None, max_iter=50, random_order=True, seed=Non
     
     elapsed = time.perf_counter() - start_time
     conflicts = count_cochannel_conflicts(best_x, W)
-    return best_x, history, elapsed, conflicts
+    return best_x, history, elapsed, conflicts, best_iteration
 
 
 def bdcenn_allocation(N, K, W, M=None, num_restarts=10, max_iter=50, random_order=True, seed=None, verbose=False):
@@ -88,6 +95,8 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=10, max_iter=50, random_orde
     Solveur BD-CeNN avec redémarrages multiples :
     exécute le solveur `num_restarts` fois avec des initialisations aléatoires différentes,
     et retourne la meilleure solution (coût minimal).
+    Retourne : (best_x, best_history, best_time, best_conflicts, best_iteration)
+    où best_iteration est l'itération du meilleur coût parmi les redémarrages.
     """
     if seed is None:
         seed = 42
@@ -97,10 +106,11 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=10, max_iter=50, random_orde
     best_history = None
     best_time = 0.0
     best_conflicts = 0
+    best_iteration = 0  # Itération du meilleur coût global
     
     for i in range(num_restarts):
         seed_i = seed + i
-        x, hist, elapsed, conf = _bdcenn_single_run(
+        x, hist, elapsed, conf, iter_best = _bdcenn_single_run(
             N, K, W, M=M,
             max_iter=max_iter,
             random_order=random_order,
@@ -112,11 +122,13 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=10, max_iter=50, random_orde
             cost = compute_adjacent_cost(x, W, M)
         else:
             cost = compute_cochannel_cost(x, W)
+        
         if cost < best_cost:
             best_cost = cost
             best_x = x
             best_history = hist
             best_time = elapsed
             best_conflicts = conf
+            best_iteration = iter_best  # On garde l'itération de la meilleure solution
     
-    return best_x, best_history, best_time, best_conflicts
+    return best_x, best_history, best_time, best_conflicts, best_iteration

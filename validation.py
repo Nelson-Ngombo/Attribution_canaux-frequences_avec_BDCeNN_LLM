@@ -47,6 +47,7 @@ def run_validation():
     excel_file = config.VALIDATION_EXCEL_FILE
 
     # Pour stocker le nombre de balayages par run pour BD-CeNN
+    # On va stocker à la fois les itérations totales (arrêt) et les itérations jusqu'au minimum
     iterations_data_adj = []
     iterations_data_co = []
 
@@ -141,7 +142,7 @@ def run_validation():
             #    pour que seules les fonctions de coût diffèrent.
             # ================================================================
             # 4.1 Co-canal
-            x_bd_co, history_bd_co, t_bd_co, conf_bd_co = bdcenn_allocation(
+            x_bd_co, history_bd_co, t_bd_co, conf_bd_co, best_iter_co = bdcenn_allocation(
                 N, K, W, M=None,
                 num_restarts=config.NUM_RESTARTS,
                 max_iter=config.MAX_ITER_BD,
@@ -149,13 +150,13 @@ def run_validation():
                 seed=run_seed,           # seed de base
                 verbose=False
             )
-            iterations_used_co = len(history_bd_co) - 1
+            iterations_used_co = len(history_bd_co) - 1  # itérations totales jusqu'à l'arrêt
             cochannel_cost_bd = compute_cochannel_cost(x_bd_co, W)
             cochannel_conf_bd = count_cochannel_conflicts(x_bd_co, W)
             used_bd_co = len(set(x_bd_co))
 
             # 4.2 Adjacent (MÊME seed que pour co-canal)
-            x_bd_adj, history_bd_adj, t_bd_adj, conf_bd_adj = bdcenn_allocation(
+            x_bd_adj, history_bd_adj, t_bd_adj, conf_bd_adj, best_iter_adj = bdcenn_allocation(
                 N, K, W, M=M,
                 num_restarts=config.NUM_RESTARTS,
                 max_iter=config.MAX_ITER_BD,
@@ -168,17 +169,19 @@ def run_validation():
             adjacent_conf_bd = count_adjacent_conflicts(x_bd_adj, W, M)
             used_bd_adj = len(set(x_bd_adj))
 
-            # --- Stocker les itérations pour BD-CeNN ---
+            # --- Stocker les itérations pour BD-CeNN (totales et jusqu'au minimum) ---
             iterations_data_co.append({
                 "run_seed": run_seed,
                 "scenario": name,
-                "iterations_used": iterations_used_co,
+                "iterations_used": iterations_used_co,      # total jusqu'à arrêt
+                "best_iteration": best_iter_co,             # itération du meilleur coût
                 "max_iter": config.MAX_ITER_BD
             })
             iterations_data_adj.append({
                 "run_seed": run_seed,
                 "scenario": name,
                 "iterations_used": iterations_used_adj,
+                "best_iteration": best_iter_adj,
                 "max_iter": config.MAX_ITER_BD
             })
 
@@ -209,11 +212,12 @@ def run_validation():
                 "scenario": name,
                 "N": N,
                 "K": K,
+                # seed_scenario est conservé pour traçabilité dans Raw_Data
                 "seed_scenario": seed_scenario,
                 # Métriques co-canal
                 "cochannel_cost_rand": cochannel_cost_rand,
                 "cochannel_conflicts_rand": cochannel_conf_rand,
-                "cochannel_time_rand": time_rand,          # temps unique pour Random
+                "cochannel_time_rand": time_rand,
                 "cochannel_used_channels_rand": used_rand,
                 "cochannel_cost_greedy": cochannel_cost_greedy,
                 "cochannel_conflicts_greedy": cochannel_conf_greedy,
@@ -230,7 +234,7 @@ def run_validation():
                 # Métriques adjacentes
                 "adjacent_cost_rand": adjacent_cost_rand,
                 "adjacent_conflicts_rand": adjacent_conf_rand,
-                "adjacent_time_rand": time_rand,          # même temps
+                "adjacent_time_rand": time_rand,
                 "adjacent_used_channels_rand": used_rand,
                 "adjacent_cost_greedy": adjacent_cost_greedy,
                 "adjacent_conflicts_greedy": adjacent_conf_greedy,
@@ -258,7 +262,7 @@ def run_validation():
         for metric in ['cost', 'conflicts', 'time', 'used_channels']:
             col_name = f"cochannel_{metric}_{method}"
             if col_name in df_raw.columns:
-                temp = df_raw[['scenario', 'N', 'K', 'seed_scenario', col_name]].copy()
+                temp = df_raw[['scenario', 'N', 'K', col_name]].copy()  # seed_scenario retiré
                 temp['method'] = {'rand': 'Random', 'greedy': 'Greedy', 'dsatur': 'DSATUR', 'bd': 'BD-CeNN'}[method]
                 temp['metric'] = f"cochannel_{metric}"
                 temp['value'] = temp[col_name]
@@ -273,7 +277,7 @@ def run_validation():
         for metric in ['cost', 'conflicts', 'time', 'used_channels']:
             col_name = f"adjacent_{metric}_{method}"
             if col_name in df_raw.columns:
-                temp = df_raw[['scenario', 'N', 'K', 'seed_scenario', col_name]].copy()
+                temp = df_raw[['scenario', 'N', 'K', col_name]].copy()
                 temp['method'] = {'rand': 'Random', 'greedy': 'Greedy', 'dsatur': 'DSATUR', 'bd': 'BD-CeNN'}[method]
                 temp['metric'] = f"adjacent_{metric}"
                 temp['value'] = temp[col_name]
@@ -290,13 +294,11 @@ def run_validation():
     for (scenario, method, metric), group in df_melted.groupby(['scenario', 'method', 'metric']):
         N = group['N'].iloc[0]
         K = group['K'].iloc[0]
-        seed_scenario = group['seed_scenario'].iloc[0]
         values = group['value'].values
         stats_list.append({
             'scenario': scenario,
             'N': N,
             'K': K,
-            'seed_scenario': seed_scenario,
             'method': method,
             'metric': metric,
             'mean': np.mean(values),
@@ -309,28 +311,27 @@ def run_validation():
     df_stats = pd.DataFrame(stats_list)
 
     # --- Pivot pour avoir une ligne par (scenario, method) avec toutes les métriques ---
+    # On retire seed_scenario de l'index car il n'est pas nécessaire dans le résumé
     df_summary = df_stats.pivot_table(
-        index=['scenario', 'N', 'K', 'seed_scenario', 'method'],
+        index=['scenario', 'N', 'K', 'method'],
         columns='metric',
         values=['mean', 'std', 'median', 'min', 'max']
     ).reset_index()
     # Aplatir les colonnes
-    df_summary.columns = ['scenario', 'N', 'K', 'seed_scenario', 'method'] + \
-                         [f"{metric}_{stat}" for stat, metric in df_summary.columns[5:]]
+    df_summary.columns = ['scenario', 'N', 'K', 'method'] + \
+                         [f"{metric}_{stat}" for stat, metric in df_summary.columns[4:]]
 
     # --- Calcul des intervalles de confiance ---
     ci_data = []
     for (scenario, method, metric), group in df_melted.groupby(['scenario', 'method', 'metric']):
         N = group['N'].iloc[0]
         K = group['K'].iloc[0]
-        seed_scenario = group['seed_scenario'].iloc[0]
         values = group['value'].values
         ci_low, ci_high = compute_confidence_interval(values)
         ci_data.append({
             'scenario': scenario,
             'N': N,
             'K': K,
-            'seed_scenario': seed_scenario,
             'method': method,
             'metric': metric,
             'ci_low': ci_low,
@@ -338,35 +339,35 @@ def run_validation():
         })
     df_ci = pd.DataFrame(ci_data)
 
-    # --- Pivot des IC pour avoir une ligne par (scenario, method) ---
+    # --- Pivot des IC ---
     df_ci_pivot = df_ci.pivot_table(
-        index=['scenario', 'N', 'K', 'seed_scenario', 'method'],
+        index=['scenario', 'N', 'K', 'method'],
         columns='metric',
         values=['ci_low', 'ci_high']
     ).reset_index()
-    df_ci_pivot.columns = ['scenario', 'N', 'K', 'seed_scenario', 'method'] + \
-                          [f"{metric}_{stat}" for stat, metric in df_ci_pivot.columns[5:]]
+    df_ci_pivot.columns = ['scenario', 'N', 'K', 'method'] + \
+                          [f"{metric}_{stat}" for stat, metric in df_ci_pivot.columns[4:]]
 
     # --- Exporter les CSV de statistiques ---
     # 1. Tableau des médianes
-    df_median = df_summary[['scenario', 'N', 'K', 'seed_scenario', 'method'] + 
+    df_median = df_summary[['scenario', 'N', 'K', 'method'] + 
                            [col for col in df_summary.columns if '_median' in col]]
     df_median.to_csv(config.STATS_MEDIAN_CSV, index=False)
 
     # 2. Tableau des minima
-    df_min = df_summary[['scenario', 'N', 'K', 'seed_scenario', 'method'] + 
+    df_min = df_summary[['scenario', 'N', 'K', 'method'] + 
                         [col for col in df_summary.columns if '_min' in col]]
     df_min.to_csv(config.STATS_MIN_CSV, index=False)
 
     # 3. Tableau des maxima
-    df_max = df_summary[['scenario', 'N', 'K', 'seed_scenario', 'method'] + 
+    df_max = df_summary[['scenario', 'N', 'K', 'method'] + 
                         [col for col in df_summary.columns if '_max' in col]]
     df_max.to_csv(config.STATS_MAX_CSV, index=False)
 
     # 4. Tableau des intervalles de confiance
     df_ci_pivot.to_csv(config.STATS_CI_CSV, index=False)
 
-    # 5. Tableau du nombre de balayages pour co-canal
+    # 5. Statistiques des itérations TOTALES (arrêt) pour co-canal
     df_iter_co = pd.DataFrame(iterations_data_co)
     if not df_iter_co.empty:
         iter_stats_co = df_iter_co.groupby("scenario").agg({
@@ -377,7 +378,7 @@ def run_validation():
     else:
         pd.DataFrame(columns=['scenario', 'iter_mean_co', 'iter_std_co', 'iter_min_co', 'iter_max_co', 'iter_median_co']).to_csv(config.STATS_ITERATIONS_CO_CSV, index=False)
 
-    # 6. Tableau du nombre de balayages pour adjacent
+    # 6. Statistiques des itérations TOTALES (arrêt) pour adjacent
     df_iter_adj = pd.DataFrame(iterations_data_adj)
     if not df_iter_adj.empty:
         iter_stats_adj = df_iter_adj.groupby("scenario").agg({
@@ -388,7 +389,34 @@ def run_validation():
     else:
         pd.DataFrame(columns=['scenario', 'iter_mean_adj', 'iter_std_adj', 'iter_min_adj', 'iter_max_adj', 'iter_median_adj']).to_csv(config.STATS_ITERATIONS_ADJ_CSV, index=False)
 
+    # --- NOUVEAU : Statistiques des itérations jusqu'au MINIMUM LOCAL (best_iteration) ---
+    # Pour co-canal
+    if not df_iter_co.empty:
+        best_iter_stats_co = df_iter_co.groupby("scenario").agg({
+            "best_iteration": ["mean", "std", "min", "max", "median"]
+        }).reset_index()
+        best_iter_stats_co.columns = ['scenario', 'best_iter_mean_co', 'best_iter_std_co', 
+                                      'best_iter_min_co', 'best_iter_max_co', 'best_iter_median_co']
+        best_iter_stats_co.to_csv(config.STATS_BEST_ITERATION_CO_CSV, index=False)
+    else:
+        pd.DataFrame(columns=['scenario', 'best_iter_mean_co', 'best_iter_std_co', 
+                              'best_iter_min_co', 'best_iter_max_co', 'best_iter_median_co']).to_csv(config.STATS_BEST_ITERATION_CO_CSV, index=False)
+
+    # Pour adjacent
+    if not df_iter_adj.empty:
+        best_iter_stats_adj = df_iter_adj.groupby("scenario").agg({
+            "best_iteration": ["mean", "std", "min", "max", "median"]
+        }).reset_index()
+        best_iter_stats_adj.columns = ['scenario', 'best_iter_mean_adj', 'best_iter_std_adj',
+                                       'best_iter_min_adj', 'best_iter_max_adj', 'best_iter_median_adj']
+        best_iter_stats_adj.to_csv(config.STATS_BEST_ITERATION_ADJ_CSV, index=False)
+    else:
+        pd.DataFrame(columns=['scenario', 'best_iter_mean_adj', 'best_iter_std_adj',
+                              'best_iter_min_adj', 'best_iter_max_adj', 'best_iter_median_adj']).to_csv(config.STATS_BEST_ITERATION_ADJ_CSV, index=False)
+
     print("✅ Statistiques supplémentaires exportées en CSV.")
+    print(f"   - Iterations jusqu'au minimum (co-canal) : {config.STATS_BEST_ITERATION_CO_CSV}")
+    print(f"   - Iterations jusqu'au minimum (adjacent) : {config.STATS_BEST_ITERATION_ADJ_CSV}")
 
     # --- Sauvegarde du fichier Excel principal ---
     with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
@@ -399,6 +427,11 @@ def run_validation():
             iter_stats_co.to_excel(writer, sheet_name='BD_Iterations_Co', index=False)
         if not df_iter_adj.empty:
             iter_stats_adj.to_excel(writer, sheet_name='BD_Iterations_Adj', index=False)
+        # Nouvelles feuilles pour les itérations jusqu'au minimum
+        if not df_iter_co.empty:
+            best_iter_stats_co.to_excel(writer, sheet_name='BD_BestIter_Co', index=False)
+        if not df_iter_adj.empty:
+            best_iter_stats_adj.to_excel(writer, sheet_name='BD_BestIter_Adj', index=False)
 
     print(f"\n✅ Validation terminée !")
     print(f"📁 Fichier Excel : {excel_file}")
