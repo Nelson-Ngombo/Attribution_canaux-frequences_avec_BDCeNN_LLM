@@ -9,3 +9,7 @@ seaborn
 ipykernel
 jupyter
 tqdm
+google-genai
+python-dotenv
+requests
+reportlab

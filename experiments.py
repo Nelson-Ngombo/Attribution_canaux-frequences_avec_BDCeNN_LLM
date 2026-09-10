@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 import time
+from llm_assistant import audit_case, LLM_REPORTS_DIR, LLM_LOGS_DIR
 import json
 from baselines import greedy_allocation, dsatur_allocation, random_allocation
 from bdcenn_solver import bdcenn_allocation
@@ -2029,6 +2030,424 @@ def run_experiment_E9(verbose=False):
     print("✅ E9 terminée.")
 
 
+
+
+# ============================================================================
+# E10 – AUDIT LLM SUR 20 CAS REPRÉSENTATIFS
+# ============================================================================
+def run_experiment_E10(verbose=False):
+    """
+    E10 - Évaluation de la fidélité du LLM sur 20 cas représentatifs.
+
+    Pour chaque cas :
+        - Construction des données de simulation à partir du fichier JSON
+          (scenarios_data.json) et des résultats déjà calculés (validation_results.xlsx,
+          E7/E8/E9 CSV) ou recalculés si nécessaire.
+        - Soumission au module `llm_assistant` (prompt → LLM → contrôleur → PDF).
+        - Calcul du score académique (5 critères × 2 pts).
+
+    Produit :
+        - Rapports PDF individuels dans results/logs/llm_logs/reports_pdf/
+        - Fichier CSV récapitulatif : results/csv/E10/llm_fidelity_evaluation.csv
+        - 20 figures radar individuelles + 1 figure radar groupée
+          dans results/figures/E10/{cochannel,adjacent}/
+    """
+    import networkx as nx
+    import time
+    from llm_assistant import audit_case, LLM_REPORTS_DIR
+    from bdcenn_solver import bdcenn_allocation
+    from baselines import greedy_allocation, dsatur_allocation, random_allocation
+    from metrics import (
+        create_channel_interference_matrix,
+        compute_cochannel_cost, count_cochannel_conflicts,
+        compute_adjacent_cost, count_adjacent_conflicts,
+    )
+
+    # Dossiers de sortie
+    e10_fig_dir = config.FIGURES_DIR / "E10"
+    e10_csv_dir = config.CSV_DIR / "E10"
+    os.makedirs(e10_fig_dir, exist_ok=True)
+    os.makedirs(e10_csv_dir, exist_ok=True)
+
+    # --- Définition des 20 cas (voir image jointe) ---
+    cases_def = [
+        {"case_id": "#1",  "scenario": "S1", "N": 8,   "K": 3, "seed": 1, "context": "Validation visuelle simple (0 conflit attendu)"},
+        {"case_id": "#2",  "scenario": "S1", "N": 8,   "K": 3, "seed": 2, "context": "Deuxième topologie simple"},
+        {"case_id": "#3",  "scenario": "S2", "N": 30,  "K": 4, "seed": 1, "context": "Cas nominal standard"},
+        {"case_id": "#4",  "scenario": "S2", "N": 30,  "K": 4, "seed": 2, "context": "Deuxième topologie moyenne"},
+        {"case_id": "#5",  "scenario": "S2", "N": 30,  "K": 6, "seed": 1, "context": "Plus de canaux"},
+        {"case_id": "#6",  "scenario": "S3", "N": 50,  "K": 6, "seed": 1, "context": "Forte densité (beaucoup de contraintes)"},
+        {"case_id": "#7",  "scenario": "S3", "N": 50,  "K": 6, "seed": 2, "context": "Deuxième topologie dense"},
+        {"case_id": "#8",  "scenario": "S3", "N": 50,  "K": 6, "seed": 3, "context": "Troisième topologie dense"},
+        {"case_id": "#9",  "scenario": "S4", "N": 50,  "K": 2, "seed": 1, "context": "Cas très difficile (beaucoup de conflits restants)"},
+        {"case_id": "#10", "scenario": "S4", "N": 50,  "K": 2, "seed": 2, "context": "Deuxième cas de pénurie sévère"},
+        {"case_id": "#11", "scenario": "S4", "N": 50,  "K": 3, "seed": 1, "context": "Pénurie modérée"},
+        {"case_id": "#12", "scenario": "S5", "N": 100, "K": 8, "seed": 1, "context": "Grand réseau (100 cellules)"},
+        {"case_id": "#13", "scenario": "S5", "N": 200, "K": 8, "seed": 1, "context": "Très grand réseau (200 cellules)"},
+        {"case_id": "#14", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Faible bruit de mesure sur la matrice W (bruit 5%)"},
+        {"case_id": "#15", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Bruit moyen sur W (bruit 10%)"},
+        {"case_id": "#16", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Fort bruit (dégradation de coût élevée, bruit 20%)"},
+        {"case_id": "#17", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Perturbation dynamique faible (réoptimisation 'à chaud', modif 5%)"},
+        {"case_id": "#18", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Perturbation dynamique moyenne (modif 10%)"},
+        {"case_id": "#19", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Forte perturbation dynamique (modif 20%)"},
+        {"case_id": "#20", "scenario": "S4", "N": 50,  "K": 2, "seed": 1, "context": "Cas où le BD-CeNN s'est bloqué dans un minimum local (E9, 1 redémarrage)"},
+    ]
+
+    # --- Boucle sur les deux modèles (co-canal / adjacent) ---
+    models = [
+        {"name": "cochannel", "M": None, "folder": "cochannel"},
+        {"name": "adjacent", "M": None, "folder": "adjacent"},
+    ]
+
+    # Dictionnaire global pour stocker les scores de tous les cas (par modèle)
+    all_results = {}
+
+    for model in models:
+        model_name = model["name"]
+        folder = model["folder"]
+        model_fig_dir = e10_fig_dir / folder
+        model_csv_dir = e10_csv_dir / folder
+        os.makedirs(model_fig_dir, exist_ok=True)
+        os.makedirs(model_csv_dir, exist_ok=True)
+
+        results_for_model = []
+
+        # --- Boucle sur les 20 cas ---
+        for case in cases_def:
+            print(f"\n{'='*70}")
+            print(f"🔎 Cas {case['case_id']} - {case['scenario']} ({model_name})")
+            print(f"{'='*70}")
+
+            sc_name = case["scenario"]
+            N = case["N"]
+            K = case["K"]
+            seed = case["seed"]
+
+            # Charger la topologie correspondante
+            instances = all_instances.get(sc_name, {})
+            if not instances:
+                print(f"❌ Scénario {sc_name} introuvable.")
+                continue
+
+            # Pour S5, les tailles N=200 ne sont pas dans le JSON (N=100 max)
+            # -> on génère une topologie synthétique avec la seed
+            if str(seed) not in instances:
+                np.random.seed(seed)
+                area = 300
+                threshold = 50
+                positions = np.random.rand(N, 2) * area
+                W = np.zeros((N, N))
+                for i in range(N):
+                    for j in range(i+1, N):
+                        dist = np.linalg.norm(positions[i] - positions[j])
+                        if dist < threshold * 0.4:
+                            w = 4
+                        elif dist < threshold * 0.65:
+                            w = 2
+                        elif dist < threshold:
+                            w = 1
+                        else:
+                            w = 0
+                        W[i, j] = w
+                        W[j, i] = w
+            else:
+                inst = instances[str(seed)]
+                positions = np.array(inst["positions"])
+                W = np.array(inst["W"])
+
+            # Adapter W au cas N/K spécifique (S2 avec K=6, S4 avec K=3)
+            # On régénère W si la taille N est différente de celle de la topologie
+            if W.shape[0] != N:
+                np.random.seed(seed)
+                area = 300 if N > 50 else 200
+                threshold = 50
+                positions = np.random.rand(N, 2) * area
+                W = np.zeros((N, N))
+                for i in range(N):
+                    for j in range(i+1, N):
+                        dist = np.linalg.norm(positions[i] - positions[j])
+                        if dist < threshold * 0.4:
+                            w = 4
+                        elif dist < threshold * 0.65:
+                            w = 2
+                        elif dist < threshold:
+                            w = 1
+                        else:
+                            w = 0
+                        W[i, j] = w
+                        W[j, i] = w
+
+            # Gérer les cas spéciaux S6 (bruit) et S7 (modification dynamique)
+            bruit_level = 0.0
+            mod_level = 0.0
+            if sc_name == "S6":
+                # Extraire le niveau de bruit du contexte
+                if "5%" in case["context"]:
+                    bruit_level = 0.05
+                elif "10%" in case["context"]:
+                    bruit_level = 0.10
+                elif "20%" in case["context"]:
+                    bruit_level = 0.20
+                # Appliquer le bruit
+                np.random.seed(seed + int(bruit_level * 10000))
+                mask = W > 0
+                noise_factor = np.random.uniform(-bruit_level, bruit_level, size=W.shape)
+                W = W * (1 + noise_factor * mask)
+                W = np.round(W)
+                W[W < 0] = 0
+                for i in range(N):
+                    for j in range(i+1, N):
+                        W[j, i] = W[i, j]
+                np.fill_diagonal(W, 0)
+            elif sc_name == "S7":
+                if "5%" in case["context"]:
+                    mod_level = 0.05
+                elif "10%" in case["context"]:
+                    mod_level = 0.10
+                elif "20%" in case["context"]:
+                    mod_level = 0.20
+                # Appliquer la modification dynamique
+                np.random.seed(seed + int(mod_level * 10000) + 200)
+                edges = [(i, j) for i in range(N) for j in range(i+1, N) if W[i, j] > 0]
+                if edges:
+                    num_mod = int(len(edges) * mod_level)
+                    indices = np.random.choice(len(edges), min(num_mod, len(edges)), replace=False)
+                    for idx in indices:
+                        i, j = edges[idx]
+                        if np.random.random() > 0.5:
+                            W[i, j] = 0
+                            W[j, i] = 0
+                        else:
+                            current = W[i, j]
+                            new_w = current + np.random.choice([-1, 1]) * min(current, 1)
+                            new_w = max(1, min(4, new_w))
+                            W[i, j] = new_w
+                            W[j, i] = new_w
+
+            # Créer la matrice M pour ce K (si modèle adjacent)
+            if model_name == "adjacent":
+                M = create_channel_interference_matrix(K)
+            else:
+                M = None
+
+            # --- Exécuter BD-CeNN ---
+            # Cas #20 : 1 seul redémarrage (minimum local)
+            num_restarts = 1 if case["case_id"] == "#20" else config.NUM_RESTARTS
+
+            start_t = time.perf_counter()
+            x_bd, history_bd, _, _, best_iter = bdcenn_allocation(
+                N, K, W, M=M,
+                num_restarts=num_restarts,
+                max_iter=config.MAX_ITER_BD,
+                random_order=True,
+                seed=seed,
+                verbose=False,
+            )
+            time_bd = time.perf_counter() - start_t
+
+            # Coût initial (première allocation de l'historique)
+            if history_bd:
+                alloc_init = history_bd[0][2]
+                if M is None:
+                    cost_init = compute_cochannel_cost(alloc_init, W)
+                else:
+                    cost_init = compute_adjacent_cost(alloc_init, W, M)
+            else:
+                cost_init = 0.0
+
+            # Métriques finales BD-CeNN
+            if M is None:
+                cost_final = compute_cochannel_cost(x_bd, W)
+                conf_cci = count_cochannel_conflicts(x_bd, W)
+                conf_aci = 0  # pas applicable en co-canal
+            else:
+                cost_final = compute_adjacent_cost(x_bd, W, M)
+                conf_cci = count_cochannel_conflicts(x_bd, W)
+                conf_aci = count_adjacent_conflicts(x_bd, W, M)
+
+            used_channels = len(set(x_bd))
+
+            # --- Exécuter les baselines ---
+            np.random.seed(seed)
+            x_rand = random_allocation(N, K)
+            np.random.seed(seed)
+            order_greedy = np.random.permutation(N).tolist()
+            x_greedy = greedy_allocation(N, K, W, order=order_greedy, M=M)
+            x_dsatur = dsatur_allocation(N, K, W, M=M)
+
+            baselines = {}
+            for name, x_b, t_b in [("Random", x_rand, 0.0), ("Greedy", x_greedy, 0.0), ("DSATUR", x_dsatur, 0.0)]:
+                if M is None:
+                    c = compute_cochannel_cost(x_b, W)
+                    cf = count_cochannel_conflicts(x_b, W)
+                else:
+                    c = compute_adjacent_cost(x_b, W, M)
+                    cf = count_adjacent_conflicts(x_b, W, M)
+                baselines[name] = {"cost": float(c), "conflicts": int(cf), "time": float(t_b)}
+
+            # --- Cellules en conflit ---
+            conflicting_cells = []
+            for i in range(N):
+                for j in range(i+1, N):
+                    if W[i, j] > 0:
+                        if M is None and x_bd[i] == x_bd[j]:
+                            conflicting_cells.append(i)
+                            conflicting_cells.append(j)
+                        elif M is not None and M[x_bd[i], x_bd[j]] > 0:
+                            conflicting_cells.append(i)
+                            conflicting_cells.append(j)
+            conflicting_cells = sorted(set(conflicting_cells))
+
+            # --- Construire le case_data complet ---
+            case_data = {
+                "case_id": case["case_id"],
+                "scenario": case["scenario"],
+                "N": N,
+                "K": K,
+                "seed": seed,
+                "context": case["context"] + f" [{model_name}]",
+                "metrics": {
+                    "cost_initial": float(cost_init),
+                    "cost_final": float(cost_final),
+                    "conflicts_cochannel": int(conf_cci),
+                    "conflicts_adjacent": int(conf_aci),
+                    "time_seconds": float(time_bd),
+                    "iterations": int(best_iter),
+                    "used_channels": int(used_channels),
+                },
+                "baselines": baselines,
+                "conflicting_cells": conflicting_cells,
+            }
+
+            # --- Appeler le module LLM ---
+            try:
+                audit_result = audit_case(case_data, max_correction_attempts=2)
+                results_for_model.append(audit_result)
+            except Exception as e:
+                print(f"❌ Erreur lors de l'audit LLM du cas {case['case_id']} : {e}")
+                continue
+
+        all_results[model_name] = results_for_model
+
+        # --- Sauvegarde du CSV récapitulatif ---
+        rows = []
+        for r in results_for_model:
+            inv_detected = "Oui" if r["verification_initial"]["has_hallucination"] else "Non"
+            # Construire le type d'erreur / correction
+            if r["verification_initial"]["has_hallucination"]:
+                invented_vals = ", ".join(raw for _, raw in r["verification_initial"]["invented_numbers"])
+                type_err = f"Hallucination : {invented_vals}"
+                if r["verification_final"]["has_hallucination"]:
+                    type_err += " (non corrigée)"
+                else:
+                    type_err += f" (corrigée en {r['correction_attempts']} tentative(s))"
+            else:
+                type_err = "Aucune erreur"
+            rows.append({
+                "Cas": r["case_id"],
+                "Scénario (N, K, seed)": f"{r['scenario']} (N={r['N']}, K={r['K']}, seed={r['seed']})",
+                "Contexte": r["context"],
+                "Score /10": r["score_total"],
+                "Invention détectée (Oui/Non)": inv_detected,
+                "Type d'erreur / Correction appliquée": type_err,
+                # Détails du score
+                "Exactitude (2)": r["score_details"].get("Exactitude numérique", 0),
+                "Cohérence (2)": r["score_details"].get("Cohérence", 0),
+                "Clarté (2)": r["score_details"].get("Clarté", 0),
+                "Utilité (2)": r["score_details"].get("Utilité ingénieur", 0),
+                "Traçabilité (2)": r["score_details"].get("Traçabilité", 0),
+                "Taux exactitude initial": r["verification_initial"]["accuracy_rate"],
+                "Taux exactitude final": r["verification_final"]["accuracy_rate"],
+            })
+        df_eval = pd.DataFrame(rows)
+        csv_path = model_csv_dir / "llm_fidelity_evaluation.csv"
+        df_eval.to_csv(csv_path, index=False, float_format="%.2f")
+        print(f"✅ CSV E10/{folder}/llm_fidelity_evaluation.csv sauvegardé.")
+
+        # --- Figures radar individuelles (20) ---
+        criteria_labels = ["Exactitude", "Cohérence", "Clarté", "Utilité", "Traçabilité"]
+        criteria_keys = ["Exactitude numérique", "Cohérence", "Clarté", "Utilité ingénieur", "Traçabilité"]
+
+        # Pour chaque cas, tracer un radar
+        for r in results_for_model:
+            values = [r["score_details"].get(k, 0) for k in criteria_keys]
+            values += values[:1]  # fermer le polygone
+            angles = np.linspace(0, 2 * np.pi, len(criteria_labels), endpoint=False).tolist()
+            angles += angles[:1]
+
+            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+            ax.plot(angles, values, "o-", linewidth=2, color="firebrick")
+            ax.fill(angles, values, alpha=0.25, color="firebrick")
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(criteria_labels, fontsize=9)
+            ax.set_yticks([0, 1, 2])
+            ax.set_yticklabels(["0", "1", "2"], fontsize=8)
+            ax.set_ylim(0, 2.2)
+            ax.set_title(
+                f"Fidélité LLM - {r['case_id']} ({r['scenario']})\n"
+                f"Score total : {r['score_total']:.1f}/10",
+                fontsize=11, fontweight="bold", pad=15,
+            )
+            plt.tight_layout()
+            fname = f"radar_{r['case_id'].replace('#', 'cas')}_{model_name}.pdf"
+            plt.savefig(model_fig_dir / fname, format="pdf", bbox_inches="tight")
+            plt.close(fig)
+            print(f"✅ Figure E10/{folder}/{fname} sauvegardée.")
+
+        # --- Figure radar groupée (20 cas sur le même graphique) ---
+        fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(polar=True))
+        cmap = plt.cm.get_cmap("tab20", len(results_for_model))
+        for idx, r in enumerate(results_for_model):
+            values = [r["score_details"].get(k, 0) for k in criteria_keys]
+            values += values[:1]
+            angles = np.linspace(0, 2 * np.pi, len(criteria_labels), endpoint=False).tolist()
+            angles += angles[:1]
+            ax.plot(angles, values, "o-", linewidth=1.5, color=cmap(idx),
+                    label=f"{r['case_id']} ({r['scenario']})", alpha=0.8)
+            ax.fill(angles, values, alpha=0.05, color=cmap(idx))
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(criteria_labels, fontsize=11, fontweight="bold")
+        ax.set_yticks([0, 1, 2])
+        ax.set_yticklabels(["0", "1", "2"], fontsize=9)
+        ax.set_ylim(0, 2.2)
+        ax.set_title(
+            f"Scores de fidélité du LLM sur 20 cas - {model_name}\n"
+            "(5 critères × 2 pts)",
+            fontsize=13, fontweight="bold", pad=25,
+        )
+        ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.10), fontsize=7, ncol=1)
+        plt.tight_layout()
+        fname_group = f"radar_grouped_20cases_{model_name}.pdf"
+        plt.savefig(model_fig_dir / fname_group, format="pdf", bbox_inches="tight")
+        plt.close(fig)
+        print(f"✅ Figure E10/{folder}/{fname_group} sauvegardée.")
+
+    # --- Bilan global ---
+    print("\n" + "=" * 80)
+    print("📊 BILAN E10 - Évaluation de la fidélité du LLM")
+    print("=" * 80)
+    for model_name, results in all_results.items():
+        if not results:
+            continue
+        scores = [r["score_total"] for r in results]
+        hallu_count = sum(1 for r in results if r["verification_initial"]["has_hallucination"])
+        corrected_count = sum(
+            1 for r in results
+            if r["verification_initial"]["has_hallucination"] and not r["verification_final"]["has_hallucination"]
+        )
+        print(f"\n[{model_name}]")
+        print(f"  Nombre de cas évalués         : {len(results)}")
+        print(f"  Score moyen                   : {np.mean(scores):.2f}/10")
+        print(f"  Cas avec hallucination (init) : {hallu_count}/{len(results)}")
+        print(f"  Cas corrigés automatiquement  : {corrected_count}/{hallu_count if hallu_count > 0 else 1}")
+    print("\n✅ E10 terminée.")
+
+
+
+
+
+
+
 # ============================================================================
 # ORCHESTRATEUR PRINCIPAL
 # ============================================================================
@@ -2047,6 +2466,7 @@ def run_all_experiments(verbose=False):
     run_experiment_E7(verbose)
     run_experiment_E8(verbose)
     run_experiment_E9(verbose)
+    run_experiment_E10(verbose)
 
     print("\n" + "=" * 80)
     print("✅ TOUTES LES EXPÉRIENCES SONT TERMINÉES.")
@@ -2056,5 +2476,5 @@ def run_all_experiments(verbose=False):
 if __name__ == "__main__":
     # Par défaut, exécute E9 pour une visualisation rapide.
     # Pour lancer toutes les expériences, utiliser main.py ou décommenter la ligne ci-dessous.
-    run_experiment_E2()
+    run_experiment_E10()
     # run_all_experiments()
