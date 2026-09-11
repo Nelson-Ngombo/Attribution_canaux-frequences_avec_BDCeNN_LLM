@@ -2037,9 +2037,6 @@ def run_experiment_E9(verbose=False):
 # ============================================================================
 # E10 – AUDIT LLM SUR 20 CAS REPRÉSENTATIFS
 # ============================================================================
-# ============================================================================
-# E10 – AUDIT LLM SUR 20 CAS REPRÉSENTATIFS
-# ============================================================================
 def run_experiment_E10(verbose=False):
     """
     E10 - Évaluation de la fidélité du LLM sur 20 cas représentatifs.
@@ -2069,6 +2066,16 @@ def run_experiment_E10(verbose=False):
         Les cas où l'appel LLM échoue définitivement (status == "LLM_FAILED")
         sont exclus du calcul de la moyenne. Ils restent listés à part dans le
         bilan global pour information.
+
+    NOTE (Informations supplémentaires fournies au LLM) :
+        Le case_data contient désormais des champs supplémentaires pour
+        permettre au LLM d'argumenter ses analyses :
+          - allocations       : cellule → canal pour les 4 méthodes
+          - cell_positions    : coordonnées (x, y) des cellules
+          - topology_edges    : arêtes d'interférence (i, j, poids) triées
+          - total_edges       : nombre total d'arêtes du réseau
+          - cell_summary      : top 10 des cellules les plus contraintes
+          - topology_meta     : seed, threshold, N, K (métadonnées du JSON)
     """
     import networkx as nx
     import time
@@ -2145,6 +2152,9 @@ def run_experiment_E10(verbose=False):
 
             # Pour S5, les tailles N=200 ne sont pas dans le JSON (N=100 max)
             # -> on génère une topologie synthétique avec la seed
+            # On conserve la variable "inst" pour récupérer les métadonnées
+            # (threshold notamment) en cas de succès ou fallback.
+            inst = None
             if str(seed) not in instances:
                 np.random.seed(seed)
                 area = 300
@@ -2170,6 +2180,7 @@ def run_experiment_E10(verbose=False):
                 W = np.array(inst["W"])
 
             # Adapter W au cas N/K spécifique (S2 avec K=6, S4 avec K=3)
+            # On régénère W si la taille N est différente de celle de la topologie
             if W.shape[0] != N:
                 np.random.seed(seed)
                 area = 300 if N > 50 else 200
@@ -2308,10 +2319,89 @@ def run_experiment_E10(verbose=False):
                             conflicting_cells.append(j)
             conflicting_cells = sorted(set(conflicting_cells))
 
+            # ---------------------------------------------------------------
+            # Collecte des informations supplémentaires pour le LLM
+            # ---------------------------------------------------------------
+            # Objectif : fournir au LLM plus d'arguments pour analyser la
+            # solution BD-CeNN en la comparant cellule par cellule aux
+            # baselines, et en s'appuyant sur la structure locale du réseau.
+
+            # 1. Affectations (cellule → canal) pour les 4 méthodes.
+            #    Format : liste d'entiers de longueur N ; l'index = cellule.
+            #    Ces valeurs viennent du RUN COURANT : x_bd est optimisé selon
+            #    le mode (CCI-only ou CCI+ACI), donc les affectations sont
+            #    cohérentes avec le mode indiqué dans model_label.
+            allocations_dict = {
+                "Random": [int(c) for c in x_rand],
+                "Greedy": [int(c) for c in x_greedy],
+                "DSATUR": [int(c) for c in x_dsatur],
+                "BD-CeNN": [int(c) for c in x_bd],
+            }
+
+            # 2. Positions (x, y) des cellules — utile pour visualiser
+            #    la géométrie du réseau et la notion de distance.
+            cell_positions = {
+                int(i): [float(positions[i][0]), float(positions[i][1])]
+                for i in range(N)
+            }
+
+            # 3. Topologie du réseau : arêtes d'interférence (i, j, poids).
+            #    On trie par poids décroissant pour mettre en avant les
+            #    interférences critiques (poids 4 puis 2 puis 1).
+            #    On limite le nombre d'arêtes transmises au LLM pour éviter
+            #    d'exploser le prompt en cas de grand réseau (N=200).
+            topology_edges_all = []
+            for i in range(N):
+                for j in range(i+1, N):
+                    if W[i, j] > 0:
+                        topology_edges_all.append((int(i), int(j), int(W[i, j])))
+            topology_edges_all.sort(key=lambda e: -e[2])
+            total_edges = len(topology_edges_all)
+
+            MAX_TOPOLOGY_EDGES = 80
+            topology_edges = topology_edges_all[:MAX_TOPOLOGY_EDGES]
+
+            # 4. Résumé par cellule : degré (nombre de voisins) et force
+            #    (somme des poids) pour identifier les cellules les plus
+            #    contraintes. On prend le TOP 10.
+            cell_degree = np.zeros(N, dtype=int)
+            cell_strength = np.zeros(N, dtype=int)
+            for (i, j, w) in topology_edges_all:
+                cell_degree[i] += 1
+                cell_degree[j] += 1
+                cell_strength[i] += w
+                cell_strength[j] += w
+
+            # Trier par force décroissante
+            top_cells_idx = np.argsort(-cell_strength)[:10]
+            cell_summary = [
+                {"cell": int(idx),
+                 "degree": int(cell_degree[idx]),
+                 "strength": int(cell_strength[idx])}
+                for idx in top_cells_idx
+            ]
+
+            # 5. Métadonnées de la topologie issues du fichier JSON
+            #    (seed + threshold + N + K pour la reproductibilité).
+            #    On lit "threshold" depuis l'instance JSON si elle existe,
+            #    sinon on met 0.0 (cas des topologies synthétiques S5 N=200).
+            if inst is not None and "threshold" in inst:
+                threshold_value = float(inst["threshold"])
+            else:
+                # Cas fallback : topologie synthétique ou régénérée
+                threshold_value = 0.0
+
+            topology_meta = {
+                "seed": int(seed),
+                "threshold": threshold_value,
+                "N": int(N),
+                "K": int(K),
+            }
+
             # --- Étiquette du mode d'interférence ---
             model_label = "CCI-only" if model_name == "cochannel" else "CCI+ACI"
 
-            # --- Construire le case_data complet ---
+            # --- UN SEUL case_data (pas de doublon) ---
             case_data = {
                 "case_id": case["case_id"],
                 "scenario": case["scenario"],
@@ -2330,6 +2420,13 @@ def run_experiment_E10(verbose=False):
                 },
                 "baselines": baselines,
                 "conflicting_cells": conflicting_cells,
+                # --- Informations supplémentaires pour le LLM ---
+                "allocations": allocations_dict,       # cellule → canal (4 méthodes)
+                "cell_positions": cell_positions,      # coordonnées (x, y) des cellules
+                "topology_edges": topology_edges,      # arêtes (i, j, poids) triées
+                "total_edges": int(total_edges),       # nombre total d'arêtes
+                "cell_summary": cell_summary,          # top 10 cellules contraintes
+                "topology_meta": topology_meta,        # seed, threshold, N, K
             }
 
             # --- Appeler le module LLM ---
@@ -2431,7 +2528,7 @@ def run_experiment_E10(verbose=False):
         else:
             print("  ⚠️ Aucun cas réussi pour ce modèle.")
 
-    print("\n✅ E10 terminée.")
+    print("\n E10 terminée.")
 
 
 

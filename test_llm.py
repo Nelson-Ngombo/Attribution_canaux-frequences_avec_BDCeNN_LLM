@@ -14,7 +14,7 @@ client = genai.Client(api_key=api_key)
 #     print(m.name)
 
 # --- Option B : tester un modèle précis ---
-MODEL = "gemini-3.7-flash"   # ← remplacer si nécessaire
+MODEL = "gemini-3.6-flash"   # ← remplacer si nécessaire
 response = client.models.generate_content(
     model=MODEL,
     contents=" es-tu opérationnel ?",
