@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import matplotlib          # ← AJOUTER cette ligne
 import matplotlib.pyplot as plt
 import os
 import time
@@ -2032,6 +2033,10 @@ def run_experiment_E9(verbose=False):
 
 
 
+
+# ============================================================================
+# E10 – AUDIT LLM SUR 20 CAS REPRÉSENTATIFS
+# ============================================================================
 # ============================================================================
 # E10 – AUDIT LLM SUR 20 CAS REPRÉSENTATIFS
 # ============================================================================
@@ -2044,13 +2049,26 @@ def run_experiment_E10(verbose=False):
           (scenarios_data.json) et des résultats déjà calculés (validation_results.xlsx,
           E7/E8/E9 CSV) ou recalculés si nécessaire.
         - Soumission au module `llm_assistant` (prompt → LLM → contrôleur → PDF).
-        - Calcul du score académique (5 critères × 2 pts).
+
+    DEUX MODES D'INTERFÉRENCE (dossier séparé pour chacun) :
+        - "CCI-only" (dossier cochannel) : coût et conflits = CCI uniquement.
+        - "CCI+ACI"  (dossier adjacent) : coût et conflits = CCI ET ACI combinés
+                                         (UN SEUL chiffre, pas deux séparés).
+
+    NOTE : l'évaluation académique automatique (grille 5 critères × 2 pts)
+    et les figures radar associées ont été RETIRÉES. Les cotes sont attribuées
+    MANUELLEMENT par l'auteur en se basant sur les PDF et le CSV récapitulatif.
 
     Produit :
-        - Rapports PDF individuels dans results/logs/llm_logs/reports_pdf/
-        - Fichier CSV récapitulatif : results/csv/E10/llm_fidelity_evaluation.csv
-        - 20 figures radar individuelles + 1 figure radar groupée
-          dans results/figures/E10/{cochannel,adjacent}/
+        - Rapports PDF individuels dans
+          results/logs/llm_logs/reports_pdf/{cochannel,adjacent}/
+        - Fichier CSV récapitulatif :
+          results/csv/E10/{cochannel,adjacent}/llm_fidelity_evaluation.csv
+
+    NOTE (Solution 2 intégrée) :
+        Les cas où l'appel LLM échoue définitivement (status == "LLM_FAILED")
+        sont exclus du calcul de la moyenne. Ils restent listés à part dans le
+        bilan global pour information.
     """
     import networkx as nx
     import time
@@ -2063,15 +2081,13 @@ def run_experiment_E10(verbose=False):
         compute_adjacent_cost, count_adjacent_conflicts,
     )
 
-    # Dossiers de sortie
-    e10_fig_dir = config.FIGURES_DIR / "E10"
+    # Dossiers de sortie (uniquement le CSV — plus de dossier de figures)
     e10_csv_dir = config.CSV_DIR / "E10"
-    os.makedirs(e10_fig_dir, exist_ok=True)
     os.makedirs(e10_csv_dir, exist_ok=True)
 
     # --- Définition des 20 cas (voir image jointe) ---
     cases_def = [
-        {"case_id": "#1",  "scenario": "S1", "N": 8,   "K": 3, "seed": 1, "context": "Validation visuelle simple (0 conflit attendu)"},
+        {"case_id": "#1",  "scenario": "S1", "N": 8,   "K": 3, "seed": 1, "context": "Validation visuelle simple"},
         {"case_id": "#2",  "scenario": "S1", "N": 8,   "K": 3, "seed": 2, "context": "Deuxième topologie simple"},
         {"case_id": "#3",  "scenario": "S2", "N": 30,  "K": 4, "seed": 1, "context": "Cas nominal standard"},
         {"case_id": "#4",  "scenario": "S2", "N": 30,  "K": 4, "seed": 2, "context": "Deuxième topologie moyenne"},
@@ -2099,15 +2115,13 @@ def run_experiment_E10(verbose=False):
         {"name": "adjacent", "M": None, "folder": "adjacent"},
     ]
 
-    # Dictionnaire global pour stocker les scores de tous les cas (par modèle)
+    # Dictionnaire global pour stocker les résultats de tous les cas (par modèle)
     all_results = {}
 
     for model in models:
         model_name = model["name"]
         folder = model["folder"]
-        model_fig_dir = e10_fig_dir / folder
         model_csv_dir = e10_csv_dir / folder
-        os.makedirs(model_fig_dir, exist_ok=True)
         os.makedirs(model_csv_dir, exist_ok=True)
 
         results_for_model = []
@@ -2156,7 +2170,6 @@ def run_experiment_E10(verbose=False):
                 W = np.array(inst["W"])
 
             # Adapter W au cas N/K spécifique (S2 avec K=6, S4 avec K=3)
-            # On régénère W si la taille N est différente de celle de la topologie
             if W.shape[0] != N:
                 np.random.seed(seed)
                 area = 300 if N > 50 else 200
@@ -2181,14 +2194,12 @@ def run_experiment_E10(verbose=False):
             bruit_level = 0.0
             mod_level = 0.0
             if sc_name == "S6":
-                # Extraire le niveau de bruit du contexte
                 if "5%" in case["context"]:
                     bruit_level = 0.05
                 elif "10%" in case["context"]:
                     bruit_level = 0.10
                 elif "20%" in case["context"]:
                     bruit_level = 0.20
-                # Appliquer le bruit
                 np.random.seed(seed + int(bruit_level * 10000))
                 mask = W > 0
                 noise_factor = np.random.uniform(-bruit_level, bruit_level, size=W.shape)
@@ -2206,7 +2217,6 @@ def run_experiment_E10(verbose=False):
                     mod_level = 0.10
                 elif "20%" in case["context"]:
                     mod_level = 0.20
-                # Appliquer la modification dynamique
                 np.random.seed(seed + int(mod_level * 10000) + 200)
                 edges = [(i, j) for i in range(N) for j in range(i+1, N) if W[i, j] > 0]
                 if edges:
@@ -2255,15 +2265,15 @@ def run_experiment_E10(verbose=False):
             else:
                 cost_init = 0.0
 
-            # Métriques finales BD-CeNN
+            # ---------------------------------------------------------------
+            # Métriques finales BD-CeNN — UNE SEULE valeur de "conflicts"
+            # ---------------------------------------------------------------
             if M is None:
                 cost_final = compute_cochannel_cost(x_bd, W)
-                conf_cci = count_cochannel_conflicts(x_bd, W)
-                conf_aci = 0  # pas applicable en co-canal
+                conflicts_final = count_cochannel_conflicts(x_bd, W)
             else:
                 cost_final = compute_adjacent_cost(x_bd, W, M)
-                conf_cci = count_cochannel_conflicts(x_bd, W)
-                conf_aci = count_adjacent_conflicts(x_bd, W, M)
+                conflicts_final = count_adjacent_conflicts(x_bd, W, M)
 
             used_channels = len(set(x_bd))
 
@@ -2298,6 +2308,9 @@ def run_experiment_E10(verbose=False):
                             conflicting_cells.append(j)
             conflicting_cells = sorted(set(conflicting_cells))
 
+            # --- Étiquette du mode d'interférence ---
+            model_label = "CCI-only" if model_name == "cochannel" else "CCI+ACI"
+
             # --- Construire le case_data complet ---
             case_data = {
                 "case_id": case["case_id"],
@@ -2305,12 +2318,12 @@ def run_experiment_E10(verbose=False):
                 "N": N,
                 "K": K,
                 "seed": seed,
-                "context": case["context"] + f" [{model_name}]",
+                "context": case["context"] + f" [{model_label}]",
+                "model_label": model_label,
                 "metrics": {
                     "cost_initial": float(cost_init),
                     "cost_final": float(cost_final),
-                    "conflicts_cochannel": int(conf_cci),
-                    "conflicts_adjacent": int(conf_aci),
+                    "conflicts": int(conflicts_final),
                     "time_seconds": float(time_bd),
                     "iterations": int(best_iter),
                     "used_channels": int(used_channels),
@@ -2321,7 +2334,11 @@ def run_experiment_E10(verbose=False):
 
             # --- Appeler le module LLM ---
             try:
-                audit_result = audit_case(case_data, max_correction_attempts=2)
+                audit_result = audit_case(
+                    case_data,
+                    max_correction_attempts=2,
+                    model_folder=model_name,
+                )
                 results_for_model.append(audit_result)
             except Exception as e:
                 print(f"❌ Erreur lors de l'audit LLM du cas {case['case_id']} : {e}")
@@ -2329,119 +2346,92 @@ def run_experiment_E10(verbose=False):
 
         all_results[model_name] = results_for_model
 
+        # ----------------------------------------------------------------
+        # Filtrage des cas réussis vs échoués
+        # ----------------------------------------------------------------
+        valid_results = [r for r in results_for_model if r.get("status") != "LLM_FAILED"]
+        failed_results = [r for r in results_for_model if r.get("status") == "LLM_FAILED"]
+
         # --- Sauvegarde du CSV récapitulatif ---
+        # NOTE : les colonnes de score (Score /10, Exactitude, Cohérence,
+        # Clarté, Utilité, Traçabilité) ont été RETIRÉES. Les cotes sont
+        # attribuées manuellement par l'auteur.
         rows = []
         for r in results_for_model:
-            inv_detected = "Oui" if r["verification_initial"]["has_hallucination"] else "Non"
-            # Construire le type d'erreur / correction
-            if r["verification_initial"]["has_hallucination"]:
-                invented_vals = ", ".join(raw for _, raw in r["verification_initial"]["invented_numbers"])
-                type_err = f"Hallucination : {invented_vals}"
-                if r["verification_final"]["has_hallucination"]:
-                    type_err += " (non corrigée)"
-                else:
-                    type_err += f" (corrigée en {r['correction_attempts']} tentative(s))"
+            status = r.get("status", "OK")
+            if status == "LLM_FAILED":
+                rows.append({
+                    "Cas": r["case_id"],
+                    "Scénario (N, K, seed)": f"{r['scenario']} (N={r['N']}, K={r['K']}, seed={r['seed']})",
+                    "Contexte": r["context"],
+                    "Statut": "LLM_FAILED",
+                    "Invention détectée (Oui/Non)": "N/A",
+                    "Type d'erreur / Correction appliquée": "Échec LLM (503 répété) — cas non évalué",
+                    "Taux exactitude initial": 0.0,
+                    "Taux exactitude final": 0.0,
+                })
             else:
-                type_err = "Aucune erreur"
-            rows.append({
-                "Cas": r["case_id"],
-                "Scénario (N, K, seed)": f"{r['scenario']} (N={r['N']}, K={r['K']}, seed={r['seed']})",
-                "Contexte": r["context"],
-                "Score /10": r["score_total"],
-                "Invention détectée (Oui/Non)": inv_detected,
-                "Type d'erreur / Correction appliquée": type_err,
-                # Détails du score
-                "Exactitude (2)": r["score_details"].get("Exactitude numérique", 0),
-                "Cohérence (2)": r["score_details"].get("Cohérence", 0),
-                "Clarté (2)": r["score_details"].get("Clarté", 0),
-                "Utilité (2)": r["score_details"].get("Utilité ingénieur", 0),
-                "Traçabilité (2)": r["score_details"].get("Traçabilité", 0),
-                "Taux exactitude initial": r["verification_initial"]["accuracy_rate"],
-                "Taux exactitude final": r["verification_final"]["accuracy_rate"],
-            })
+                inv_detected = "Oui" if r["verification_initial"]["has_hallucination"] else "Non"
+                if r["verification_initial"]["has_hallucination"]:
+                    invented_vals = ", ".join(raw for _, raw in r["verification_initial"]["invented_numbers"])
+                    type_err = f"Hallucination : {invented_vals}"
+                    if r["verification_final"]["has_hallucination"]:
+                        type_err += " (non corrigée)"
+                    else:
+                        type_err += f" (corrigée en {r['correction_attempts']} tentative(s))"
+                else:
+                    type_err = "Aucune erreur"
+                rows.append({
+                    "Cas": r["case_id"],
+                    "Scénario (N, K, seed)": f"{r['scenario']} (N={r['N']}, K={r['K']}, seed={r['seed']})",
+                    "Contexte": r["context"],
+                    "Statut": "OK",
+                    "Invention détectée (Oui/Non)": inv_detected,
+                    "Type d'erreur / Correction appliquée": type_err,
+                    "Taux exactitude initial": r["verification_initial"]["accuracy_rate"],
+                    "Taux exactitude final": r["verification_final"]["accuracy_rate"],
+                })
         df_eval = pd.DataFrame(rows)
         csv_path = model_csv_dir / "llm_fidelity_evaluation.csv"
         df_eval.to_csv(csv_path, index=False, float_format="%.2f")
-        print(f"✅ CSV E10/{folder}/llm_fidelity_evaluation.csv sauvegardé.")
+        print(f" CSV E10/{folder}/llm_fidelity_evaluation.csv sauvegardé.")
 
-        # --- Figures radar individuelles (20) ---
-        criteria_labels = ["Exactitude", "Cohérence", "Clarté", "Utilité", "Traçabilité"]
-        criteria_keys = ["Exactitude numérique", "Cohérence", "Clarté", "Utilité ingénieur", "Traçabilité"]
+        # NOTE : la génération des figures radar individuelles et de la
+        # figure radar groupée a été RETIRÉE. Le dossier figures/E10/ n'est
+        # plus créé.
 
-        # Pour chaque cas, tracer un radar
-        for r in results_for_model:
-            values = [r["score_details"].get(k, 0) for k in criteria_keys]
-            values += values[:1]  # fermer le polygone
-            angles = np.linspace(0, 2 * np.pi, len(criteria_labels), endpoint=False).tolist()
-            angles += angles[:1]
-
-            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-            ax.plot(angles, values, "o-", linewidth=2, color="firebrick")
-            ax.fill(angles, values, alpha=0.25, color="firebrick")
-            ax.set_xticks(angles[:-1])
-            ax.set_xticklabels(criteria_labels, fontsize=9)
-            ax.set_yticks([0, 1, 2])
-            ax.set_yticklabels(["0", "1", "2"], fontsize=8)
-            ax.set_ylim(0, 2.2)
-            ax.set_title(
-                f"Fidélité LLM - {r['case_id']} ({r['scenario']})\n"
-                f"Score total : {r['score_total']:.1f}/10",
-                fontsize=11, fontweight="bold", pad=15,
-            )
-            plt.tight_layout()
-            fname = f"radar_{r['case_id'].replace('#', 'cas')}_{model_name}.pdf"
-            plt.savefig(model_fig_dir / fname, format="pdf", bbox_inches="tight")
-            plt.close(fig)
-            print(f"✅ Figure E10/{folder}/{fname} sauvegardée.")
-
-        # --- Figure radar groupée (20 cas sur le même graphique) ---
-        fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(polar=True))
-        cmap = plt.cm.get_cmap("tab20", len(results_for_model))
-        for idx, r in enumerate(results_for_model):
-            values = [r["score_details"].get(k, 0) for k in criteria_keys]
-            values += values[:1]
-            angles = np.linspace(0, 2 * np.pi, len(criteria_labels), endpoint=False).tolist()
-            angles += angles[:1]
-            ax.plot(angles, values, "o-", linewidth=1.5, color=cmap(idx),
-                    label=f"{r['case_id']} ({r['scenario']})", alpha=0.8)
-            ax.fill(angles, values, alpha=0.05, color=cmap(idx))
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(criteria_labels, fontsize=11, fontweight="bold")
-        ax.set_yticks([0, 1, 2])
-        ax.set_yticklabels(["0", "1", "2"], fontsize=9)
-        ax.set_ylim(0, 2.2)
-        ax.set_title(
-            f"Scores de fidélité du LLM sur 20 cas - {model_name}\n"
-            "(5 critères × 2 pts)",
-            fontsize=13, fontweight="bold", pad=25,
-        )
-        ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.10), fontsize=7, ncol=1)
-        plt.tight_layout()
-        fname_group = f"radar_grouped_20cases_{model_name}.pdf"
-        plt.savefig(model_fig_dir / fname_group, format="pdf", bbox_inches="tight")
-        plt.close(fig)
-        print(f"✅ Figure E10/{folder}/{fname_group} sauvegardée.")
-
-    # --- Bilan global ---
+    # --- Bilan global (filtrage des cas LLM_FAILED) ---
     print("\n" + "=" * 80)
     print("📊 BILAN E10 - Évaluation de la fidélité du LLM")
     print("=" * 80)
     for model_name, results in all_results.items():
         if not results:
             continue
-        scores = [r["score_total"] for r in results]
-        hallu_count = sum(1 for r in results if r["verification_initial"]["has_hallucination"])
-        corrected_count = sum(
-            1 for r in results
-            if r["verification_initial"]["has_hallucination"] and not r["verification_final"]["has_hallucination"]
-        )
+
+        valid_results = [r for r in results if r.get("status") != "LLM_FAILED"]
+        failed_results = [r for r in results if r.get("status") == "LLM_FAILED"]
+
         print(f"\n[{model_name}]")
         print(f"  Nombre de cas évalués         : {len(results)}")
-        print(f"  Score moyen                   : {np.mean(scores):.2f}/10")
-        print(f"  Cas avec hallucination (init) : {hallu_count}/{len(results)}")
-        print(f"  Cas corrigés automatiquement  : {corrected_count}/{hallu_count if hallu_count > 0 else 1}")
-    print("\n✅ E10 terminée.")
+        print(f"  Cas réussis                   : {len(valid_results)}")
+        print(f"  Cas échoués (LLM indisponible): {len(failed_results)}")
 
+        if valid_results:
+            hallu_count = sum(1 for r in valid_results if r["verification_initial"]["has_hallucination"])
+            corrected_count = sum(
+                1 for r in valid_results
+                if r["verification_initial"]["has_hallucination"] and not r["verification_final"]["has_hallucination"]
+            )
+            print(f"  Cas avec hallucination (init) : {hallu_count}/{len(valid_results)}")
+            print(f"  Cas corrigés automatiquement  : {corrected_count}/{hallu_count if hallu_count > 0 else 1}")
+
+            if failed_results:
+                failed_ids = ", ".join(r["case_id"] for r in failed_results)
+                print(f"  Cas LLM_FAILED                : {failed_ids}")
+        else:
+            print("  ⚠️ Aucun cas réussi pour ce modèle.")
+
+    print("\n✅ E10 terminée.")
 
 
 

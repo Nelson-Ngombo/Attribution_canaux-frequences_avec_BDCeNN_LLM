@@ -9,6 +9,10 @@ Ce module contient :
     D. La génération de rapports PDF professionnels.
     E. Le mécanisme de régénération sous contrainte (correction des hallucinations).
 
+NOTE : L'évaluation académique automatique (grille 5 critères × 2 pts) a été
+RETIRÉE de ce module. Les cotes sont attribuées MANUELLEMENT par l'auteur
+dans le rapport final, en se basant sur les PDF individuels et le CSV.
+
 Auteur : Nelson Ngombo
 """
 
@@ -16,27 +20,34 @@ import os
 import re
 import json
 import time
+import random
 import requests
+import warnings
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 # -----------------------------------------------------------------------------
+# 0. SUPPRESSION DES WARNINGS COSMÉTIQUES DU SDK GOOGLE GENAI
+# -----------------------------------------------------------------------------
+warnings.filterwarnings("ignore", message=".*automatic function calling.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*AFC.*", category=UserWarning)
+
+
+# -----------------------------------------------------------------------------
 # 1. CONFIGURATION GLOBALE
 # -----------------------------------------------------------------------------
-# Charger les variables d'environnement depuis le fichier .env
 from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-# Charger .env situé à la racine du projet
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-# Récupérer la clé API (variable d'environnement GOOGLE_API_KEY)
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise EnvironmentError(
@@ -44,20 +55,22 @@ if not GOOGLE_API_KEY:
         "Vérifiez votre fichier .env à la racine du projet."
     )
 
-# Modèle Gemini à utiliser.
-# On utilise l'alias "gemini-flash-latest" qui pointe automatiquement vers
-# le dernier modèle Flash disponible pour la clé. Cela évite les 404 en cas
-# de dépréciation (Google renomme ses modèles tous les 2-3 mois).
-GOOGLE_MODEL_PREFERRED = "gemini-flash-latest"
+# -----------------------------------------------------------------------------
+# Modèles Gemini à utiliser
+# -----------------------------------------------------------------------------
+GOOGLE_MODEL_PREFERRED = "gemini-3.6-flash"
 GOOGLE_MODEL_FALLBACKS = [
-    "gemini-3.8-flash",
     "gemini-3.7-flash",
-    "gemini-3.6-flash",
+    "gemini-3.8-flash",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
 ]
 
-# Dossiers de sortie
+INTER_REQUEST_DELAY = 5.0  # secondes
+
 from config import LLM_LOGS_DIR, FIGURES_DIR, CSV_DIR
 
 LLM_LOGS_DIR = Path(LLM_LOGS_DIR)
@@ -66,6 +79,28 @@ LLM_REPORTS_DIR = LLM_LOGS_DIR / "reports_pdf"
 LLM_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 LLM_RAW_DIR = LLM_LOGS_DIR / "raw_responses"
 LLM_RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_mode_folders(model_label: str):
+    """
+    Retourne (raw_dir, reports_dir) correspondant au mode d'interférence.
+
+    - "CCI-only"  → sous-dossier "cochannel"
+    - "CCI+ACI"   → sous-dossier "adjacent"
+    - autre       → sous-dossier "misc" (fallback)
+    """
+    if not model_label:
+        sub = "misc"
+    elif "CCI+ACI" in model_label or "adjacent" in model_label.lower():
+        sub = "adjacent"
+    else:
+        sub = "cochannel"
+    raw_dir = LLM_RAW_DIR / sub
+    rep_dir = LLM_REPORTS_DIR / sub
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    rep_dir.mkdir(parents=True, exist_ok=True)
+    return raw_dir, rep_dir
+
 
 # -----------------------------------------------------------------------------
 # 2. FONCTIONS UTILITAIRES
@@ -83,6 +118,18 @@ def _fmt(value, ndigits=2):
     return str(value)
 
 
+def _conflicts_label(model_label: str) -> str:
+    """
+    Retourne le libellé à utiliser pour la ligne "conflits" selon le mode.
+
+    - CCI-only → "Conflits co-canal (CCI)"
+    - CCI+ACI  → "Conflits totaux (CCI+ACI)"
+    """
+    if model_label == "CCI+ACI":
+        return "Conflits totaux (CCI+ACI)"
+    return "Conflits co-canal (CCI)"
+
+
 # -----------------------------------------------------------------------------
 # A. GÉNÉRATEUR DE PROMPT AVEC GARDE-FOUS
 # -----------------------------------------------------------------------------
@@ -94,52 +141,76 @@ les résultats d'une simulation d'attribution de canaux.
 
 RÈGLES STRICTES :
 1. Tu ne dois JAMAIS inventer, altérer ou extrapoler un chiffre.
-2. Tu dois citer EXCLUSIVEMENT les valeurs numériques présentes dans les données fournies.
+2. Tu dois citer EXCLUSIVEMENT les valeurs numériques présentes dans les
+   données fournies.
 3. Si une information n'est pas présente dans les données, écris simplement :
    "Information non disponible dans les données fournies."
 4. Toute valeur numérique que tu cites doit pouvoir être retrouvée textuellement
    dans le bloc "DONNÉES DE SIMULATION" ci-dessous.
 5. Si tu détectes une incohérence dans les données, signale-le sans inventer.
 6. Rédige une analyse structurée et concise, comme un rapport d'ingénieur.
+
+=== RÈGLE D'ÉNUMÉRATION ===
+- Pour énumérer tes points, utilise OBLIGATOIREMENT des LETTRES MAJUSCULES
+  suivies d'une parenthèse fermante : A), B), C), D)...
+- N'utilise JAMAIS de chiffres suivis d'un point (1., 2., 3...), car tout
+  chiffre dans ta réponse est interprété comme une DONNÉE NUMÉRIQUE de la
+  simulation et sera vérifié par le contrôleur automatique.
+
+=== RÈGLE SUR LES NOMBRES (TRÈS IMPORTANTE) ===
+Un contrôleur automatique indépendant vérifie CHAQUE nombre écrit en chiffres
+dans ta réponse. Tout chiffre qui n'est pas un résultat de la simulation
+fournie sera CONSIDÉRÉ COMME UNE HALLUCINATION NUMÉRIQUE, même s'il s'agit
+d'un simple numéro dans une phrase.
+
+  RÈGLE 1 — RÉSULTATS DE SIMULATION : EN CHIFFRES.
+  Écris en chiffres UNIQUEMENT les valeurs qui proviennent du bloc
+  "DONNÉES DE SIMULATION" ci-dessous (coût, conflits, temps, itérations,
+  canaux utilisés, N, K, seed, identifiant du cas, nom du scénario).
+
+  RÈGLE 2 — NOMBRES HORS SIMULATION : EN TOUTES LETTRES.
+  Tous les autres nombres que tu souhaites introduire dans ton texte
+  (numéros d'ordre, bornes d'échelle, effectifs génériques, dates,
+  numéros de version, etc.) DOIVENT être écrits EN TOUTES LETTRES.
+
+  EXEMPLES CORRECTS :
+    ✓ "sur les trois baselines..."
+    ✓ "au cours des deux premières itérations..."
+    ✓ "la note de confiance est quatre sur cinq"
+    ✓ "Le coût final s'élève à 37.75"  (37.75 = résultat, donc en chiffres)
+
+  EXEMPLES INTERDITS :
+    ✗ "sur les 3 baselines..."
+    ✗ "pendant les 2 premières..."
+    ✗ "la note de confiance est 4 sur 5"
+
+POURQUOI CETTE RÈGLE ?
+Le contrôleur automatique ne fait pas la différence entre un chiffre qui est
+un RÉSULTAT de la simulation et un chiffre qui est un simple NUMÉRO dans une
+phrase. Écrire les numéros non-résultats en toutes lettres élimine toute
+ambiguïté et garantit qu'aucun faux positif d'hallucination n'est déclenché.
+
+=== RÈGLE DE SINCÉRITÉ ===
+- Reste strictement factuel dans tes comparaisons. Si une baseline (Random,
+  Greedy, DSATUR) est meilleure que BD-CeNN sur un critère (coût ou temps),
+  dis-le explicitement sans enjoliver.
 === FIN DIRECTIVE ===
 """
+
 
 def build_prompt(case_data: dict) -> str:
     """
     Construit un prompt structuré avec garde-fous pour un cas de simulation.
 
-    Parameters
-    ----------
-    case_data : dict
-        Dictionnaire contenant les informations du cas. Doit contenir :
-        - 'case_id'      : identifiant du cas (#1..#20)
-        - 'scenario'     : nom du scénario (S1..S7)
-        - 'N'            : nombre de cellules
-        - 'K'            : nombre de canaux
-        - 'seed'         : seed de topologie
-        - 'context'      : contexte (nominal, bruit 5%, etc.)
-        - 'metrics'      : dict contenant les métriques du solveur BD-CeNN :
-              * 'cost_initial'
-              * 'cost_final'
-              * 'conflicts_cochannel'
-              * 'conflicts_adjacent'
-              * 'time_seconds'
-              * 'iterations'
-              * 'used_channels'
-        - 'baselines'    : dict avec les métriques des baselines :
-              * 'Random'   : {'cost': .., 'conflicts': .., 'time': ..}
-              * 'Greedy'   : {...}
-              * 'DSATUR'   : {...}
-        - 'conflicting_cells' : liste des cellules en conflit (optionnel)
-
-    Returns
-    -------
-    prompt : str
+    SÉMANTIQUE DES MODES (IMPORTANT) :
+      - "CCI-only" : coût et conflits = interférences co-canal uniquement.
+      - "CCI+ACI"  : coût et conflits = interférences co-canal ET adjacent
+                     (UN SEUL chiffre combiné).
     """
     m = case_data.get("metrics", {})
     b = case_data.get("baselines", {})
+    model_label = case_data.get("model_label", "CCI-only")
 
-    # Construire le bloc des baselines
     baseline_lines = []
     for name in ["Random", "Greedy", "DSATUR"]:
         if name in b:
@@ -157,6 +228,22 @@ def build_prompt(case_data: dict) -> str:
         else "aucune (ou non disponible)"
     )
 
+    if model_label == "CCI+ACI":
+        conflicts_label = "Conflits totaux (CCI+ACI)"
+        mode_note = (
+            "Le coût et le nombre de conflits présentés ci-dessous intègrent\n"
+            "À LA FOIS les interférences co-canal (même canal) ET les\n"
+            "interférences entre canaux adjacents. C'est UN SEUL chiffre\n"
+            "combiné, pas deux chiffres séparés."
+        )
+    else:
+        conflicts_label = "Conflits co-canal (CCI)"
+        mode_note = (
+            "Le coût et le nombre de conflits présentés ci-dessous prennent en\n"
+            "compte UNIQUEMENT les interférences co-canal (même canal attribué\n"
+            "à deux cellules interférentes)."
+        )
+
     prompt = f"""
 {ZERO_HALLUCINATION_DIRECTIVE}
 
@@ -165,14 +252,17 @@ def build_prompt(case_data: dict) -> str:
 - Scénario : {case_data.get('scenario')}
 - Configuration : N = {case_data.get('N')} cellules, K = {case_data.get('K')} canaux
 - Seed de topologie : {case_data.get('seed')}
+- Mode d'interférence : {model_label}
 - Contexte : {case_data.get('context')}
+
+=== NOTE SUR LE MODE D'INTERFÉRENCE ===
+{mode_note}
 
 === DONNÉES DE SIMULATION (SOLVEUR BD-CeNN) ===
 - Coût initial J_0 : {_fmt(m.get('cost_initial'))}
 - Coût final J(x) : {_fmt(m.get('cost_final'))}
-- Nombre de conflits co-canal (CCI) : {_fmt(m.get('conflicts_cochannel'))}
-- Nombre de conflits adjacent (ACI) : {_fmt(m.get('conflicts_adjacent'))}
-- Temps d'exécution : {_fmt(m.get('time_seconds'), 6)} s
+- {conflicts_label} : {_fmt(m.get('conflicts'))}
+- Temps d'exécution du BD-CeNN : {_fmt(m.get('time_seconds'), 6)} s
 - Nombre d'itérations avant convergence : {_fmt(m.get('iterations'))}
 - Canaux utilisés : {_fmt(m.get('used_channels'))}
 
@@ -182,24 +272,37 @@ def build_prompt(case_data: dict) -> str:
 === CELLULES ENCORE EN CONFLIT ===
 {conflicting_str}
 
-=== TÂCHES DEMANDÉES ===
-1. Résume la qualité de la solution BD-CeNN en comparant le coût final aux baselines.
-2. Identifie la cause probable des conflits restants (topologie, pénurie de canaux, minimum local).
-3. Évalue la convergence (nombre d'itérations, temps d'exécution).
-4. Donne une recommandation opérationnelle pour un ingénieur radio.
-5. Termine par un avis de confiance (1-5) justifié.
+=== TÂCHES DEMANDÉES (à énumérer avec des LETTRES : A), B), C)...) ===
+A) Résume la qualité de la solution BD-CeNN en comparant le COÛT FINAL aux baselines.
 
-Rédige ton rapport en français, de manière professionnelle et structurée.
-N'oublie pas : tu ne dois citer AUCUN chiffre qui ne soit présent dans les données ci-dessus.
+B) Évalue la convergence en citant explicitement le nombre d'itérations avant convergence
+C) Compare les PERFORMANCES DE CALCUL (TEMPS D'EXÉCUTION) :
+   - Cite le temps d'exécution du BD-CeNN et celui de chaque baseline.
+   - Si une baseline est PLUS RAPIDE que BD-CeNN, dis-le franchement ;
+   - Si BD-CeNN est plus lent, explique pourquoi ?.
+D) Dans le cas où les résultats du BD-CeNN ne sont pas fameux a tu une récommandation a faire en tant que Assitant de l'ingénieur Radio pour améliorer les résultats si les résultats sont satisfaisant tu peut nous dire "pas de recommandation à faire vu les bons résultats obtenues"
+
+E) Termine par un avis de confiance : attribue une note de confiance
+   sur une échelle à cinq niveaux (le niveau maximal étant le plus élevé),
+   puis justifie-la brièvement. Écris la note EN TOUTES LETTRES
+   (par exemple : "quatre sur cinq"), PAS en chiffres.
+
+Rédige ton rapport de facon détaillé, long et Argumenté en français, de manière professionnelle et structurée.
+Rappels :
+- N'utilise JAMAIS de chiffres pour énumérer. Utilise A), B), C)...
+- Tous les chiffres cités doivent provenir EXCLUSIVEMENT des données ci-dessus.
+- Pour tout autre nombre (numéros d'ordre, bornes d'échelle), utilise des
+  LETTRES (ex. "trois", "quatre sur cinq").
+- Ne cite PAS de "conflits CCI" ni de "conflits ACI" séparément dans ce mode.
+  Utilise UNIQUEMENT le chiffre "{conflicts_label}" fourni ci-dessus.
 """
     return prompt.strip()
 
 
 # -----------------------------------------------------------------------------
-# B. INTERFACE AVEC LE LLM (GOOGLE GENAI – SDK MODERNE)
+# B. INTERFACE AVEC LE LLM
 # -----------------------------------------------------------------------------
 
-# Initialiser le client Google GenAI une seule fois
 from google import genai
 from google.genai import types
 
@@ -207,18 +310,9 @@ _client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
 def _check_model_available(preferred: str, fallbacks: list) -> str:
-    """
-    Vérifie que `preferred` est utilisable pour cette clé API.
-    Sinon, essaie dans l'ordre les modèles de `fallbacks`.
-    Retourne le nom du premier modèle fonctionnel.
-
-    NB : `client.models.list()` peut lister des modèles qui ne sont plus
-    accessibles aux nouveaux utilisateurs. On vérifie donc par un appel réel.
-    """
     candidates = [preferred] + [f for f in fallbacks if f != preferred]
     for c in candidates:
         try:
-            # Test minimal : on demande une réponse triviale
             _client.models.generate_content(
                 model=c,
                 contents="ping",
@@ -234,71 +328,170 @@ def _check_model_available(preferred: str, fallbacks: list) -> str:
     )
 
 
-# On détermine une bonne fois pour toutes le modèle à utiliser
 GOOGLE_MODEL = _check_model_available(GOOGLE_MODEL_PREFERRED, GOOGLE_MODEL_FALLBACKS)
 print(f"✅ Modèle Gemini retenu : {GOOGLE_MODEL}")
 
+_LAST_SUCCESSFUL_MODEL = None
 
-def ask_llm(prompt: str, timeout: int = 60, max_retries: int = 3) -> str:
+
+def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
+            inter_request_delay: float = INTER_REQUEST_DELAY) -> str:
     """
-    Interroge le LLM Google Gemini via le nouveau SDK `google-genai`.
+    Interroge le LLM Google Gemini via le SDK `google-genai`.
 
-    Parameters
-    ----------
-    prompt : str
-        Prompt complet à envoyer.
-    timeout : int
-        Délai d'attente (le SDK gère en interne, ce paramètre est indicatif).
-    max_retries : int
-        Nombre de tentatives en cas d'erreur transitoire.
-
-    Returns
-    -------
-    response : str
-        Texte généré par le LLM. En cas d'échec total, retourne un message d'erreur.
+    STRATÉGIE :
+    1. PAUSE INTER-REQUÊTE (5s) avant chaque nouvelle requête.
+    2. ROTATION DE MODÈLES sur 503/429/404.
+    3. STICKY MODEL (mémorise le dernier modèle qui a marché).
+    4. BACKOFF EXPONENTIEL pour les autres erreurs.
+    5. BUDGET DE TOKENS ÉLARGI : 8000 (au lieu de 4000).
+       Motif : les modèles 3.x génèrent des "thinking tokens" internes
+       qui comptent dans le budget de sortie. Un budget trop bas tronque
+       la réponse finale.
+    6. FILTRAGE DES THOUGHTS : on ignore les parts marquées comme
+       "thought" (raisonnement interne) et on ne garde que le texte final
+       visible.
+    7. DÉTECTION DE TRONCATURE : si finish_reason == "MAX_TOKENS", on
+       retry immédiatement avec un budget doublé.
     """
+    global _LAST_SUCCESSFUL_MODEL
+
+    if inter_request_delay > 0:
+        print(f"       Pause de {inter_request_delay:.1f}s avant la requête...")
+        time.sleep(inter_request_delay)
+
+    all_models = [GOOGLE_MODEL] + [m for m in GOOGLE_MODEL_FALLBACKS if m != GOOGLE_MODEL]
+    if _LAST_SUCCESSFUL_MODEL and _LAST_SUCCESSFUL_MODEL in all_models:
+        candidates = [_LAST_SUCCESSFUL_MODEL] + [m for m in all_models if m != _LAST_SUCCESSFUL_MODEL]
+    else:
+        candidates = all_models
+
+    tried_models = set()
     last_error = None
+
+    # Budget de tokens initial (élargi)
+    current_max_tokens = 8000
+
     for attempt in range(1, max_retries + 1):
+        model_to_try = None
+        for c in candidates:
+            if c not in tried_models:
+                model_to_try = c
+                break
+        if model_to_try is None:
+            tried_models.clear()
+            model_to_try = candidates[0]
+
         try:
             response = _client.models.generate_content(
-                model=GOOGLE_MODEL,
+                model=model_to_try,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.2,          # faible pour limiter la créativité
-                    max_output_tokens=1200,
+                    temperature=0.2,
+                    max_output_tokens=current_max_tokens,
                     top_p=0.9,
                 ),
             )
-            # Récupérer le texte
+
+            # ---------------------------------------------------------------
+            # EXTRACTION DU TEXTE FINAL (en ignorant les "thoughts")
+            # ---------------------------------------------------------------
+            # Les modèles Gemini 3.x génèrent des "thinking tokens" internes
+            # qui apparaissent parfois dans `content.parts` avec un flag
+            # `thought=True`. On DOIT les ignorer pour ne garder QUE la
+            # réponse finale visible.
+            extracted_text = ""
+            finish_reason_str = None
+
+            if response.candidates:
+                cand = response.candidates[0]
+                # Détecter la raison d'arrêt
+                if hasattr(cand, "finish_reason"):
+                    finish_reason_str = str(cand.finish_reason).upper()
+
+                # Parcourir les parts et ignorer celles marquées "thought"
+                if cand.content and cand.content.parts:
+                    for part in cand.content.parts:
+                        # Ignorer les parts "thought" (raisonnement interne)
+                        is_thought = getattr(part, "thought", False)
+                        if is_thought:
+                            continue
+                        # Extraire le texte des parts normales
+                        if hasattr(part, "text") and part.text:
+                            extracted_text += part.text
+
+            # Si on a pu extraire du texte via les parts, on l'utilise
+            if extracted_text.strip():
+                extracted_text = extracted_text.strip()
+
+                # ---------------------------------------------------------
+                # DÉTECTION DE TRONCATURE
+                # ---------------------------------------------------------
+                # Si le modèle s'est arrêté pour cause de MAX_TOKENS, la
+                # réponse est probablement tronquée. On l'accepte quand
+                # même (pour ne pas perdre le travail déjà fait), MAIS on
+                # log un avertissement visible.
+                if finish_reason_str and "MAX_TOKENS" in finish_reason_str:
+                    print(f"     ⚠️  Réponse TRONQUÉE (MAX_TOKENS atteint, "
+                          f"budget = {current_max_tokens}). La réponse peut "
+                          f"être incomplète.")
+                    # Augmenter le budget pour la prochaine tentative
+                    current_max_tokens = min(current_max_tokens * 2, 16000)
+
+                _LAST_SUCCESSFUL_MODEL = model_to_try
+                return extracted_text
+
+            # Fallback : si response.text existe et n'est pas vide
             if hasattr(response, "text") and response.text:
-                return response.text.strip()
-            # Fallback si response.text est vide
-            if response.candidates and response.candidates[0].content.parts:
-                text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p, "text"))
+                text = response.text.strip()
                 if text:
-                    return text.strip()
+                    _LAST_SUCCESSFUL_MODEL = model_to_try
+                    return text
+
             return "[ERREUR LLM] Réponse vide renvoyée par le modèle."
+
         except Exception as e:
             last_error = f"{type(e).__name__} : {e}"
-            print(f"  ⚠️ Tentative {attempt}/{max_retries} échouée : {last_error}")
-            time.sleep(2 * attempt)   # backoff exponentiel
+            error_str = str(e)
+            is_503 = "503" in error_str or "UNAVAILABLE" in error_str
+            is_429 = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            is_404 = "404" in error_str or "NOT_FOUND" in error_str
+            needs_rotation = is_503 or is_429 or is_404
+
+            short_err = last_error.split("\n")[0][:140]
+            print(f"  ⚠️ Tentative {attempt}/{max_retries} sur '{model_to_try}' échouée : {short_err}")
+            tried_models.add(model_to_try)
+
+            if attempt < max_retries:
+                if needs_rotation:
+                    next_model = next(
+                        (c for c in candidates if c not in tried_models),
+                        candidates[0],
+                    )
+                    if is_503:
+                        reason = "503 (surcharge)"
+                    elif is_429:
+                        reason = "429 (quota épuisé)"
+                    else:
+                        reason = "404 (modèle indisponible)"
+                    wait = 1 + random.uniform(0, 3)
+                    print(f"     🔄 {reason} → rotation vers '{next_model}'. Attente {wait:.1f}s...")
+                else:
+                    wait = min(60, (2 ** (attempt + 1)) + random.uniform(0, 3))
+                    print(f"     ⏳ Attente de {wait:.1f}s avant nouvelle tentative...")
+                time.sleep(wait)
+
     return f"[ERREUR LLM] Échec après {max_retries} tentatives. Détail : {last_error}"
 
 
 # -----------------------------------------------------------------------------
-# C. CONTRÔLEUR MATHÉMATIQUE INDÉPENDANT (REGEX & PARSER GARDE-FOU)
+# C. CONTRÔLEUR MATHÉMATIQUE INDÉPENDANT
 # -----------------------------------------------------------------------------
 
-# Regex pour capturer les entiers et flottants (positifs/négatifs, avec ou sans décimale)
 NUMBER_REGEX = re.compile(r"-?\d+(?:[.,]\d+)?")
 
-def extract_numbers(text: str) -> list:
-    """
-    Extrait tous les nombres (entiers et flottants) présents dans un texte.
 
-    Retourne une liste de tuples (valeur_float, valeur_str_originale).
-    Les virgules décimales sont converties en points.
-    """
+def extract_numbers(text: str) -> list:
     results = []
     for match in NUMBER_REGEX.findall(text):
         raw = match
@@ -314,7 +507,6 @@ def extract_numbers(text: str) -> list:
 def _collect_allowed_numbers(case_data: dict) -> set:
     """
     Construit l'ensemble des valeurs numériques autorisées à partir du case_data.
-    On y ajoute aussi quelques valeurs structurelles (N, K, seed, case_id).
     """
     allowed = set()
 
@@ -325,33 +517,40 @@ def _collect_allowed_numbers(case_data: dict) -> set:
         except Exception:
             pass
 
-    # Paramètres structurels
     for key in ["N", "K", "seed"]:
         if key in case_data:
             add(case_data[key])
 
-    # Identifiant du cas (ex. "#3" -> 3)
+    # Identifiant du cas (ex. "#3" → 3)
     cid = str(case_data.get("case_id", "")).replace("#", "")
     if cid.isdigit():
         add(int(cid))
 
-    # Métriques du solveur
+    # Chiffres du scénario (ex. "S3" → 3, "S7" → 7)
+    scenario_str = str(case_data.get("scenario", ""))
+    for num_str in re.findall(r"\d+", scenario_str):
+        try:
+            add(int(num_str))
+        except ValueError:
+            pass
+
+    # Échelle de confiance 1-5 (par sécurité)
+    for n in range(1, 6):
+        add(n)
+
     m = case_data.get("metrics", {})
     for key in [
-        "cost_initial", "cost_final",
-        "conflicts_cochannel", "conflicts_adjacent",
+        "cost_initial", "cost_final", "conflicts",
         "time_seconds", "iterations", "used_channels",
     ]:
         if key in m:
             add(m[key])
 
-    # Baselines
     for base_name, base_data in case_data.get("baselines", {}).items():
         for k in ["cost", "conflicts", "time"]:
             if k in base_data:
                 add(base_data[k])
 
-    # Cellules en conflit
     for c in case_data.get("conflicting_cells", []):
         add(c)
 
@@ -359,29 +558,6 @@ def _collect_allowed_numbers(case_data: dict) -> set:
 
 
 def verify_numbers(llm_response: str, case_data: dict, tolerance: float = 0.01) -> dict:
-    """
-    Contrôleur mathématique indépendant : vérifie que tous les nombres cités
-    par le LLM sont présents (à la tolérance près) dans le case_data.
-
-    Parameters
-    ----------
-    llm_response : str
-        Texte généré par le LLM.
-    case_data : dict
-        Dictionnaire du cas (voir build_prompt).
-    tolerance : float
-        Tolérance relative pour la comparaison des flottants (1% par défaut).
-
-    Returns
-    -------
-    report : dict avec :
-        - 'all_numbers'          : liste de tous les nombres extraits
-        - 'allowed_numbers'      : ensemble des nombres autorisés
-        - 'valid_numbers'        : liste des nombres validés
-        - 'invented_numbers'     : liste des nombres NON trouvés (hallucinations)
-        - 'has_hallucination'    : booléen
-        - 'accuracy_rate'        : taux d'exactitude numérique en %
-    """
     extracted = extract_numbers(llm_response)
     allowed = _collect_allowed_numbers(case_data)
 
@@ -389,7 +565,6 @@ def verify_numbers(llm_response: str, case_data: dict, tolerance: float = 0.01) 
     invented = []
 
     for val, raw in extracted:
-        # Vérifier la présence à tolérance près
         found = False
         for a in allowed:
             if a == 0 and val == 0:
@@ -418,54 +593,74 @@ def verify_numbers(llm_response: str, case_data: dict, tolerance: float = 0.01) 
     }
 
 
-def regenerate_with_correction(case_data: dict, llm_response: str, verification: dict) -> str:
+def regenerate_with_correction(case_data: dict, original_prompt: str,
+                                llm_response: str, verification: dict) -> str:
     """
-    Mécanisme de régénération sous contrainte : réinterroge le LLM en lui
-    signalant explicitement les valeurs incorrectes détectées.
-
-    Retourne la nouvelle réponse du LLM.
+    Régénération sous contrainte. On renvoie le PROMPT INITIAL COMPLET
+    (car chaque appel est indépendant, pas de mémoire conversationnelle).
     """
     if not verification["has_hallucination"]:
         return llm_response
 
-    # Construire la liste des valeurs fautives
     faulty_str = "\n".join(
         f"  - valeur citée : {raw} (non présente dans les données)"
         for _, raw in verification["invented_numbers"]
     )
 
-    # Reconstruire un mini-rappel des données autorisées
     m = case_data.get("metrics", {})
+    model_label = case_data.get("model_label", "CCI-only")
+    conflicts_label = _conflicts_label(model_label)
+
     allowed_summary = (
         f"Coût initial = {_fmt(m.get('cost_initial'))} ; "
         f"Coût final = {_fmt(m.get('cost_final'))} ; "
-        f"Conflits CCI = {_fmt(m.get('conflicts_cochannel'))} ; "
-        f"Conflits ACI = {_fmt(m.get('conflicts_adjacent'))} ; "
+        f"{conflicts_label} = {_fmt(m.get('conflicts'))} ; "
         f"Temps = {_fmt(m.get('time_seconds'), 6)} s ; "
         f"Itérations = {_fmt(m.get('iterations'))} ; "
         f"Canaux utilisés = {_fmt(m.get('used_channels'))}."
     )
 
     correction_prompt = f"""
-=== RECTIFICATION DEMANDÉE ===
-Dans ta réponse précédente, tu as cité les valeurs numériques suivantes
-qui NE FIGURENT PAS dans les données fournies :
+=== RECTIFICATION DEMANDÉE (REPRISE INTÉGRALE) ===
+
+Nous te fournissons à nouveau la REQUÊTE ORIGINALE COMPLÈTE (car tu n'as pas
+de mémoire entre nos échanges). Prends-en connaissance, puis corrige ta
+réponse précédente qui contenait des ERREURS NUMÉRIQUES.
+
+--- DÉBUT DE LA REQUÊTE ORIGINALE ---
+{original_prompt}
+--- FIN DE LA REQUÊTE ORIGINALE ---
+
+Dans ta réponse précédente à cette requête, tu as cité les valeurs
+numériques suivantes :
 
 {faulty_str}
 
-RAPPEL DES DONNÉES AUTORISÉES :
+Ces valeurs NE FIGURENT PAS dans les données de simulation de la requête
+originale. Ce sont donc des HALLUCINATIONS NUMÉRIQUES.
+
+Rappel des données autorisées :
 {allowed_summary}
 
-Consigne : réécris intégralement ton rapport en remplaçant toute valeur
-incorrecte par la valeur exacte issue des données. Si une information
-est absente, écris "Information non disponible dans les données fournies."
-
-Ta nouvelle réponse doit contenir UNIQUEMENT des chiffres autorisés.
+CONSIGNES DE CORRECTION :
+A) Reprends intégralement ta réponse en répondant aux MÊMES tâches
+   (A) Résumé, B) Convergence, C) Temps d'exécution, D) Avis de confiance).
+B) Remplace toute valeur incorrecte par la valeur exacte issue des données.
+C) Si une information est absente, écris simplement :
+   "Information non disponible dans les données fournies."
+D) Utilise des LETTRES MAJUSCULES (A), B), C)...) pour énumérer.
+E) RAPPEL DE LA RÈGLE DES NOMBRES :
+   - Les RÉSULTATS de simulation (coût, conflits, temps, itérations,
+     canaux) doivent être écrits EN CHIFFRES.
+   - Tous les AUTRES nombres (numéros d'ordre, bornes d'échelle,
+     note de confiance, etc.) doivent être écrits EN TOUTES LETTRES.
+F) Ne cite PAS de "conflits CCI" ni de "conflits ACI" séparément si le mode
+   est CCI+ACI. Utilise UNIQUEMENT le chiffre "{conflicts_label}" fourni.
 
 === RÉPONSE PRÉCÉDENTE À CORRIGER ===
 {llm_response}
 """
-    return ask_llm(correction_prompt)
+    return ask_llm(correction_prompt, inter_request_delay=INTER_REQUEST_DELAY)
 
 
 # -----------------------------------------------------------------------------
@@ -479,23 +674,14 @@ def generate_pdf_report(
     verification_initial: dict,
     corrected_response: str,
     verification_final: dict,
-    score_total: float,
-    score_details: dict,
     output_path: Path,
-    model_name: str = None,   # ← nom du modèle LLM utilisé
+    model_name: str = None,
 ) -> None:
     """
     Génère un rapport PDF professionnel pour un cas LLM.
 
-    Le rapport contient :
-        - En-tête avec le cas, le scénario et la date.
-        - Données de simulation utilisées (table).
-        - Prompt envoyé au LLM.
-        - Réponse brute du LLM.
-        - Résultats de l'audit numérique (inventions, taux d'exactitude).
-        - Réponse corrigée (si applicable).
-        - Score académique (5 critères x 2 pts).
-        - Badge de conformité.
+    NOTE : la section "6. Évaluation académique (grille 5 critères × 2 pts)"
+    a été RETIRÉE. Les cotes sont attribuées manuellement par l'auteur.
     """
     try:
         from reportlab.lib.pagesizes import A4
@@ -541,8 +727,14 @@ def generate_pdf_report(
 
     story = []
 
+    model_label = case_data.get("model_label", "CCI-only")
+    conflicts_label = _conflicts_label(model_label)
+
     # ---- Titre ----
-    story.append(Paragraph("Rapport d'audit LLM - Attribution de canaux", style_title))
+    story.append(Paragraph(
+        f"Rapport d'audit LLM — Attribution de canaux ({model_label})",
+        style_title
+    ))
     story.append(Spacer(1, 0.3*cm))
 
     # ---- En-tête ----
@@ -550,8 +742,9 @@ def generate_pdf_report(
         ["Cas", case_data.get("case_id", "-")],
         ["Scénario", case_data.get("scenario", "-")],
         ["Configuration", f"N={case_data.get('N')}, K={case_data.get('K')}, seed={case_data.get('seed')}"],
+        ["Mode d'interférence", model_label],
         ["Contexte", case_data.get("context", "-")],
-        ["Modèle LLM", model_name if model_name else "Non spécifié"],   
+        ["Modèle LLM", model_name if model_name else "Non spécifié"],
         ["Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ]
     header_table = Table(header_data, colWidths=[4*cm, 12*cm])
@@ -586,8 +779,7 @@ def generate_pdf_report(
         ["Métrique", "Valeur"],
         ["Coût initial J_0", _fmt(m.get("cost_initial"))],
         ["Coût final J(x)", _fmt(m.get("cost_final"))],
-        ["Conflits co-canal (CCI)", _fmt(m.get("conflicts_cochannel"))],
-        ["Conflits adjacent (ACI)", _fmt(m.get("conflicts_adjacent"))],
+        [conflicts_label, _fmt(m.get("conflicts"))],
         ["Temps d'exécution (s)", _fmt(m.get("time_seconds"), 6)],
         ["Itérations (BD-CeNN)", _fmt(m.get("iterations"))],
         ["Canaux utilisés", _fmt(m.get("used_channels"))],
@@ -650,7 +842,6 @@ def generate_pdf_report(
         corr_escaped = corrected_response.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         story.append(Paragraph(corr_escaped.replace("\n", "<br/>"), style_body))
 
-        # Audit de la réponse corrigée
         story.append(Spacer(1, 0.2*cm))
         story.append(Paragraph("Audit de la réponse corrigée :", style_h2))
         audit2 = [
@@ -667,30 +858,15 @@ def generate_pdf_report(
         story.append(audit2_table)
         story.append(Spacer(1, 0.4*cm))
 
-    # ---- Score académique ----
-    story.append(Paragraph("6. Évaluation académique (grille 5 critères × 2 pts)", style_h1))
-    score_data = [["Critère", "Note /2"]]
-    for crit, val in score_details.items():
-        score_data.append([crit, str(val)])
-    score_data.append(["TOTAL", f"{score_total:.1f} / 10"])
-    score_table = Table(score_data, colWidths=[9*cm, 4*cm])
-    score_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d6d")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8eef7")),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-    ]))
-    story.append(score_table)
-    story.append(Spacer(1, 0.5*cm))
+    # NOTE : la section "6. Évaluation académique (grille 5 critères × 2 pts)"
+    # a été RETIRÉE. Les cotes seront saisies manuellement dans le mémoire.
 
     # ---- Pied de page ----
     footer_text = (
         "<i>Rapport généré automatiquement dans le cadre du mémoire "
         "« Attribution de canaux/fréquences avec BD-CeNN + LLM » — "
         f"Nelson Ngombo, Bastion-Lab.<br/>"
+        f"Mode d'interférence : <b>{model_label}</b>. "
         f"Modèle LLM utilisé : <b>{model_name if model_name else 'Non spécifié'}</b>."
         "</i>"
     )
@@ -704,35 +880,64 @@ def generate_pdf_report(
 # E. FONCTION DE HAUT NIVEAU : audit complet d'un cas
 # -----------------------------------------------------------------------------
 
-def audit_case(case_data: dict, max_correction_attempts: int = 2) -> dict:
+def audit_case(case_data: dict, max_correction_attempts: int = 2,
+               model_folder: str = "cochannel") -> dict:
     """
     Réalise l'audit complet d'un cas : prompt -> LLM -> vérification -> correction.
 
-    Retourne un dictionnaire contenant toutes les informations du cas.
+    NOTE : le score académique n'est plus calculé automatiquement. Les cotes
+    seront attribuées manuellement par l'auteur dans le mémoire.
     """
     case_id = case_data.get("case_id", "unknown")
-    print(f"\n🔎 Audit du cas {case_id} ({case_data.get('scenario')})...")
+    model_label = case_data.get("model_label", "CCI-only")
+    print(f"\n🔎 Audit du cas {case_id} ({case_data.get('scenario')}) [{model_label}]...")
 
-    # 1. Construire le prompt
+    raw_dir, reports_dir = _get_mode_folders(model_label)
+
     prompt = build_prompt(case_data)
 
-    # Sauvegarder le prompt brut
-    prompt_file = LLM_RAW_DIR / f"{case_id}_prompt.txt"
+    prompt_file = raw_dir / f"{case_id}_prompt.txt"
     with open(prompt_file, "w", encoding="utf-8") as f:
         f.write(prompt)
 
-    # 2. Interroger le LLM
     raw_response = ask_llm(prompt)
 
-    # Sauvegarder la réponse brute
-    raw_file = LLM_RAW_DIR / f"{case_id}_raw_response.txt"
+    if raw_response.startswith("[ERREUR LLM]"):
+        print(f"  ❌ Échec de l'appel LLM pour le cas {case_id}. Cas marqué comme LLM_FAILED.")
+        err_file = raw_dir / f"{case_id}_error.txt"
+        with open(err_file, "w", encoding="utf-8") as f:
+            f.write(raw_response)
+        return {
+            "case_id": case_id,
+            "scenario": case_data.get("scenario"),
+            "N": case_data.get("N"),
+            "K": case_data.get("K"),
+            "seed": case_data.get("seed"),
+            "context": case_data.get("context"),
+            "model_label": model_label,
+            "raw_response": raw_response,
+            "corrected_response": raw_response,
+            "verification_initial": {
+                "all_numbers": [], "allowed_numbers": set(),
+                "valid_numbers": [], "invented_numbers": [],
+                "has_hallucination": False, "accuracy_rate": 0.0,
+            },
+            "verification_final": {
+                "all_numbers": [], "allowed_numbers": set(),
+                "valid_numbers": [], "invented_numbers": [],
+                "has_hallucination": False, "accuracy_rate": 0.0,
+            },
+            "correction_attempts": 0,
+            "pdf_path": None,
+            "status": "LLM_FAILED",
+        }
+
+    raw_file = raw_dir / f"{case_id}_raw_response.txt"
     with open(raw_file, "w", encoding="utf-8") as f:
         f.write(raw_response)
 
-    # 3. Vérification numérique initiale
     verification_initial = verify_numbers(raw_response, case_data)
 
-    # 4. Mécanisme de régénération sous contrainte (si nécessaire)
     corrected_response = raw_response
     verification_final = verification_initial
     correction_attempts = 0
@@ -740,21 +945,22 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2) -> dict:
         correction_attempts += 1
         print(f"  ⚠️ Hallucination détectée ({len(verification_final['invented_numbers'])} valeur(s)) "
               f"— tentative de correction {correction_attempts}/{max_correction_attempts}")
-        corrected_response = regenerate_with_correction(case_data, corrected_response, verification_final)
+        corrected_response = regenerate_with_correction(
+            case_data, prompt, corrected_response, verification_final
+        )
+
+        if corrected_response.startswith("[ERREUR LLM]"):
+            print(f"  ❌ Échec de l'appel LLM lors de la correction du cas {case_id}. "
+                  f"On conserve la réponse initiale.")
+            corrected_response = raw_response
+            break
+
         verification_final = verify_numbers(corrected_response, case_data)
-        # Sauvegarder chaque tentative corrigée
-        corr_file = LLM_RAW_DIR / f"{case_id}_corrected_v{correction_attempts}.txt"
+        corr_file = raw_dir / f"{case_id}_corrected_v{correction_attempts}.txt"
         with open(corr_file, "w", encoding="utf-8") as f:
             f.write(corrected_response)
 
-    # 5. Calcul du score académique (5 critères × 2 pts)
-    score_details = compute_academic_score(
-        case_data, corrected_response, verification_final
-    )
-    score_total = sum(score_details.values())
-
-    # 6. Générer le rapport PDF
-    pdf_path = LLM_REPORTS_DIR / f"rapport_{case_id}_{case_data.get('scenario')}.pdf"
+    pdf_path = reports_dir / f"rapport_{case_id}_{case_data.get('scenario')}.pdf"
     generate_pdf_report(
         case_data=case_data,
         prompt=prompt,
@@ -762,10 +968,8 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2) -> dict:
         verification_initial=verification_initial,
         corrected_response=corrected_response,
         verification_final=verification_final,
-        score_total=score_total,
-        score_details=score_details,
         output_path=pdf_path,
-        model_name=GOOGLE_MODEL,   # passage du modèle utilisé
+        model_name=GOOGLE_MODEL,
     )
 
     return {
@@ -775,103 +979,12 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2) -> dict:
         "K": case_data.get("K"),
         "seed": case_data.get("seed"),
         "context": case_data.get("context"),
+        "model_label": model_label,
         "raw_response": raw_response,
         "corrected_response": corrected_response,
         "verification_initial": verification_initial,
         "verification_final": verification_final,
         "correction_attempts": correction_attempts,
-        "score_total": score_total,
-        "score_details": score_details,
         "pdf_path": str(pdf_path),
+        "status": "OK",
     }
-
-
-# -----------------------------------------------------------------------------
-# F. SCORING ACADÉMIQUE AUTOMATIQUE (5 critères × 2 pts)
-# -----------------------------------------------------------------------------
-
-def compute_academic_score(case_data: dict, response: str, verification: dict) -> dict:
-    """
-    Calcule un score sur 10 points (5 critères × 2 pts) :
-        - Exactitude numérique (2 pts) : taux d'exactitude >= 99% -> 2 ; >= 95% -> 1 ; sinon 0.
-        - Cohérence (2 pts) : aucune contradiction détectable -> 2 ; mineure -> 1 ; sinon 0.
-        - Clarté (2 pts) : structure en paragraphes/numérotée -> 2 ; sinon 1 ou 0.
-        - Utilité ingénieur (2 pts) : présence de recommandations -> 2 ; sinon 0-1.
-        - Traçabilité (2 pts) : mention explicite des métriques -> 2 ; sinon 0-1.
-
-    NB : il s'agit d'une heuristique automatique. Une évaluation humaine reste recommandée.
-    """
-    score = {}
-
-    # --- 1. Exactitude numérique ---
-    if verification["accuracy_rate"] >= 99.0:
-        score["Exactitude numérique"] = 2
-    elif verification["accuracy_rate"] >= 95.0:
-        score["Exactitude numérique"] = 1
-    else:
-        score["Exactitude numérique"] = 0
-
-    # --- 2. Cohérence (recherche de contradictions basiques) ---
-    response_lower = response.lower()
-    contradiction_markers = ["contradiction", "incohérent", "impossible"]
-    has_contradiction = any(m in response_lower for m in contradiction_markers)
-    # Vérifier que le coût final est bien présenté comme < coût initial si applicable
-    m = case_data.get("metrics", {})
-    c_init = m.get("cost_initial")
-    c_final = m.get("cost_final")
-    coherent = True
-    if c_init is not None and c_final is not None:
-        # Si le LLM affirme que le coût a augmenté alors que c_final < c_init, c'est incohérent
-        if c_final < c_init and "augment" in response_lower and "coût" in response_lower:
-            coherent = False
-    if coherent and not has_contradiction:
-        score["Cohérence"] = 2
-    elif has_contradiction:
-        score["Cohérence"] = 0
-    else:
-        score["Cohérence"] = 1
-
-    # --- 3. Clarté ---
-    # Un rapport clair a au moins 3 paragraphes ou une structure numérotée
-    paragraphs = [p for p in response.split("\n\n") if len(p.strip()) > 30]
-    has_numbering = bool(re.search(r"(?:^|\n)\s*\d+[\.\)]\s", response))
-    if len(paragraphs) >= 3 or has_numbering:
-        score["Clarté"] = 2
-    elif len(paragraphs) >= 1:
-        score["Clarté"] = 1
-    else:
-        score["Clarté"] = 0
-
-    # --- 4. Utilité ingénieur ---
-    # Recherche de mots-clés liés aux recommandations
-    rec_markers = ["recommand", "suggèr", "propos", "il est conseillé", "action", "solution"]
-    has_recommendation = any(m in response_lower for m in rec_markers)
-    if has_recommendation:
-        score["Utilité ingénieur"] = 2
-    elif "analyse" in response_lower or "cause" in response_lower:
-        score["Utilité ingénieur"] = 1
-    else:
-        score["Utilité ingénieur"] = 0
-
-    # --- 5. Traçabilité ---
-    # Vérifier que le rapport cite au moins 3 métriques distinctes parmi celles attendues
-    m = case_data.get("metrics", {})
-    expected_keys = [
-        ("coût final", "cost_final"),
-        ("conflit", "conflicts_cochannel"),
-        ("temps", "time_seconds"),
-        ("itération", "iterations"),
-        ("canaux", "used_channels"),
-    ]
-    cited_count = 0
-    for kw, key in expected_keys:
-        if key in m and kw in response_lower:
-            cited_count += 1
-    if cited_count >= 3:
-        score["Traçabilité"] = 2
-    elif cited_count >= 1:
-        score["Traçabilité"] = 1
-    else:
-        score["Traçabilité"] = 0
-
-    return score
