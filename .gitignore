@@ -1,19 +1,21 @@
-# --- Environnements virtuels ---
-venv/
-env/
-.venv/
-ENV/
-env.bak/
-venv.bak/
+# =============================================================================
+# BD-CeNN CAP Framework - .gitignore
+# =============================================================================
 
-# --- Fichiers Python compilés ---
+# =============================================================================
+# PYTHON - Fichiers compilés et cache
+# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
+*.pyc
+*.pyo
 *.pyd
+*.so
 
-# --- Distribution / packaging ---
+# =============================================================================
+# PYTHON - Distribution et packaging
+# =============================================================================
 .Python
 build/
 develop-eggs/
@@ -28,70 +30,52 @@ sdist/
 var/
 wheels/
 *.egg-info/
-.installed.cfg
 *.egg
+.installed.cfg
+MANIFEST
+*.whl
 
-# --- Fichiers de logs ---
-*.log
-logs/
-*.log.*
-results/logs/
-results/llm_logs/
-# --- Fichiers info---
-info.txt
-# --- Fichiers de données générés (à ne pas versionner) ---
-*.csv
-*.xlsx
-*.json
-*.db
-*.sqlite
-*.sqlite3
-*.parquet
+# =============================================================================
+# ENVIRONNEMENTS VIRTUELS
+# =============================================================================
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
 
-# On conserve uniquement les fichiers de données d'exemple ou de référence
-# (ex: si tu veux garder un scénario d'exemple, décommente la ligne ci-dessous)
-# !data/example_scenario.json
+# =============================================================================
+# DÉPENDANCES ET LOCK FILES
+# =============================================================================
+Pipfile.lock
+poetry.lock
+package-lock.json
+yarn.lock
+requirements-frozen.txt
 
-# --- Fichiers de résultats (à ne pas versionner) ---
-results/
-*.png
-*.jpg
-*.jpeg
-*.svg
-*.pdf
-*.html
-
-# --- Fichiers de figures (à ne pas versionner) ---
-figures/
-convergence_*.png
-comparison_*.png
-
-# --- Fichiers temporaires ---
-*.tmp
-*.temp
+# =============================================================================
+# IDE ET ÉDITEURS
+# =============================================================================
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# --- Notebooks Jupyter (optionnel, à versionner si essentiel) ---
-.ipynb_checkpoints/
-*.ipynb
-# !notebooks/example.ipynb
-
-# --- Fichiers d'IDE ---
-.vscode/
-.idea/
 *.iml
 .project
 .classpath
 .settings/
 *.code-workspace
+*.sublime-project
+*.sublime-workspace
 
-# --- Fichiers de configuration sensibles ---
+# =============================================================================
+# FICHIERS SENSIBLES ET SECRETS
+# =============================================================================
 .env
+.env.local
+.env.*.local
 *.key
 *.pem
 *.crt
@@ -101,8 +85,22 @@ config_local.py
 secrets.py
 openai_key.txt
 ollama_config.txt
+api_keys.txt
+credentials.json
+service-account.json
+.streamlit/secrets.toml
 
-# --- Fichiers de données volumineux ---
+# =============================================================================
+# FICHIERS DE DONNÉES GÉNÉRÉS (à ne pas versionner)
+# =============================================================================
+*.csv
+*.xlsx
+*.xls
+*.json
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
 *.h5
 *.hdf5
 *.pkl
@@ -110,19 +108,103 @@ ollama_config.txt
 *.joblib
 *.npz
 *.npy
+data/
+!data/.gitkeep
+!data/example_*.json
 
-# --- Fichiers de sauvegarde (LLM) ---
+# =============================================================================
+# RÉSULTATS ET SORTIES (figures, rapports, logs)
+# =============================================================================
+results/
+outputs/
+figures/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.html
+convergence_*.png
+comparison_*.png
+results/logs/
+results/llm_logs/
+
+# =============================================================================
+# FICHIERS DE LOGS
+# =============================================================================
+*.log
+logs/
+*.log.*
+
+# =============================================================================
+# FICHIERS D'INFORMATION
+# =============================================================================
+info.txt
+
+# =============================================================================
+# JUPYTER ET NOTEBOOKS
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb
+!notebooks/example.ipynb
+!notebooks/README.ipynb
+
+# =============================================================================
+# STREAMLIT
+# =============================================================================
+.streamlit/
+!.streamlit/config.toml
+
+# =============================================================================
+# TESTING ET COUVERTURE
+# =============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.hypothesis/
+.ruff_cache/
+.pyre/
+.nox/
+
+# =============================================================================
+# PROFILAGE ET DEBUGGING
+# =============================================================================
+*.prof
+*.gcda
+*.gcno
+*.gcov
+*.trace
+*.dump
+
+# =============================================================================
+# MODÈLES IA/LLM ET SAUVEGARDES
+# =============================================================================
 ollama_models/
 models/
 *.gguf
 *.bin
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.savedmodel/
 
-# --- Fichiers de dumps ---
+# =============================================================================
+# DUMPS DE BASES DE DONNÉES
+# =============================================================================
 dump.rdb
 mongodump/
 postgres_dump.sql
+*.sql
 
-# --- Fichiers de rapports (à ne pas versionner) ---
+# =============================================================================
+# LATEX ET DOCUMENTATION
+# =============================================================================
 *.aux
 *.bbl
 *.blg
@@ -136,40 +218,58 @@ postgres_dump.sql
 *.fdb_latexmk
 *.fls
 *.xdv
+*.nav
+*.snm
+*.vrb
 
-# --- Dossiers de données (à adapter selon tes données) ---
-data/
-!data/.gitkeep
-
-# --- Fichiers de tests ---
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# --- Fichiers de profilage ---
-*.prof
-*.gcda
-*.gcno
-*.gcov
-
-# --- Fichiers de dépendances (lock files) ---
-Pipfile.lock
-poetry.lock
-package-lock.json
-yarn.lock
-
-# --- Fichiers de configuration système ---
+# =============================================================================
+# FICHIERS TEMPORAIRES
+# =============================================================================
+*.tmp
+*.temp
 *.bak
 *.orig
 *.rej
 *.patch
 *.diff
+*.cache
+.cache/
 
-# --- Fichiers de notes personnelles ---
+# =============================================================================
+# FICHIERS SYSTÈME D'EXPLOITATION
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# NOTES PERSONNELLES
+# =============================================================================
 *.todo
 *.notes
-*.md~  # Backup du README
+*.md~
+TODO.md
+NOTES.md
+
+# =============================================================================
+# FICHIERS SPÉCIFIQUES AU PROJET BD-CeNN
+# =============================================================================
+scenarios_data.json
+comparison_full_table.csv
+comparison_all_methods_*.png
+convergence_*.png
+*.pyc
+__pycache__/
+
+# =============================================================================
+# NODE_MODULES (si utilisation de Plotly/Streamlit avec frontend)
+# =============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

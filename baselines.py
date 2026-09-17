@@ -1,8 +1,23 @@
+#baselines.py
+"""
+Baseline heuristics for the Channel Assignment Problem (CAP).
+Implements Random, Order-based Greedy, and DSATUR assignment algorithms.
+"""
+
 import numpy as np
 
 def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
     """
-    Crée une matrice d'interférence entre canaux M (K x K).
+    Generates a K x K adjacent channel interference (ACI) matrix M.
+    Models the physical spectral leakage between contiguous frequency bands.
+    
+    Args:
+        K (int): Total available channels
+        decay (float): Power attenuation factor per channel distance unit
+        cutoff (int): Maximum channel distance experiencing spectral leakage
+        
+    Returns:
+        M (ndarray): K x K symmetric interference decay matrix
     """
     M = np.zeros((K, K))
     for k in range(K):
@@ -17,18 +32,34 @@ def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
     return M
 
 def random_allocation(N, K):
-    """Allocation aléatoire uniforme."""
+    """
+    Assigns channels uniformly at random across all N cells.
+    
+    Args:
+        N (int): Number of cellular antennas
+        K (int): Number of available channels
+        
+    Returns:
+        ndarray: Allocated channel indices of size N
+    """
     return np.random.randint(0, K, size=N)
 
 def greedy_allocation(N, K, W, order=None, M=None):
     """
-    Allocation gloutonne séquentielle, avec prise en compte de la matrice
-    d'interférence entre canaux M (adjacent-aware).
+    Sequential Greedy Channel Allocation. Iteratively assigns the best local
+    channel to minimize co-channel and adjacent-channel interference.
+    
+    Args:
+        N (int): Number of cells
+        K (int): Number of channels
+        W (ndarray): Spatial cell interference matrix
+        order (list): Optional custom ordering of cells to process
+        M (ndarray): Optional channel adjacency penalty matrix (ACI awareness)
+        
+    Returns:
+        ndarray: Vector of length N containing assigned channels
     """
-    if M is None:
-        use_adjacent = False
-    else:
-        use_adjacent = True
+    use_adjacent = (M is not None)
 
     if order is None:
         order = list(range(N))
@@ -39,7 +70,7 @@ def greedy_allocation(N, K, W, order=None, M=None):
         best_c = -1
         best_cost = float('inf')
         for c in range(K):
-            local_cost = 0
+            local_cost = 0.0
             for j in order[:idx]:
                 if W[i][j] > 0:
                     if use_adjacent:
@@ -55,8 +86,17 @@ def greedy_allocation(N, K, W, order=None, M=None):
 
 def dsatur_allocation(N, K, W, M=None):
     """
-    Allocation par DSATUR, avec prise en compte de la matrice
-    d'interférence entre canaux M (adjacent-aware).
+    Degree of Saturation (DSATUR) allocation tailored for weighted network topologies.
+    Prioritizes coloring of nodes with higher numbers of distinct neighbor colors.
+    
+    Args:
+        N (int): Number of cells
+        K (int): Number of channels
+        W (ndarray): Spatial cell interference matrix
+        M (ndarray): Optional channel adjacency penalty matrix
+        
+    Returns:
+        ndarray: Vector of length N containing assigned channels
     """
     degree = np.sum(W > 0, axis=1)
     colored = np.full(N, False, dtype=bool)
@@ -82,7 +122,7 @@ def dsatur_allocation(N, K, W, M=None):
         best_c = -1
         best_cost = float('inf')
         for c in range(K):
-            local_cost = 0
+            local_cost = 0.0
             for j in range(N):
                 if colored[j] and W[v][j] > 0:
                     if use_adjacent:

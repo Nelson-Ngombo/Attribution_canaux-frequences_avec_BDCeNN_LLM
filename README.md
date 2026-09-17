@@ -4,73 +4,90 @@
 [![License](https://img.shields.io/badge/License-Academic%20Use-grey.svg)](./LICENSE)
 
 
-## Description du projet
+# BD-CeNN + LLM
 
-Ce projet, réalisé dans le cadre d'un mémoire de fin d'études (2e cycle ICE/EN), propose un cadre complet pour l'attribution dynamique de canaux et de fréquences dans les réseaux radio. L'approche hybride combine :
+**Attribution neuro-symbolique de canaux radio sous contraintes d'interference**
 
-- Un **solveur d'optimisation discret BD-CeNN** (Binary Discrete Cellular Neural Network) dédié à la minimisation des interférences.
-- Un **assistant basé sur un modèle de langage (LLM)**  pour l'analyse contextuelle des résultats et la génération de rapports interprétatifs.
+Framework complet pour l'optimisation de l'attribution de frequences dans les
+reseaux cellulaires, combinant un solveur BD-CeNN (Binary Discretized Cellular
+Neural Network) avec un assistant LLM (Google Gemini) audite par un garde-fou
+regex independant.
 
-Le problème d'attribution est modélisé comme une **coloration de graphe pondéré**. Les cellules radio sont représentées par des sommets, les interférences par des arêtes, et les canaux par des couleurs. Une **matrice d'interférence entre canaux (M)** est intégrée pour pénaliser simultanément les conflits co-canal et les interférences entre canaux adjacents.
+## Fonctionnalites
 
-## Fonctionnalités principales
+- **Solveur BD-CeNN multistart** avec mises a jour locales asynchrones
+- **Baselines heuristiques** : Random, Greedy (multi-ordres), DSATUR
+- **Deux modeles d'interference** :
+  - CCI-only (co-canal strict)
+  - CCI+ACI (co-canal + fuite de canal adjacent via matrice M)
+- **Assistant LLM** en francais avec directive Zero-Hallucination
+- **Auditeur regex independant** verifiant chaque nombre cite par le LLM
+- **Dashboard Streamlit interactif** avec 7 onglets :
+  1. Configuration (scenarios S1-S7, parametres manuels, traduction NL via LLM)
+  2. Graphe reseau (visualisation dynamique avec coloration des aretes)
+  3. Convergence (courbes forward-filled BD-CeNN)
+  4. Comparaison (BD-CeNN vs baselines, tableaux et graphiques)
+  5. Rapport LLM (analyse qualitative + badge de certification)
+  6. Campagnes E1-E10 (execution batch en tache de fond avec logs live)
+  7. Export (CSV, JSON, ZIP)
+- **Auto-sauvegarde** dans `outputs/interactive_runs/{cochannel|adjacent}/`
+- **10 campagnes d'experiences** reproductibles sur 30 seeds fixes
 
-- Génération automatisée des scénarios de réseaux radio.
-- Implémentation et comparaison d'algorithmes de référence (Random, Greedy, DSATUR) adaptés à la matrice d'interférence.
-- Résolution optimisée via l'architecture BD-CeNN.
-- Campagne de validation statistique robuste (30 exécutions par scénario).
-- Analyse post-traitement et génération de rapports automatisés via un LLM.
-- Visualisation complète des métriques (coût global, conflits spectraux, canaux utilisés, temps de calcul).
-
-## Architecture du projet
+## Architecture
 
 ```text
-BD_CeNN_LLM/
-│
-├── config.py                      # Configuration centrale (chemins, seeds, paramètres globaux)
-├── data_generator.py              # Génération des scénarios
-├── visualize_scenarios.py         # Visualisation des graphes et matrices d'interférence (W)
-├── baselines.py                   # Implémentation des heuristiques : Random, Greedy, DSATUR
-├── bdcenn_solver.py               # Cœur du solveur BD-CeNN
-├── experiments.py                 # Expériences à réaliser pour produire les résultats du mémoire
-├── metrics.py                     # Calcul des métriques : coût, conflits, canaux utilisés
-├── validation.py                  # Orchestration de la campagne de validation (30 runs x 50 scénarios)
-├── plots.py                       # Génération des figures, tableaux et heatmaps du rapport final
-├── llm_assistant.py               # Interface avec le LLM  pour l'analyse des scénarios
-├── main.py                        # Point d'entrée principal (orchestration du pipeline complet)
-├── requirements.txt               # Dépendances Python requises
-├── README.md                      # Documentation du projet
-├──.gitignore                      # fichiers à ignorer 
-│
-├── dashboard/                     #Démonstrateur final 
-│   └── app.py
-├── data/                          # Données d'entrée générées
-│   └── scenarios_data.json        # Fichier JSON contenant les scénarios
-│
-│
-│
-
-│
-│
-│── results/                       # Répertoire de sortie (généré à l'exécution)
-    ├── excel/
-    │   └── validation_results.xlsx          # Résultats bruts et résumé statistique
-    ├── csv/
-    │   ├── comparison_full_table.csv        # Tableau comparatif complet des métriques
-    │   └── validation_summary_table.csv     # Moyennes et écarts-types par algorithme
-    ├── figures/                             # Visualisations graphiques 
-    ├── logs/                                # Journaux d'exécution système
-    └── llm_logs/                            # Journaux des analyses générées par le LLM
+BD-CeNN_LLM/
+|-- main.py                          # Point d'entree Streamlit
+|-- config.py                        # Configuration globale
+|-- data_generator.py                # Generation topologies
+|-- graph_model.py                   # Abstraction reseau (CCI / CCI+ACI)
+|-- bdcenn_solver.py                 # Solveur BD-CeNN multistart
+|-- baselines.py                     # Random, Greedy, DSATUR
+|-- metrics.py                       # Calcul certifie des metriques
+|-- experiment_runner.py             # Orchestrateur des simulations
+|-- llm_assistant.py                 # Interface Google Gemini + prompts francais
+|-- verifier.py                      # Auditeur regex independant
+|-- export_manager.py                # Exports CSV/JSON/ZIP
+|-- visualize_scenarios.py           # Visualisation statique
+|-- experiments.py                   # Campagnes E1-E10
+|-- dashboard/                       # Interface Streamlit (7 onglets)
+|   |-- theme.py                     # Theme visuel professionnel
+|   |-- components.py                # Composants UI reutilisables
+|   |-- session_manager.py           # Gestion du session state
+|   |-- bootstrap.py                 # Initialisation au demarrage
+|   |-- toast.py                     # Notifications
+|   |-- graph_renderer.py            # Rendu graphe (Plotly / PyVis)
+|   |-- chart_factory.py             # Fabrique de graphiques
+|   |-- log_capture.py               # Capture stdout thread-safe
+|   |-- experiment_wrappers.py       # Wrappers E1-E10
+|   |-- campaign_manager.py          # Gestion des campagnes async
+|   |-- interactive_save.py          # Auto-sauvegarde
+|   |-- tab_config.py                # Onglet 1
+|   |-- tab_graph.py                 # Onglet 2
+|   |-- tab_convergence.py           # Onglet 3
+|   |-- tab_comparison.py            # Onglet 4
+|   |-- tab_llm_report.py            # Onglet 5
+|   |-- tab_experiments.py           # Onglet 6 (campagnes)
+|   |-- tab_export.py                # Onglet 7
+|-- data_structures/                 # Dataclasses
+|-- scenarios/                       # Registre S1-S7
+|-- tests/                           # Suite pytest
+|-- outputs/                         # Sorties interactives (auto)
+|-- results/                         # Sorties batch (E1-E10)
+|-- requirements.txt
+|-- README.md
+|-- .env.example
+|-- .gitignore
 ```
 
-## Prérequis et installation
-
+## Installation
 ### 1. Cloner le dépôt
 ```bash
 git clone https://github.com/Nelson-Ngombo/Attribution_canaux-frequences_avec_BDCeNN_LLM.git
 cd Attribution_canaux-frequences_avec_BDCeNN_LLM
 ```
 
+For LLM features, create a .env file at the project root: GOOGLE_API_KEY=your_api_key_here
 ### 2.  Créer et activer un environnement virtuel
 ```bash
 python -m venv venv
@@ -84,15 +101,34 @@ pip install -r requirements.txt
 ```
 
 ### 4.  Exécution principale
-Le pipeline est conçu pour être exécuté de manière séquentielle. Exécutez les commandes suivantes dans l'ordre :
+
 ```bash
-python data_generator.py
-
-python visualize_scenarios.py
-
-python main.py
+streamlit run main.py
 ```
-## Auteur
+Le dashboard s'ouvre dans votre navigateur (http://localhost:8501).
+Au premier demarrage, il genere automatiquement les 30 topologies par
+scenario (fichier data/scenarios_data.json).
+
+Aucune autre commande terminale n'est necessaire : tout se fait depuis
+l'interface (generation, simulations, campagnes, exports, tests).
+
+## Lancement d'une simulation interactive
+### 1.Onglet Configuration : 
+choisissez un scenario S1-S7 ou definissez des parametres personnalises (N, K, area, threshold). Vous pouvez aussi decrire le reseau en francais et laisser le LLM extraire les
+parametres.
+Cliquez sur Generer la topologie.
+
+### 2.Onglet Convergence : 
+cliquez sur Lancer la simulation. BD-CeNN et les trois baselines s'executent sous les modes d'interference actifs. Les resultats sont automatiquement sauvegardes dans
+outputs/interactive_runs/{cochannel|adjacent}/.
+Visualisez le graphe colore (onglet Graphe reseau), comparez les
+solveurs (onglet Comparaison), generez un rapport LLM (onglet
+Rapport LLM), ou exportez les resultats (onglet Export).
+Lancement d'une campagne d'experiences
+### 3. Onglet Campagnes E1-E10 : 
+cochez les experiences a lancer (E1 a E10) Cliquez sur Lancer la campagne selectionnee Le suivi live affiche les logs en temps reel et l'avancement Les resultats sont sauvegardes dans results/csv/E{n}/ et
+results/figures/E{n}/ avec separation stricte cochannel / adjacent
+## Author
 Nelson N. – 2e ICE/EN
 
 Encadreur principal : Prof. Kyandoghere Kyamakya

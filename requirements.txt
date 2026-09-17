@@ -1,15 +1,53 @@
-numpy
-pandas
-matplotlib
-networkx
-openpyxl
-requests
+# BD-CeNN CAP Framework - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# ==========================================
+# Core numerical computation & Data Science
+# ==========================================
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
 scikit-learn
+
+# ==========================================
+# Network graph manipulation
+# ==========================================
+networkx>=3.0
+pyvis>=0.3.2
+
+# ==========================================
+# Visualization (static & interactive)
+# ==========================================
+matplotlib>=3.7.0
 seaborn
-ipykernel
+plotly>=5.18.0
+
+# ==========================================
+# Interactive dashboard
+# ==========================================
+streamlit>=1.30.0
+
+# ==========================================
+# LLM integration & API
+# ==========================================
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# ==========================================
+# PDF & Excel report generation
+# ==========================================
+reportlab>=4.0.0
+openpyxl>=3.1.0
+
+# ==========================================
+# Jupyter, Notebooks & Progress bars
+# ==========================================
 jupyter
+ipykernel
 tqdm
-google-genai
-python-dotenv
-requests
-reportlab
+
+# ==========================================
+# Testing
+# ==========================================
+pytest>=7.4.0
