@@ -81,39 +81,27 @@ def _run_dashboard():
                 else:
                     st.error(msg)
 
-        # LLM availability (lazy check)
+        # LLM status (non-blocking, updates dynamically)
         try:
-            from llm_assistant import is_llm_available, get_active_model, get_initialization_error
+            from llm_assistant import (
+                get_llm_status_label, is_llm_available,
+                is_llm_initializing, get_initialization_error,
+            )
+            status_label = get_llm_status_label()
+
             if is_llm_available():
-                st.success(f"LLM actif : {get_active_model()}")
+                st.success(f"LLM : {status_label}")
+            elif is_llm_initializing():
+                st.info(f"LLM : {status_label}")
+                st.caption("Le test de connectivite tourne en arriere-plan. L'interface reste fluide.")
             else:
-                st.warning("LLM non initialise")
+                st.warning(f"LLM : {status_label}")
                 err = get_initialization_error()
                 if err:
-                    with st.expander("Details"):
+                    with st.expander("Detail de l'erreur"):
                         st.caption(err)
         except Exception as e:
-            st.warning(f"LLM inaccessible : {e}")
-
-        st.markdown("### Actions")
-
-        if st.button("Regenerer les topologies", use_container_width=True):
-            from dashboard.bootstrap import generate_topologies
-            with st.spinner("Regeneration en cours..."):
-                ok, msg = generate_topologies()
-            if ok:
-                st.session_state["bootstrap_topo_ok"] = True
-                st.success(msg)
-            else:
-                st.error(msg)
-
-        if st.button("Reinitialiser la session", use_container_width=True):
-            keys_to_keep = {"bootstrap_done", "bootstrap_topo_ok", "bootstrap_test_ok"}
-            for key in list(st.session_state.keys()):
-                if key not in keys_to_keep:
-                    del st.session_state[key]
-            sm.initialize_state()
-            st.rerun()
+            st.warning(f"LLM : erreur de chargement ({type(e).__name__})")
 
         # Optional test runner
         render_manual_test_runner_in_sidebar()
