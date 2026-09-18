@@ -1,12 +1,12 @@
 """
-Tab 2: Interactive Interference Graph with dynamic edge coloring.
+Tab: Interactive interference graph with dynamic edge coloring.
 
-Enhanced:
-    - Smooth transitions via Plotly layout updates
-    - Consistent color coding (green = clear, red = co-channel conflict,
-      orange = adjacent conflict for CCI+ACI mode)
-    - Solver selection filter
-    - Only-conflicts filter for visual clarity on dense networks
+Displays:
+    - Nodes colored by channel assignment (per solver)
+    - Edges colored by conflict status:
+        * green = no conflict
+        * red = co-channel conflict
+        * orange dashed = adjacent-channel conflict (CCI+ACI mode only)
 """
 
 import streamlit as st
@@ -29,7 +29,7 @@ from dashboard.components import (
 
 
 def _get_assignment_for_view(record, solver_name, mode):
-    """Retrieves the assignment for a given (solver, mode) tuple."""
+    """Retrieves the assignment vector for a (solver, mode) tuple."""
     if record is None or solver_name not in record.solver_results:
         return None
     modes_dict = record.solver_results[solver_name]
@@ -123,7 +123,6 @@ def render():
         - **Vert (fin)** : lien d'interference actif sans conflit (canaux differents et distants)
         - **Rouge (epais)** : conflit co-canal (les deux cellules utilisent le meme canal)
         - **Orange (pointille, mode CCI+ACI uniquement)** : fuite de canal adjacent
-          (|x_i - x_j| <= cutoff)
         """)
 
     st.divider()
@@ -164,7 +163,7 @@ def render():
         f"Scenario {topology.scenario_name} (N={topology.N}, K={topology.K})"
     )
 
-    # Render via Plotly (primary) or PyVis (experimental)
+    # Backend selector
     render_cols = st.columns([4, 1])
     with render_cols[1]:
         backend = st.radio(
@@ -174,34 +173,55 @@ def render():
             index=0,
         )
 
-    if backend == "Plotly":
-        fig = render_topology_plotly(
-            graph,
-            assignment=assignment,
-            mode=mode,
-            show_only_conflicts=show_only_conflicts,
-            show_labels=show_labels,
-            title=title,
-        )
-        fig.update_layout(transition_duration=400)
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=f"graph_{solver_selected}_{mode}_{show_only_conflicts}",
-        )
-    else:
-        try:
-            html_str = render_topology_pyvis_html(
+    # ------------------------------------------------------------------
+    # BUG FIX: full-width rendering from first paint
+    # Use a stable container and force autosize with explicit width handling
+    # ------------------------------------------------------------------
+    graph_container = st.container()
+
+    with graph_container:
+        if backend == "Plotly":
+            fig = render_topology_plotly(
                 graph,
                 assignment=assignment,
                 mode=mode,
                 show_only_conflicts=show_only_conflicts,
-                height="650px",
+                show_labels=show_labels,
+                title=title,
             )
-            components.html(html_str, height=680, scrolling=True)
-        except Exception as e:
-            st.error(f"Erreur PyVis : {type(e).__name__}: {e}")
-            st.info("Basculez sur Plotly pour un rendu garanti.")
+            # Force autosize and disable fixed dimensions in layout
+            fig.update_layout(
+                autosize=True,
+                width=None,
+                height=650,
+                transition_duration=400,
+            )
+            # Use a stable key that doesn't change on filter toggles
+            # to prevent Streamlit from re-mounting the component with wrong dims
+            stable_key = f"graph_plot_{topology.scenario_name}_{topology.seed}"
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key=stable_key,
+                config={
+                    "responsive": True,
+                    "displayModeBar": True,
+                    "displaylogo": False,
+                },
+            )
+        else:
+            try:
+                html_str = render_topology_pyvis_html(
+                    graph,
+                    assignment=assignment,
+                    mode=mode,
+                    show_only_conflicts=show_only_conflicts,
+                    height="650px",
+                )
+                components.html(html_str, height=680, scrolling=True)
+            except Exception as e:
+                st.error(f"Erreur PyVis : {type(e).__name__}: {e}")
+                st.info("Basculez sur Plotly pour un rendu garanti.")
 
     # ------------------------------------------------------------------
     # Conflict details

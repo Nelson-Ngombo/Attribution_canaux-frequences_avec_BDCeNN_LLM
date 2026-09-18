@@ -1,11 +1,15 @@
 #llm_assistant.py
 """
 LLM Assistant module for BD-CeNN + LLM thesis project.
-Provides prompt synthesis, Google Gemini API gateway, mathematical audit reporting,
-and automated PDF generation.
 
-Exposes a fast, thread-safe synchronous initialization matching the verified
-standalone connection sequence, fully compatible with main.py imports.
+Non-blocking initialization architecture:
+    - Background daemon thread probes each model sequentially
+    - UI thread reads cached status instantly (never blocks)
+    - Once a model responds, sidebar updates automatically
+    - If all models fail, sidebar shows the final unavailable state
+
+Fully compatible with main.py imports (get_llm_status_label,
+is_llm_available, is_llm_initializing, get_initialization_error).
 
 Author: Nelson Ngombo
 """
@@ -19,28 +23,28 @@ import threading
 import warnings
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
 
 import numpy as np
 
 # -----------------------------------------------------------------------------
-# 0. SUPPRESSION OF COSMETIC SDK WARNINGS
+# 0. SUPPRESS COSMETIC SDK WARNINGS
 # -----------------------------------------------------------------------------
 warnings.filterwarnings("ignore", message=".*automatic function calling.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*AFC.*", category=UserWarning)
 
 
 # -----------------------------------------------------------------------------
-# 1. GLOBAL CONFIGURATION & ENV LOADING
+# 1. CONFIGURATION & ENVIRONMENT
 # -----------------------------------------------------------------------------
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-# Retrieve and clean API key from potential quotes
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip().strip('"').strip("'")
 
-# Standardized qualified model identifiers matching verified API privileges
+# Qualified model names (verified against user's API key)
 GOOGLE_MODEL_PREFERRED = "models/gemini-3.6-flash"
 GOOGLE_MODEL_FALLBACKS = [
     "models/gemini-3.7-flash",
@@ -53,6 +57,7 @@ GOOGLE_MODEL_FALLBACKS = [
 
 INTER_REQUEST_DELAY = 3.0
 LLM_TIMEOUT_SECONDS = 45
+PROBE_TIMEOUT_SECONDS = 20
 
 from config import LLM_LOGS_DIR, FIGURES_DIR, CSV_DIR
 
@@ -65,129 +70,245 @@ LLM_RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -----------------------------------------------------------------------------
-# DYNAMIC CACHED ON-DEMAND INITIALIZATION (THREAD-SAFE, NO UI LAG)
+# 2. BACKGROUND INITIALIZATION STATE MACHINE
 # -----------------------------------------------------------------------------
-_client = None
-_active_model = None
-_last_successful_model = None
-_initialization_error = None
-_initialized = False
+
+class LLMStatus(Enum):
+    NOT_STARTED = "not_started"
+    INITIALIZING = "initializing"
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+_state_lock = threading.Lock()
 _init_lock = threading.Lock()
 
+_state = {
+    "status": LLMStatus.NOT_STARTED,
+    "client": None,
+    "active_model": None,
+    "last_successful_model": None,
+    "error_message": "",
+    "probe_progress": "",
+    "init_thread_started": False,
+}
 
-def ensure_init() -> bool:
+
+def _get_status() -> LLMStatus:
+    with _state_lock:
+        return _state["status"]
+
+
+def _set_status(status: LLMStatus, model: str = None, error: str = ""):
+    with _state_lock:
+        _state["status"] = status
+        if model is not None:
+            _state["active_model"] = model
+        if error:
+            _state["error_message"] = error
+
+
+def _set_progress(msg: str):
+    with _state_lock:
+        _state["probe_progress"] = msg
+
+
+def _get_progress() -> str:
+    with _state_lock:
+        return _state["probe_progress"]
+
+
+def _get_client():
+    with _state_lock:
+        return _state["client"]
+
+
+def _set_client(client):
+    with _state_lock:
+        _state["client"] = client
+
+
+def _get_active_model_internal() -> str:
+    with _state_lock:
+        return _state["active_model"] or ""
+
+
+# -----------------------------------------------------------------------------
+# BACKGROUND PROBE ENGINE
+# -----------------------------------------------------------------------------
+
+def _probe_single_model(client, model_name: str, types_module) -> bool:
     """
-    Thread-safe synchronous initialization. Evaluates API connectivity
-    once, caches the instance, and immediately releases execution flow.
-    
-    Returns:
-        bool: True if connection is active, False otherwise.
+    Probes a single model with strict timeout. Returns True if responsive.
+    Runs entirely in the caller thread (which is already the background init thread).
     """
-    global _client, _active_model, _initialization_error, _initialized
+    result = {"ok": False}
 
-    if _initialized:
-        return _client is not None
+    def _ping():
+        try:
+            client.models.generate_content(
+                model=model_name,
+                contents="ping",
+                config=types_module.GenerateContentConfig(max_output_tokens=5),
+            )
+            result["ok"] = True
+        except Exception:
+            result["ok"] = False
 
-    with _init_lock:
-        if _initialized:
-            return _client is not None
+    t = threading.Thread(target=_ping, daemon=True)
+    t.start()
+    t.join(timeout=PROBE_TIMEOUT_SECONDS)
 
-        _initialized = True
+    return result["ok"]
 
-        if not GOOGLE_API_KEY:
-            _client = None
-            _active_model = None
-            _initialization_error = "Cle GOOGLE_API_KEY absente du fichier .env"
-            return False
+
+def _background_init():
+    """
+    Runs in a daemon thread. Never touches Streamlit session state.
+    Updates _state atomically as models are probed.
+    """
+    _set_status(LLMStatus.INITIALIZING)
+    _set_progress("Chargement du package google-genai...")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        _set_status(
+            LLMStatus.UNAVAILABLE,
+            error="Package google-genai non installe. Executez : pip install google-genai"
+        )
+        return
+
+    if not GOOGLE_API_KEY:
+        _set_status(
+            LLMStatus.UNAVAILABLE,
+            error="Cle GOOGLE_API_KEY absente du fichier .env"
+        )
+        return
+
+    _set_progress("Creation du client Gemini...")
+
+    try:
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        _set_client(client)
+    except Exception as e:
+        _set_status(
+            LLMStatus.UNAVAILABLE,
+            error=f"Echec de creation du client : {type(e).__name__}: {e}"
+        )
+        return
+
+    candidates = [GOOGLE_MODEL_PREFERRED] + [
+        m for m in GOOGLE_MODEL_FALLBACKS if m != GOOGLE_MODEL_PREFERRED
+    ]
+
+    errors_collected = []
+
+    for i, model_name in enumerate(candidates, start=1):
+        display_name = model_name.replace("models/", "")
+        _set_progress(f"Test du modele {i}/{len(candidates)} : {display_name}")
 
         try:
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(api_key=GOOGLE_API_KEY)
-
-            # Test preferred qualified model name (models/gemini-3.6-flash)
-            try:
-                client.models.generate_content(
-                    model=GOOGLE_MODEL_PREFERRED,
-                    contents="ping",
-                    config=types.GenerateContentConfig(max_output_tokens=5),
-                )
-                _client = client
-                _active_model = GOOGLE_MODEL_PREFERRED
-                _initialization_error = None
-                return True
-            except Exception as e_pref:
-                # Fallback sweep over alternative certified configurations
-                for model_name in GOOGLE_MODEL_FALLBACKS:
-                    try:
-                        client.models.generate_content(
-                            model=model_name,
-                            contents="ping",
-                            config=types.GenerateContentConfig(max_output_tokens=5),
-                        )
-                        _client = client
-                        _active_model = model_name
-                        _initialization_error = None
-                        return True
-                    except Exception:
-                        continue
-                
-                _client = None
-                _active_model = None
-                _initialization_error = f"La cle API est valide mais le test a echoue. Erreur d'origine: {e_pref}"
-                return False
-
-        except ImportError:
-            _client = None
-            _active_model = None
-            _initialization_error = "Package google-genai manquant. Lancez: pip install google-genai"
-            return False
+            if _probe_single_model(client, model_name, types):
+                with _state_lock:
+                    _state["last_successful_model"] = model_name
+                _set_status(LLMStatus.AVAILABLE, model=model_name)
+                _set_progress("")
+                return
+            else:
+                errors_collected.append(f"{display_name}: timeout")
         except Exception as e:
-            _client = None
-            _active_model = None
-            _initialization_error = f"Erreur critique de connectivite: {e}"
-            return False
+            errors_collected.append(f"{display_name}: {type(e).__name__}")
 
+    _set_status(
+        LLMStatus.UNAVAILABLE,
+        error="Aucun modele disponible. Details: " + "; ".join(errors_collected[:3])
+    )
+    _set_progress("")
+
+
+def ensure_init_started():
+    """
+    Triggers the background initialization once per session.
+    Fully non-blocking: returns immediately after spawning the thread.
+    """
+    with _init_lock:
+        with _state_lock:
+            if _state["init_thread_started"]:
+                return
+            _state["init_thread_started"] = True
+
+    thread = threading.Thread(
+        target=_background_init,
+        daemon=True,
+        name="llm-background-init",
+    )
+    thread.start()
+
+
+# -----------------------------------------------------------------------------
+# PUBLIC API (CALLED BY main.py AND OTHER DASHBOARD MODULES)
+# -----------------------------------------------------------------------------
 
 def is_llm_available() -> bool:
-    """Checks LLM availability. Triggers fast cached initialization."""
-    return ensure_init()
+    """
+    Non-blocking check. Triggers background init if not started.
+    Returns True only when a model has been confirmed responsive.
+    """
+    ensure_init_started()
+    return _get_status() == LLMStatus.AVAILABLE
 
 
 def is_llm_initializing() -> bool:
     """
-    Returns False in this synchronous version since initialization 
-    happens instantly and is cached upon first demand.
-    Provided to maintain import compatibility with main.py.
+    Returns True while the background probe is running.
+    Triggers background init if not started.
     """
-    return False
+    ensure_init_started()
+    return _get_status() == LLMStatus.INITIALIZING
 
 
 def get_active_model() -> str:
-    """Returns the verified active model name."""
-    ensure_init()
-    return _active_model or ""
+    """Returns the verified working model name (empty string if none)."""
+    return _get_active_model_internal()
 
 
 def get_initialization_error() -> str:
-    """Returns initialization failure message."""
-    ensure_init()
-    return _initialization_error or ""
+    """Returns the current error message (empty string if none)."""
+    with _state_lock:
+        return _state["error_message"] or ""
 
 
 def get_llm_status_label() -> str:
-    """Returns standard label for UI sidebar representation."""
-    if is_llm_available():
-        return f"Actif ({get_active_model().replace('models/', '')})"
-    err = get_initialization_error()
-    if err:
+    """
+    Returns a human-readable status label for the sidebar.
+    Updates dynamically as the background probe progresses.
+    """
+    ensure_init_started()
+    status = _get_status()
+
+    if status == LLMStatus.NOT_STARTED:
+        return "Initialisation en cours..."
+
+    if status == LLMStatus.INITIALIZING:
+        progress = _get_progress()
+        if progress:
+            return f"Initialisation : {progress}"
+        return "Initialisation en cours..."
+
+    if status == LLMStatus.AVAILABLE:
+        model = _get_active_model_internal().replace("models/", "")
+        return f"Actif ({model})"
+
+    if status == LLMStatus.UNAVAILABLE:
         return "Non disponible"
-    return "Non initialise"
+
+    return "Etat inconnu"
 
 
 def _get_mode_folders(model_label: str):
-    """Routes logging paths depending on constraints."""
+    """Routes logging paths based on interference constraints."""
     if not model_label:
         sub = "misc"
     elif "CCI+ACI" in model_label or "adjacent" in model_label.lower():
@@ -283,7 +404,7 @@ phrase. Ecrire les numeros non-resultats en toutes lettres elimine toute
 ambiguite et garantit qu'aucun faux positif d'hallucination n'est declenche.
 
 === REGLE DE SINCERITE ===
-- Reste STRICTEMENT factuel dans tes comparaisons. Si une baseline (Random,
+- Reste strictement factuel dans tes comparaisons. Si une baseline (Random,
   Greedy, DSATUR) est meilleure que BD-CeNN sur un critere (cout ou temps),
   dis-le explicitement sans enjoliver.
 === FIN DIRECTIVE ===
@@ -485,25 +606,26 @@ Rappels :
 
 
 # -----------------------------------------------------------------------------
-# B. API INTERACTION ENGINE (FAST SINGLE-THREADED EXECUTION)
+# B. API INTERACTION ENGINE (FULL ERROR COVERAGE)
 # -----------------------------------------------------------------------------
 
 def _call_with_timeout(model_to_try: str, prompt: str,
                        max_tokens: int, timeout_seconds: float):
-    """Executes model generation inside a single-threaded execution layer."""
-    if _client is None:
-        return None, "SDK_ERROR", "Client Gemini non initialise."
+    """Executes model generation with strict timeout enforcement."""
+    client = _get_client()
+    if client is None:
+        return None, "SDK_ERROR", "Client Gemini non initialise"
 
     try:
         from google.genai import types
     except ImportError:
-        return None, "SDK_ERROR", "Package google-genai manquant."
+        return None, "SDK_ERROR", "Package google-genai manquant"
 
     result = {"response": None, "error": None, "done": False}
 
     def _worker():
         try:
-            resp = _client.models.generate_content(
+            resp = client.models.generate_content(
                 model=model_to_try,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -533,6 +655,7 @@ def _call_with_timeout(model_to_try: str, prompt: str,
 
 
 def _extract_text_from_response(response) -> str:
+    """Safely extracts text from a Gemini response."""
     if response is None:
         return ""
 
@@ -559,97 +682,106 @@ def _extract_text_from_response(response) -> str:
 
 def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
             inter_request_delay: float = INTER_REQUEST_DELAY) -> str:
-    """Queries Google Gemini API with fallback cascade and rotation."""
-    if not is_llm_available():
+    """
+    Queries Gemini with comprehensive error handling and model rotation.
+    Waits briefly if background init is still running.
+    """
+    ensure_init_started()
+    status = _get_status()
+
+    if status == LLMStatus.UNAVAILABLE:
         err = get_initialization_error()
-        return f"[ERREUR LLM] {err}"
+        return f"[ERREUR LLM] LLM non disponible. {err}"
+
+    # Wait for background init if still running (max 30 seconds)
+    if status in (LLMStatus.NOT_STARTED, LLMStatus.INITIALIZING):
+        waited = 0.0
+        while _get_status() == LLMStatus.INITIALIZING and waited < 30.0:
+            time.sleep(1.0)
+            waited += 1.0
+
+        if _get_status() != LLMStatus.AVAILABLE:
+            return (
+                "[ERREUR LLM] LLM en cours d'initialisation ou indisponible. "
+                "Veuillez patienter et reessayer."
+            )
 
     if inter_request_delay > 0:
         time.sleep(inter_request_delay)
 
-    with _lock:
+    with _state_lock:
         last_ok = _state["last_successful_model"]
 
-    all_models = [get_active_model()] + [
-        m for m in GOOGLE_MODEL_FALLBACKS if m != get_active_model()
-    ]
+    active = _get_active_model_internal()
+    all_models = [active] + [m for m in GOOGLE_MODEL_FALLBACKS if m != active]
     if last_ok and last_ok in all_models:
         candidates = [last_ok] + [m for m in all_models if m != last_ok]
     else:
         candidates = all_models
 
-    total_timeout_attempts = LLM_TIMEOUT_RETRIES + 1
-    final_error = None
+    tried_models = set()
+    last_error = None
     empty_response_count = 0
+    current_max_tokens = 8000
 
-    for timeout_attempt in range(1, total_timeout_attempts + 1):
-        if timeout_attempt > 1:
-            time.sleep(LLM_TIMEOUT_DELAY)
+    for attempt in range(1, max_retries + 1):
+        model_to_try = next(
+            (c for c in candidates if c not in tried_models),
+            candidates[0]
+        )
 
-        tried_models = set()
-        last_error = None
-        current_max_tokens = 8000
-        timeout_triggered = False
+        response, error_type, error_msg = _call_with_timeout(
+            model_to_try=model_to_try,
+            prompt=prompt,
+            max_tokens=current_max_tokens,
+            timeout_seconds=LLM_TIMEOUT_SECONDS,
+        )
 
-        for attempt in range(1, max_retries + 1):
-            model_to_try = next(
-                (c for c in candidates if c not in tried_models),
-                candidates[0]
-            )
-
-            response, error_type, error_msg = _call_with_timeout(
-                model_to_try=model_to_try,
-                prompt=prompt,
-                max_tokens=current_max_tokens,
-                timeout_seconds=LLM_TIMEOUT_SECONDS,
-            )
-
-            if error_type == "TIMEOUT":
-                timeout_triggered = True
-                last_error = error_msg
-                break
-
-            if error_type == "SDK_ERROR":
-                last_error = error_msg
-                error_str = error_msg.upper()
-                is_transient = any(
-                    code in error_str
-                    for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
-                                 "404", "NOT_FOUND", "DEADLINE_EXCEEDED"]
-                )
-                tried_models.add(model_to_try)
-
-                if attempt < max_retries:
-                    wait = 1 + random.uniform(0, 3) if is_transient else min(60, (2 ** (attempt + 1)) + random.uniform(0, 3))
-                    time.sleep(wait)
-                continue
-
-            extracted = _extract_text_from_response(response)
-
-            if extracted:
-                with _lock:
-                    _state["last_successful_model"] = model_to_try
-                return extracted
-
-            empty_response_count += 1
-            last_error = f"Reponse vide de '{model_to_try}'"
+        if error_type == "TIMEOUT":
+            last_error = error_msg
             tried_models.add(model_to_try)
-
-            if empty_response_count >= 3:
-                return (
-                    f"[ERREUR LLM] Le modele a renvoye {empty_response_count} reponses vides "
-                    "consecutives. Veuillez simplifier votre requete ou reduire le nombre de noeuds."
-                )
-
             if attempt < max_retries:
                 time.sleep(2 + random.uniform(0, 2))
             continue
 
-        final_error = last_error
-        if not timeout_triggered:
-            break
+        if error_type == "SDK_ERROR":
+            last_error = error_msg
+            error_str = error_msg.upper()
+            is_transient = any(
+                code in error_str
+                for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                             "404", "NOT_FOUND", "DEADLINE_EXCEEDED"]
+            )
+            tried_models.add(model_to_try)
 
-    return f"[ERREUR LLM] Echec definitif apres toutes les tentatives. Detail : {final_error}"
+            if attempt < max_retries:
+                wait = 1 + random.uniform(0, 3) if is_transient else min(30, 2 ** attempt)
+                time.sleep(wait)
+            continue
+
+        # Response received
+        extracted = _extract_text_from_response(response)
+
+        if extracted:
+            with _state_lock:
+                _state["last_successful_model"] = model_to_try
+            return extracted
+
+        # Empty response
+        empty_response_count += 1
+        last_error = f"Reponse vide de '{model_to_try}'"
+        tried_models.add(model_to_try)
+
+        if empty_response_count >= 3:
+            return (
+                f"[ERREUR LLM] Le modele a renvoye {empty_response_count} reponses vides "
+                "consecutives. Simplifiez votre requete."
+            )
+
+        if attempt < max_retries:
+            time.sleep(2 + random.uniform(0, 2))
+
+    return f"[ERREUR LLM] Echec definitif apres {max_retries} tentatives. Detail : {last_error}"
 
 
 # -----------------------------------------------------------------------------
@@ -841,7 +973,6 @@ def generate_pdf_report(
     verification_initial: dict, corrected_response: str,
     verification_final: dict, output_path: Path, model_name: str = None,
 ) -> None:
-    """Exports a professional PDF audit report."""
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -942,7 +1073,6 @@ def generate_pdf_report(
 
 def audit_case(case_data: dict, max_correction_attempts: int = 2,
                model_folder: str = "cochannel") -> dict:
-    """Full pipeline: prompt -> ask -> verify -> correct -> PDF."""
     case_id = case_data.get("case_id", "unknown")
     model_label = case_data.get("model_label", "CCI-only")
 

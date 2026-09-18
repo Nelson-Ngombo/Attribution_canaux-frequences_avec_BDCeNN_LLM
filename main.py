@@ -1,14 +1,13 @@
+#main.py
 """
 BD-CeNN + LLM Dashboard - Main Entry Point.
 
-Launch:
+Launch command:
     streamlit run main.py
 
 Automatically performs on startup:
-    1. Generation of topologies if missing (fast, one-shot)
+    1. Generation of topologies if missing (one-shot)
     2. Rendering of the tabbed interface
-
-Tests are opt-in via sidebar to keep startup fast.
 """
 
 import sys
@@ -45,32 +44,34 @@ st.set_page_config(
 # Global error boundary
 # ---------------------------------------------------------------------------
 def _run_dashboard():
-    from dashboard.theme import apply_theme, render_app_header
+    from dashboard.theme import apply_theme, render_app_header, render_sidebar_status_card
     apply_theme()
 
     from dashboard import session_manager as sm
     sm.initialize_state()
 
     # Bootstrap (only topology generation is automatic)
-    from dashboard.bootstrap import render_bootstrap_ui, render_manual_test_runner_in_sidebar
+    from dashboard.bootstrap import render_bootstrap_ui
     render_bootstrap_ui()
 
     # ---------- Sidebar ----------
     with st.sidebar:
+        # Title at the very top (no extra spacing above)
         st.markdown("### BD-CeNN + LLM")
-        st.caption(
-            "Framework neuro-symbolique pour l'attribution de canaux radio "
-            "sous contraintes d'interference."
+        st.markdown(
+            "<p style='margin-top:-0.3rem;'>Framework neuro-symbolique pour "
+            "l'attribution de canaux radio sous contraintes d'interference.</p>",
+            unsafe_allow_html=True
         )
 
         st.markdown("### Etat du systeme")
 
-        # Topologies
+        # Topology status card
         if st.session_state.get("bootstrap_topo_ok", False):
-            st.success("Topologies OK")
+            render_sidebar_status_card("Topologies", "Operationnelles", kind="ok")
         else:
-            st.error("Topologies indisponibles")
-            if st.button("Regenerer maintenant", use_container_width=True):
+            render_sidebar_status_card("Topologies", "Indisponibles", kind="err")
+            if st.button("Regenerer maintenant", use_container_width=True, key="btn_regen_topo"):
                 from dashboard.bootstrap import generate_topologies
                 with st.spinner("Regeneration..."):
                     ok, msg = generate_topologies()
@@ -81,41 +82,34 @@ def _run_dashboard():
                 else:
                     st.error(msg)
 
-        # LLM status (non-blocking, updates dynamically)
+        # LLM status card (dynamic, auto-refresh while initializing)
         try:
             from llm_assistant import (
                 get_llm_status_label, is_llm_available,
                 is_llm_initializing, get_initialization_error,
+                get_active_model,
             )
-            status_label = get_llm_status_label()
 
             if is_llm_available():
-                st.success(f"LLM : {status_label}")
+                model_short = get_active_model().replace("models/", "")
+                render_sidebar_status_card("Assistant LLM", model_short, kind="ok")
             elif is_llm_initializing():
-                st.info(f"LLM : {status_label}")
-                st.caption("Le test de connectivite tourne en arriere-plan. L'interface reste fluide.")
+                render_sidebar_status_card("Assistant LLM", "Initialisation...", kind="init")
+                st.caption(
+                    "Recherche d'un modele disponible en arriere-plan. "
+                    "L'application reste utilisable pour toutes les fonctions non-LLM."
+                )
+                import time
+                time.sleep(2)
+                st.rerun()
             else:
-                st.warning(f"LLM : {status_label}")
+                render_sidebar_status_card("Assistant LLM", "Non disponible", kind="err")
                 err = get_initialization_error()
                 if err:
                     with st.expander("Detail de l'erreur"):
                         st.caption(err)
         except Exception as e:
-            st.warning(f"LLM : erreur de chargement ({type(e).__name__})")
-
-        # Optional test runner
-        render_manual_test_runner_in_sidebar()
-
-        st.markdown("### Configuration interactive")
-
-        seed_global = st.number_input(
-            "Seed global (usage interactif)",
-            min_value=1, max_value=10000,
-            value=sm.get("custom_seed", 1),
-            key="sidebar_seed",
-        )
-        if seed_global != sm.get("custom_seed"):
-            sm.set_value("custom_seed", int(seed_global))
+            render_sidebar_status_card("Assistant LLM", f"Erreur ({type(e).__name__})", kind="err")
 
         st.markdown("### Modeles d'interference")
         st.caption(
@@ -136,14 +130,14 @@ def _run_dashboard():
         ),
     )
 
-    # ---------- Tabs ----------
+    # ---------- Tabs (reordered: Export before Campagnes) ----------
     from dashboard import tab_config
     from dashboard import tab_graph
     from dashboard import tab_convergence
     from dashboard import tab_comparison
     from dashboard import tab_llm_report
-    from dashboard import tab_experiments
     from dashboard import tab_export
+    from dashboard import tab_experiments
 
     tab_labels = [
         "Configuration",
@@ -151,8 +145,8 @@ def _run_dashboard():
         "Convergence",
         "Comparaison",
         "Rapport LLM",
-        "Campagnes E1-E10",
         "Export",
+        "Campagnes E1-E10",
     ]
 
     tabs = st.tabs(tab_labels)
@@ -168,9 +162,9 @@ def _run_dashboard():
     with tabs[4]:
         tab_llm_report.render()
     with tabs[5]:
-        tab_experiments.render()
-    with tabs[6]:
         tab_export.render()
+    with tabs[6]:
+        tab_experiments.render()
 
     # Footer
     st.divider()
@@ -198,7 +192,6 @@ except Exception as e:
         st.code(traceback.format_exc(), language="python")
     st.info(
         "Actions possibles :\n"
-        "1. Cliquez sur 'Reinitialiser la session' dans la sidebar\n"
-        "2. Relancez l'application (Ctrl+C dans le terminal, puis streamlit run main.py)\n"
-        "3. Regenerez les topologies si le probleme concerne les donnees"
+        "1. Relancez l'application (Ctrl+C dans le terminal, puis streamlit run main.py)\n"
+        "2. Regenerez les topologies si le probleme concerne les donnees"
     )
