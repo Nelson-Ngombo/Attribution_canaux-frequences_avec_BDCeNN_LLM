@@ -134,8 +134,8 @@ def _render_selection_panel(campaign_running: bool):
             st.rerun()
 
     with ctrl_cols[2]:
-        light_selection = ["E1", "E3"]
-        if st.button("Selection legere (E1+E3)", use_container_width=True, disabled=campaign_running):
+        light_selection = ["E1", "E3", "E5"]
+        if st.button("Selection legere (E1+E3+E5)", use_container_width=True, disabled=campaign_running):
             for code in list_experiments():
                 st.session_state[f"exp_selected_{code}"] = code in light_selection
             st.rerun()

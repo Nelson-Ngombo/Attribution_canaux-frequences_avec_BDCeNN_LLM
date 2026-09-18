@@ -83,6 +83,23 @@ EXPERIMENTS_METADATA = {
         "supports_cci": True,
         "supports_aci": True,
     },
+    "E5": {
+        "code": "E5",
+        "title": "Dynamique de convergence BD-CeNN (Forward Fill)",
+        "description": (
+            "Analyse la trajectoire interne de minimisation d'energie J(x) du "
+            "solveur BD-CeNN au fil des iterations sur S2 (N=30, K=4) et "
+            "S3 (N=50, K=6). Utilise l'agregation Forward Fill pour eviter le "
+            "biais des instances lentes. Calcule courbe moyenne, ecart-type, et "
+            "histogramme des iterations moyennes."
+        ),
+        "scenario": "S2 et S3",
+        "seeds_used": "30 seeds fixes (1 a 30)",
+        "estimated_time": "3-6 minutes",
+        "outputs_dir": "results/figures/E5/ et results/csv/E5/",
+        "supports_cci": True,
+        "supports_aci": True,
+    },
     "E6": {
         "code": "E6",
         "title": "Scalabilite (temps, cout, iterations vs N)",
@@ -174,7 +191,7 @@ def list_experiments() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Lazy import of experiments module (prevents crash when JSON is missing)
+# Lazy import of experiments module
 # ---------------------------------------------------------------------------
 
 _experiments_module = None
@@ -197,7 +214,7 @@ def _load_experiments_module():
         )
 
     try:
-        import experiments  # this line triggers the module-level JSON load
+        import experiments
         _experiments_module = experiments
         return experiments
     except Exception as e:
@@ -222,8 +239,7 @@ def run_experiment(code: str, log_buffer: ThreadSafeLogBuffer,
         also_print: If True, also prints to real stdout for debugging
 
     Returns:
-        Result dict: {"code": str, "success": bool, "error": str|None,
-                      "duration_seconds": float}
+        Result dict with keys: code, success, error, duration_seconds
     """
     import time
     start = time.perf_counter()

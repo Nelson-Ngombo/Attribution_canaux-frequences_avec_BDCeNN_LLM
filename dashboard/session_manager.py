@@ -83,6 +83,7 @@ _DEFAULT_STATE = {
     "exp_selected_E2": False,
     "exp_selected_E3": False,
     "exp_selected_E4": False,
+    "exp_selected_E5": False,
     "exp_selected_E6": False,
     "exp_selected_E7": False,
     "exp_selected_E8": False,

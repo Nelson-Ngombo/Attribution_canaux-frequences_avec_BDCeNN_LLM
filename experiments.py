@@ -817,6 +817,317 @@ def run_experiment_E4(verbose=False):
 
     print("[SUCCESS] Experiment E4 completed.")
 
+# ============================================================================
+# E5 - CONVERGENCE DYNAMICS OF BD-CeNN (Forward Fill & First Minimum)
+# ============================================================================
+def run_experiment_E5(verbose=False):
+    """
+    E5 - Convergence dynamics of the BD-CeNN solver.
+
+    Analyzes the internal energy minimization trajectory J(x) of BD-CeNN
+    across iterations (network sweeps). Uses the Forward Fill technique
+    to avoid biasing the mean curve toward the slowest instances.
+
+    CRITICAL METHODOLOGICAL CORRECTION:
+        The iteration count for the histogram and quantitative statistics
+        measures the exact step where the global minimum was FIRST reached
+        (best_iter), isolating the true optimization speed from the arbitrary
+        patience window overhead (10 stagnation sweeps).
+
+    Scenarios:
+        S2 - Medium network: N = 30, K = 4
+        S3 - Dense network:  N = 50, K = 6
+
+    Outputs (separated cochannel / adjacent):
+        - convergence_curve_S2_{model}.png : mean +/- 1 SD trajectory for S2
+        - convergence_curve_S3_{model}.png : mean +/- 1 SD trajectory for S3
+        - iterations_histogram_{model}.png : mean iteration count to first minimum
+        - convergence_metrics.csv          : quantitative statistics table
+        - trajectory_S2.csv / trajectory_S3.csv : raw forward-filled trajectories
+    """
+    scenarios_to_run = ["S2", "S3"]
+    horizon = config.MAX_ITER_BD
+
+    e5_fig_dir = config.FIGURES_DIR / "E5"
+    e5_csv_dir = config.CSV_DIR / "E5"
+    os.makedirs(e5_fig_dir, exist_ok=True)
+    os.makedirs(e5_csv_dir, exist_ok=True)
+
+    models = [
+        {"name": "cochannel", "M": None, "folder": "cochannel"},
+        {"name": "adjacent", "M": None, "folder": "adjacent"}
+    ]
+
+    for model in models:
+        model_name = model["name"]
+        folder = model["folder"]
+        model_fig_dir = e5_fig_dir / folder
+        model_csv_dir = e5_csv_dir / folder
+        os.makedirs(model_fig_dir, exist_ok=True)
+        os.makedirs(model_csv_dir, exist_ok=True)
+
+        scenario_trajectories = {}
+        scenario_iterations = {}
+        scenario_cost_initial = {}
+        scenario_cost_final = {}
+
+        for scenario_name in scenarios_to_run:
+            instances = all_instances.get(scenario_name, {})
+            if not instances:
+                print(f"[ERROR] Scenario {scenario_name} missing from database.")
+                continue
+
+            first_inst = list(instances.values())[0]
+            N = first_inst["N"]
+            K = first_inst["K"]
+
+            M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
+            seeds = sorted([int(s) for s in instances.keys() if s.isdigit()])
+
+            trajectories_matrix = np.zeros((len(seeds), horizon + 1))
+            iterations_per_seed = []
+            cost_initial_per_seed = []
+            cost_final_per_seed = []
+
+            print(f"[INFO] E5 - Scenario {scenario_name} ({model_name}): "
+                  f"evaluating convergence on 30 certified topologies...")
+
+            for idx, seed in enumerate(seeds):
+                inst = instances.get(str(seed))
+                if inst is None:
+                    continue
+                W = np.array(inst["W"])
+
+                x_final, history, elapsed, _, best_iter = bdcenn_allocation(
+                    N, K, W, M=M,
+                    num_restarts=config.NUM_RESTARTS,
+                    max_iter=horizon,
+                    random_order=True,
+                    seed=seed,
+                    verbose=False
+                )
+
+                raw_trajectory = [entry[1] for entry in history]
+                actual_length = len(raw_trajectory)
+
+                if actual_length > 0:
+                    cost_initial = raw_trajectory[0]
+                    cost_final = raw_trajectory[-1]
+
+                    # Forward Fill up to maximum horizon
+                    filled = np.zeros(horizon + 1)
+                    for t in range(horizon + 1):
+                        if t < actual_length:
+                            filled[t] = raw_trajectory[t]
+                        else:
+                            filled[t] = cost_final
+                    trajectories_matrix[idx, :] = filled
+
+                    # CORRECTION: use best_iter (first minimal cost) instead of trajectory length
+                    iterations_per_seed.append(best_iter)
+                    cost_initial_per_seed.append(cost_initial)
+                    cost_final_per_seed.append(cost_final)
+
+            mean_trajectory = np.mean(trajectories_matrix, axis=0)
+            std_trajectory = np.std(trajectories_matrix, axis=0, ddof=1)
+
+            scenario_trajectories[scenario_name] = {
+                "mean": mean_trajectory,
+                "std": std_trajectory,
+                "N": N,
+                "K": K,
+            }
+            scenario_iterations[scenario_name] = np.array(iterations_per_seed)
+            scenario_cost_initial[scenario_name] = np.array(cost_initial_per_seed)
+            scenario_cost_final[scenario_name] = np.array(cost_final_per_seed)
+
+        # ------------------------------------------------------------------
+        # FIGURES 1 & 2: Mean convergence trajectory with +/- 1 SD band
+        # (One figure per scenario, no LaTeX to avoid Windows filesystem errors)
+        # ------------------------------------------------------------------
+        for scenario_name in scenarios_to_run:
+            if scenario_name not in scenario_trajectories:
+                continue
+
+            data = scenario_trajectories[scenario_name]
+            mean_curve = data["mean"]
+            std_curve = data["std"]
+            N = data["N"]
+            K = data["K"]
+
+            iterations_axis = np.arange(horizon + 1)
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(iterations_axis, mean_curve,
+                    color='firebrick', linewidth=2.5,
+                    label='Cout moyen J(t)', zorder=3)
+            ax.fill_between(
+                iterations_axis,
+                mean_curve - std_curve,
+                mean_curve + std_curve,
+                color='firebrick', alpha=0.20,
+                label='Plus ou moins 1 SD (dispersion sur 30 topologies)'
+            )
+
+            ax.set_xlabel("Iterations (balayages complets du reseau)", fontsize=12)
+            ax.set_ylabel("Cout global J(x)", fontsize=12)
+            ax.set_title(
+                f"E5 - Convergence BD-CeNN - Scenario {scenario_name} "
+                f"(N={N}, K={K}) - {model_name}",
+                fontsize=13, fontweight='bold'
+            )
+            ax.grid(True, linestyle='--', alpha=0.4)
+            ax.legend(loc='upper right', fontsize=11)
+            ax.set_xlim([0, horizon])
+
+            plt.tight_layout()
+            fname = f"convergence_curve_{scenario_name}_{model_name}.png"
+            # Explicit str conversion for Windows compatibility
+            output_path = str(model_fig_dir / fname)
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            plt.close('all')  # Free all matplotlib memory
+            print(f"[INFO] Figure E5/{folder}/{fname} saved.")
+
+        # ------------------------------------------------------------------
+        # FIGURE 3: Histogram of mean iterations (Best Iter) for S2 and S3
+        # ------------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(9, 6))
+        bar_labels = []
+        bar_means = []
+        bar_stds = []
+        bar_colors = ['steelblue', 'darkorange']
+
+        for scenario_name in scenarios_to_run:
+            if scenario_name not in scenario_iterations:
+                continue
+            iters = scenario_iterations[scenario_name]
+            data = scenario_trajectories[scenario_name]
+            label = f"{scenario_name}\n(N={data['N']}, K={data['K']})"
+            bar_labels.append(label)
+
+            mean_val = int(round(np.mean(iters))) if len(iters) > 0 else 0
+            std_val = float(np.std(iters, ddof=1)) if len(iters) > 1 else 0.0
+            bar_means.append(mean_val)
+            bar_stds.append(std_val)
+
+        x_positions = np.arange(len(bar_labels))
+        bars = ax.bar(
+            x_positions, bar_means, yerr=bar_stds,
+            capsize=10, color=bar_colors[:len(bar_labels)],
+            edgecolor='black', linewidth=1.2, alpha=0.85,
+            error_kw={'elinewidth': 2, 'ecolor': 'black'}
+        )
+
+        # Annotate bars with plain-text labels (no LaTeX)
+        for i, (bar, mean_val, std_val) in enumerate(zip(bars, bar_means, bar_stds)):
+            height = bar.get_height()
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                height + std_val + 0.5,
+                f"{mean_val} +/- {std_val:.1f} iters",
+                ha='center', va='bottom',
+                fontsize=11, fontweight='bold'
+            )
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(bar_labels, fontsize=11)
+        ax.set_ylabel("Nombre moyen d'iterations pour atteindre le minimum", fontsize=12)
+        ax.set_title(
+            f"E5 - Iterations moyennes vers l'optimum - {model_name}",
+            fontsize=13, fontweight='bold'
+        )
+        ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+        if bar_means and bar_stds:
+            y_upper = max(bar_means) + max(bar_stds) * 2 + 5
+        else:
+            y_upper = 10
+        ax.set_ylim([0, y_upper])
+
+        plt.tight_layout()
+        fname_hist = f"iterations_histogram_{model_name}.png"
+        # Explicit str conversion for Windows compatibility
+        output_path_hist = str(model_fig_dir / fname_hist)
+        plt.savefig(output_path_hist, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        plt.close('all')  # Free all matplotlib memory
+        print(f"[INFO] Figure E5/{folder}/{fname_hist} saved.")
+
+        # ------------------------------------------------------------------
+        # CSV: Quantitative metrics table
+        # ------------------------------------------------------------------
+        rows = []
+        for scenario_name in scenarios_to_run:
+            if scenario_name not in scenario_iterations:
+                continue
+
+            iters = scenario_iterations[scenario_name]
+            cost_init = scenario_cost_initial[scenario_name]
+            cost_fin = scenario_cost_final[scenario_name]
+            data = scenario_trajectories[scenario_name]
+
+            def _stats(arr):
+                if len(arr) == 0:
+                    return dict(mean=0, std=0, median=0, min=0, max=0)
+                return dict(
+                    mean=float(np.mean(arr)),
+                    std=float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
+                    median=float(np.median(arr)),
+                    min=float(np.min(arr)),
+                    max=float(np.max(arr)),
+                )
+
+            it_stats = _stats(iters)
+            ci_stats = _stats(cost_init)
+            cf_stats = _stats(cost_fin)
+
+            rows.append({
+                "scenario": scenario_name,
+                "N": data["N"],
+                "K": data["K"],
+                "n_seeds": len(iters),
+                "iterations_mean": round(it_stats["mean"], 2),
+                "iterations_std": round(it_stats["std"], 2),
+                "iterations_median": round(it_stats["median"], 2),
+                "iterations_min": int(it_stats["min"]),
+                "iterations_max": int(it_stats["max"]),
+                "cost_initial_mean": round(ci_stats["mean"], 4),
+                "cost_initial_std": round(ci_stats["std"], 4),
+                "cost_initial_median": round(ci_stats["median"], 4),
+                "cost_initial_min": round(ci_stats["min"], 4),
+                "cost_initial_max": round(ci_stats["max"], 4),
+                "cost_final_mean": round(cf_stats["mean"], 4),
+                "cost_final_std": round(cf_stats["std"], 4),
+                "cost_final_median": round(cf_stats["median"], 4),
+                "cost_final_min": round(cf_stats["min"], 4),
+                "cost_final_max": round(cf_stats["max"], 4),
+            })
+
+        df_metrics = pd.DataFrame(rows)
+        csv_path = str(model_csv_dir / "convergence_metrics.csv")
+        df_metrics.to_csv(csv_path, index=False, float_format="%.6f")
+        print(f"[SUCCESS] CSV E5/{folder}/convergence_metrics.csv saved.")
+
+        # ------------------------------------------------------------------
+        # Additional CSV: raw forward-filled trajectories for reproducibility
+        # ------------------------------------------------------------------
+        for scenario_name in scenarios_to_run:
+            if scenario_name not in scenario_trajectories:
+                continue
+            data = scenario_trajectories[scenario_name]
+            traj_df = pd.DataFrame({
+                "iteration": np.arange(horizon + 1),
+                "mean_cost": data["mean"],
+                "std_cost": data["std"],
+                "mean_minus_std": data["mean"] - data["std"],
+                "mean_plus_std": data["mean"] + data["std"],
+            })
+            traj_path = str(model_csv_dir / f"trajectory_{scenario_name}.csv")
+            traj_df.to_csv(traj_path, index=False, float_format="%.6f")
+            print(f"[SUCCESS] CSV E5/{folder}/trajectory_{scenario_name}.csv saved.")
+
+    print("[SUCCESS] Experiment E5 completed.")
 
 # ============================================================================
 # E6 - COMPUTATIONAL SCALE PROPERTIES (N-SENSITIVITY)
@@ -1852,6 +2163,7 @@ def run_all_experiments(verbose=False):
     run_experiment_E2(verbose)
     run_experiment_E3(verbose)
     run_experiment_E4(verbose)
+    run_experiment_E5(verbose)
     run_experiment_E6(verbose)
     run_experiment_E7(verbose)
     run_experiment_E8(verbose)
