@@ -16,103 +16,89 @@ from dashboard.components import (
     section_title,
     empty_state,
     info_banner,
-    divider_with_label,
 )
 
 
 def render():
-    """Main tab entrypoint."""
-    st.header("Comparaison globale : BD-CeNN vs Baselines")
+    """Point d'entree de l'onglet."""
+    st.header("Comparaison globale : BD-CeNN vs Heuristiques")
 
     record = sm.get("experiment_record")
     if record is None:
         empty_state(
             icon_text="[+]",
-            title="Aucun resultat disponible",
-            description=(
-                "Lancez d'abord une simulation dans l'onglet 'Convergence' "
-                "pour voir la comparaison entre BD-CeNN et les baselines."
-            ),
+            title="Aucun run disponible",
+            description="Exécutez le solveur dans l'onglet 'Convergence' pour comparer les performances.",
         )
         return
 
     st.caption(
-        "Evaluation comparative des quatre solveurs sur les deux modeles "
-        "d'interference. Chaque metrique est rapportee separement pour CCI-only "
-        "et CCI+ACI afin de mettre en evidence l'impact du modele physique "
-        "adjacent."
+        "Ce module compare le solveur BD-CeNN aux trois heuristiques classiques (Random, Greedy, DSATUR). "
+        "Le comportement est segmente pour analyser precisement l'impact des contraintes spectrales."
     )
 
-    # Metrics table
-    section_title("Tableau recapitulatif")
+    # 1. Tableau récapitulatif
+    section_title("Tableau recapitulatif de performance")
     df = build_metrics_dataframe(record)
     st.dataframe(df, use_container_width=True, height=350)
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Telecharger le CSV recapitulatif",
+        label="Exporter la table de comparaison (CSV)",
         data=csv_bytes,
-        file_name=f"metrics_{record.experiment_id}.csv",
+        file_name=f"metrics_comparison_{record.experiment_id}.csv",
         mime="text/csv",
     )
 
     st.divider()
 
-    # Bar charts
-    section_title("Comparaison visuelle par metrique")
+    # 2. Histogrammes comparatifs
+    section_title("Graphiques de mètrics comparees")
 
     metric = st.selectbox(
-        "Metrique a comparer",
-        options=["cost", "n_conflicts", "used_channels", "wall_time_seconds"],
+        "Metrique d'analyse",
+        options=["cost", "conflicts_cci", "conflicts_aci", "conflicts_total", "used_channels", "wall_time_seconds", "n_sweeps"],
         format_func=lambda m: {
-            "cost": "Cout J(x)",
-            "n_conflicts": "Nombre de conflits",
-            "used_channels": "Canaux utilises",
-            "wall_time_seconds": "Temps d'execution (s)",
+            "cost": "Cout global J(x)",
+            "conflicts_cci": "Conflits co-canal C_CCI",
+            "conflicts_aci": "Conflits adjacents C_ACI",
+            "conflicts_total": "Conflits totaux C_total",
+            "used_channels": "Canaux distincts utilises",
+            "wall_time_seconds": "Temps d'execution t_exec (s)",
+            "n_sweeps": "Nombre de balayages (sweeps)",
         }[m],
         key="cmp_metric_select",
     )
     fig = create_comparison_bar_chart(record, metric=metric)
-    fig.update_layout(transition_duration=500)
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        key=f"cmp_{metric}_{record.experiment_id}",
-    )
+    st.plotly_chart(fig, use_container_width=True, key=f"cmp_{metric}_{record.experiment_id}")
 
     st.divider()
 
-    # Delta ACI
-    section_title("Delta_ACI : impact du modele adjacent")
+    # 3. Graphique Delta_ACI
+    section_title("Analyse de la degradation adjacente (Delta_ACI)")
     fig_delta = create_delta_aci_chart(record)
     if fig_delta is not None:
-        fig_delta.update_layout(transition_duration=500)
-        st.plotly_chart(
-            fig_delta,
-            use_container_width=True,
-            key=f"delta_{record.experiment_id}",
-        )
+        st.plotly_chart(fig_delta, use_container_width=True, key=f"delta_{record.experiment_id}")
         info_banner(
-            "Delta_ACI mesure l'augmentation relative du cout lorsqu'on passe "
-            "du modele CCI-only au modele CCI+ACI pour la meme allocation. "
-            "Un Delta eleve = solution vulnerable aux fuites de canal adjacent.",
+            "Le Delta_ACI mesure l'impact d'une evaluation sous contrainte adjacente sur le "
+            "cout obtenu sous contrainte co-canal simple.",
             kind="info",
         )
     else:
         info_banner(
-            "Delta_ACI necessite que les deux modes (CCI-only ET CCI+ACI) "
-            "soient actives dans la configuration.",
+            "Pour calculer le Delta_ACI, vous devez cocher les deux modes "
+            "d'interference lors de la configuration.",
             kind="warning",
         )
 
     st.divider()
 
-    # Radar
-    section_title("Profils multi-metriques (radar normalise)")
+    # 4. Profils radar
+    section_title("Profils comportementaux (Radar normalise)")
 
     available_modes = list(record.metrics.get("BD-CeNN", {}).keys())
     if not available_modes:
-        info_banner("Aucune donnee pour le radar.", kind="warning")
+        info_banner("Aucune mètric n'est disponible pour tracer le radar.", kind="warning")
         return
 
     radar_tabs = st.tabs([MODE_LABELS[m] for m in available_modes])
@@ -120,11 +106,6 @@ def render():
         with tab:
             fig_radar = create_radar_chart(record, mode)
             if fig_radar is not None:
-                fig_radar.update_layout(transition_duration=500)
-                st.plotly_chart(
-                    fig_radar,
-                    use_container_width=True,
-                    key=f"radar_{mode}_{record.experiment_id}",
-                )
+                st.plotly_chart(fig_radar, use_container_width=True, key=f"radar_{mode}_{record.experiment_id}")
             else:
-                info_banner(f"Pas de donnees pour {MODE_LABELS[mode]}.", kind="warning")
+                info_banner(f"Donnees insuffisantes pour tracer le profil {MODE_LABELS[mode]}.", kind="warning")

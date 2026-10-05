@@ -4,7 +4,9 @@ execution across both interference modes, metrics aggregation, and optional
 LLM auditing. This is the single entry point used by the Streamlit dashboard.
 """
 
+
 import time
+import warnings
 from typing import Optional, Callable, List
 import numpy as np
 
@@ -22,17 +24,42 @@ from baselines import (
     greedy_allocation,
     dsatur_allocation,
 )
+from metrics import (
+    compute_cost_cci,
+    compute_cost_cci_aci,
+    count_conflicts_cci,
+    count_conflicts_aci,
+    create_channel_interference_matrix,
+)
 
 
-# ---------------------------------------------------------------------------
-# Topology construction
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 1. CONSTRUCTION DE TOPOLOGIE
+# ============================================================================
 
 def build_topology(N: int, K: int, area: float, threshold: float,
                    seed: int, scenario_name: Optional[str] = None) -> NetworkTopology:
     """
-    Generates a NetworkTopology by delegating to data_generator.generate_network
-    and wrapping the result in the standard dataclass.
+    Génère une NetworkTopology en déléguant à data_generator.generate_network.
+
+    Paramètres
+    ----------
+    N : int
+        Nombre de cellules.
+    K : int
+        Nombre de canaux.
+    area : float
+        Taille de la zone de simulation.
+    threshold : float
+        Seuil de portée radio.
+    seed : int
+        Graine aléatoire.
+    scenario_name : str or None
+        Identifiant du scénario (ex. "S3").
+
+    Returns
+    -------
+    topology : NetworkTopology
     """
     W, positions, _ = generate_network(N, K, area, threshold, seed)
     return NetworkTopology(
@@ -47,30 +74,47 @@ def build_topology(N: int, K: int, area: float, threshold: float,
     )
 
 
-# ---------------------------------------------------------------------------
-# Solver execution wrappers
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 2. WRAPPERS D'EXÉCUTION DES SOLVEURS
+# ============================================================================
 
 def _run_bdcenn(graph: InterferenceGraph, mode: str,
-                num_restarts: int, max_iter: int, seed: int) -> SolverResult:
+                num_restarts: int, max_sweeps: int, seed: int) -> SolverResult:
     """
-    Runs the BD-CeNN multistart solver for a given interference mode
-    and wraps the raw tuple output into a SolverResult dataclass.
+    Exécute le solveur BD-CeNN multistart pour un régime d'interférence donné.
+
+    Paramètres
+    ----------
+    graph : InterferenceGraph
+        Graphe d'interférence.
+    mode : str
+        "cci" ou "cci_aci".
+    num_restarts : int
+        Nombre de restarts.
+    max_sweeps : int
+        Nombre maximal de sweeps par restart.
+    seed : int
+        Graine aléatoire de base.
+
+    Returns
+    -------
+    result : SolverResult
     """
     M = graph.M if mode == "cci_aci" else None
 
     start = time.perf_counter()
-    x_final, history, elapsed_internal, _, best_iter = bdcenn_allocation(
+    (x_final, history, elapsed_internal,
+     n_cci, n_aci, best_sweep) = bdcenn_allocation(
         graph.N, graph.K, graph.W, M=M,
         num_restarts=num_restarts,
-        max_iter=max_iter,
+        max_sweeps=max_sweeps,
         random_order=True,
         seed=seed,
         verbose=False,
     )
     elapsed = time.perf_counter() - start
 
-    # Extract initial assignment from history
+    # Extraction de l'allocation initiale depuis l'historique
     initial_assignment = None
     if history and len(history) > 0:
         first_entry = history[0]
@@ -78,29 +122,50 @@ def _run_bdcenn(graph: InterferenceGraph, mode: str,
             initial_assignment = np.asarray(first_entry[2], dtype=int)
 
     cost = graph.compute_cost(x_final, mode)
-    conflicts = graph.count_conflicts(x_final, mode)
     used_channels = len(set(x_final.tolist()))
+
+    # En mode CCI-only, n_aci est toujours 0
+    if mode == "cci":
+        n_aci = 0
+    n_total = n_cci + n_aci
 
     return SolverResult(
         solver_name="BD-CeNN",
         assignment=np.asarray(x_final, dtype=int),
         cost=cost,
         interference_mode=mode,
-        n_conflicts=conflicts,
+        n_conflicts_cci=n_cci,
+        n_conflicts_aci=n_aci,
+        n_conflicts_total=n_total,
         used_channels=used_channels,
         wall_time_seconds=elapsed,
-        n_iterations=len(history) - 1 if history else 0,
-        best_iteration=best_iter,
+        n_sweeps=len(history) - 1 if history else 0,
+        best_sweep_index=best_sweep,
         energy_history=history,
         initial_assignment=initial_assignment,
-        metadata={"num_restarts": num_restarts, "max_iter": max_iter},
+        metadata={"num_restarts": num_restarts, "max_sweeps": max_sweeps},
     )
 
 
 def _run_baseline(name: str, graph: InterferenceGraph, mode: str,
-                   seed: int) -> SolverResult:
+                  seed: int) -> SolverResult:
     """
-    Executes a baseline heuristic and wraps its output into a SolverResult.
+    Exécute une baseline heuristique et calcule les métriques de conflit.
+
+    Paramètres
+    ----------
+    name : str
+        "Random", "Greedy" ou "DSATUR".
+    graph : InterferenceGraph
+        Graphe d'interférence.
+    mode : str
+        "cci" ou "cci_aci".
+    seed : int
+        Graine aléatoire.
+
+    Returns
+    -------
+    result : SolverResult
     """
     M = graph.M if mode == "cci_aci" else None
 
@@ -115,38 +180,54 @@ def _run_baseline(name: str, graph: InterferenceGraph, mode: str,
     elif name == "DSATUR":
         x = dsatur_allocation(graph.N, graph.K, graph.W, M=M)
     else:
-        raise ValueError(f"Unknown baseline: {name!r}")
+        raise ValueError(f"Baseline inconnue : {name!r}")
     elapsed = time.perf_counter() - start
 
     x = np.asarray(x, dtype=int)
     cost = graph.compute_cost(x, mode)
-    conflicts = graph.count_conflicts(x, mode)
     used_channels = len(set(x.tolist()))
+
+    # Conflits détaillés (Chantier A)
+    n_cci = count_conflicts_cci(x, graph.W)
+    if mode == "cci_aci":
+        n_aci = count_conflicts_aci(x, graph.W, cutoff=graph.aci_cutoff)
+    else:
+        n_aci = 0
+    n_total = n_cci + n_aci
 
     return SolverResult(
         solver_name=name,
         assignment=x,
         cost=cost,
         interference_mode=mode,
-        n_conflicts=conflicts,
+        n_conflicts_cci=n_cci,
+        n_conflicts_aci=n_aci,
+        n_conflicts_total=n_total,
         used_channels=used_channels,
         wall_time_seconds=elapsed,
-        n_iterations=0,
-        best_iteration=0,
+        n_sweeps=0,
+        best_sweep_index=0,
         energy_history=[],
         initial_assignment=None,
         metadata={},
     )
 
 
-# ---------------------------------------------------------------------------
-# ExperimentRunner class
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 3. ORCHESTRATEUR PRINCIPAL
+# ============================================================================
 
 class ExperimentRunner:
     """
-    Coordinates the full execution of a single experiment across all solvers
-    and both interference modes. Produces a self-contained ExperimentRecord.
+    Coordonne l'exécution complète d'une expérience sur tous les solveurs
+    et les deux régimes d'interférence. Produit un ExperimentRecord.
+
+    Parameters
+    ----------
+    num_restarts : int or None
+        Nombre de restarts BD-CeNN (défaut : config.NUM_RESTARTS).
+    max_sweeps : int or None
+        Sweeps max par restart (défaut : config.MAX_SWEEPS_BD).
     """
 
     SOLVER_NAMES = ["BD-CeNN", "Random", "Greedy", "DSATUR"]
@@ -154,14 +235,19 @@ class ExperimentRunner:
 
     def __init__(self,
                  num_restarts: int = None,
-                 max_iter: int = None):
-        """
-        Args:
-            num_restarts: BD-CeNN multistart count (defaults to config.NUM_RESTARTS)
-            max_iter: BD-CeNN max iterations per restart (defaults to config.MAX_ITER_BD)
-        """
+                 max_sweeps: int = None,
+                 **kwargs):
+        # Rétrocompatibilité : max_iter → max_sweeps
+        if "max_iter" in kwargs:
+            warnings.warn(
+                "Le paramètre 'max_iter' est déprécié. Utiliser 'max_sweeps'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            max_sweeps = kwargs.pop("max_iter")
+
         self.num_restarts = num_restarts if num_restarts is not None else config.NUM_RESTARTS
-        self.max_iter = max_iter if max_iter is not None else config.MAX_ITER_BD
+        self.max_sweeps = max_sweeps if max_sweeps is not None else config.MAX_SWEEPS_BD
 
     def run_single(self,
                    topology: NetworkTopology,
@@ -170,17 +256,22 @@ class ExperimentRunner:
                    progress_callback: Optional[Callable[[str, float], None]] = None
                    ) -> ExperimentRecord:
         """
-        Executes all configured solvers for the given topology under all
-        requested interference modes.
+        Exécute tous les solveurs configurés pour la topologie donnée.
 
-        Args:
-            topology: NetworkTopology to solve
-            modes: Subset of ["cci", "cci_aci"] (defaults to both)
-            solvers: Subset of SOLVER_NAMES (defaults to all)
-            progress_callback: Optional callable receiving (message, progress_ratio)
+        Paramètres
+        ----------
+        topology : NetworkTopology
+            Topologie à résoudre.
+        modes : list of str or None
+            Sous-ensemble de ["cci", "cci_aci"]. Par défaut les deux.
+        solvers : list of str or None
+            Sous-ensemble de SOLVER_NAMES. Par défaut tous.
+        progress_callback : callable or None
+            Fonction (message, ratio) pour le suivi de progression.
 
-        Returns:
-            Fully populated ExperimentRecord
+        Returns
+        -------
+        record : ExperimentRecord
         """
         if modes is None:
             modes = self.INTERFERENCE_MODES
@@ -201,24 +292,24 @@ class ExperimentRunner:
         for mode in modes:
             mode_label = "CCI-only" if mode == "cci" else "CCI+ACI"
             for solver in solvers:
-                _report(f"Running {solver} ({mode_label})...")
+                _report(f"Execution de {solver} ({mode_label})...")
                 if solver == "BD-CeNN":
                     result = _run_bdcenn(
                         graph, mode,
                         num_restarts=self.num_restarts,
-                        max_iter=self.max_iter,
+                        max_sweeps=self.max_sweeps,
                         seed=topology.seed,
                     )
                 else:
                     result = _run_baseline(solver, graph, mode, seed=topology.seed)
                 record.add_solver_result(result)
                 current_step += 1
-                _report(f"Completed {solver} ({mode_label}).")
+                _report(f"Termine : {solver} ({mode_label}).")
 
-        # Compute Delta_ACI on BD-CeNN if both modes are available
+        # Calcul du Delta_ACI sur BD-CeNN si les deux modes sont disponibles
         record.compute_delta_aci("BD-CeNN")
 
-        _report("Experiment finalized.")
+        _report("Experience terminee.")
         return record
 
     def run_batch(self,
@@ -226,7 +317,16 @@ class ExperimentRunner:
                   progress_callback: Optional[Callable[[str, float], None]] = None
                   ) -> List[ExperimentRecord]:
         """
-        Runs the standard pipeline over a list of topologies.
+        Exécute le pipeline standard sur une liste de topologies.
+
+        Paramètres
+        ----------
+        topologies : list of NetworkTopology
+        progress_callback : callable or None
+
+        Returns
+        -------
+        records : list of ExperimentRecord
         """
         records = []
         total = len(topologies)

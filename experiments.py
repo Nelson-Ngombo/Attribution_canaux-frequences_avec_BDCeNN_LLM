@@ -3,13 +3,31 @@
 """
 Comprehensive evaluation framework executing academic experiments E1 to E10.
 Produces comparative tables, charts, convergence curves, and audits LLM correctness.
+
+Note de robustesse : toutes les figures utilisent le pattern [FIX-LAYOUT]
+base sur Figure() + FigureCanvasAgg() + set_layout_engine('none') au lieu
+de plt.figure(). Cela court-circuite totalement le moteur de layout pyplot
+(constrained/tight/autolayout) et immunise les figures contre toute
+pollution d'etat pyplot entre deux runs.
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Headless execution configuration
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+# --- Configuration matplotlib robuste (defense en profondeur) ---
+plt.rcParams['figure.constrained_layout.use'] = False
+plt.rcParams['figure.autolayout'] = False
+
+# [FIX-LAYOUT] Imports pour creer des figures independantes de pyplot.
+# Ces deux classes permettent de sortir du registre global pyplot (Gcf),
+# ce qui rend les figures insensibles aux moteurs de layout automatiques.
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.ticker import MaxNLocator
+
 import os
 import time
 import json
@@ -21,16 +39,17 @@ from baselines import greedy_allocation, dsatur_allocation, random_allocation
 from bdcenn_solver import bdcenn_allocation
 from metrics import (
     create_channel_interference_matrix,
-    compute_cochannel_cost,
-    count_cochannel_conflicts,
-    compute_adjacent_cost,
-    count_adjacent_conflicts
+    compute_cost_cci,
+    compute_cost_cci_aci,
+    count_conflicts_cci,
+    count_conflicts_aci,
+    count_conflicts_total
 )
 from llm_assistant import audit_case
 
 # --- Database Scenario Initialization ---
 try:
-    with open(config.SCENARIOS_FILE, "r") as f:
+    with open(config.SCENARIOS_FILE, "r", encoding="utf-8") as f:
         all_instances = json.load(f)
     all_data = {}
     for name, instances in all_instances.items():
@@ -67,13 +86,55 @@ os.makedirs(config.FIGURES_DIR, exist_ok=True)
 
 
 # ============================================================================
+# HELPER FUNCTIONS FOR INDEPENDENT METRICS & VALIDATION
+# ============================================================================
+
+def _new_figure(figsize):
+    """
+    [FIX-LAYOUT] Helper : cree une figure matplotlib totalement independante
+    de pyplot et de tout moteur de layout automatique.
+
+    Retourne (fig, canvas) : le canvas est necessaire pour que fig.savefig()
+    fonctionne hors du registre pyplot (Gcf).
+    """
+    fig = Figure(figsize=figsize)
+    canvas = FigureCanvasAgg(fig)
+    try:
+        fig.set_layout_engine('none')
+    except Exception:
+        pass
+    return fig, canvas
+
+
+def _compute_all_conflicts(x, W, M=None):
+    n_cci = count_conflicts_cci(x, W)
+    n_aci = count_conflicts_aci(x, W, cutoff=2) if M is not None else 0
+    return n_cci, n_aci, n_cci + n_aci
+
+
+def _compute_cost(x, W, M=None):
+    if M is not None:
+        return compute_cost_cci_aci(x, W, M)
+    return compute_cost_cci(x, W)
+
+
+def _validate_if_available(experiment_id: str, modes: list = None):
+    try:
+        from validate_results import validate_experiment
+        if modes is None:
+            modes = ["cochannel", "adjacent"]
+        validate_experiment(experiment_id=experiment_id, modes=modes)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[WARNING] Validation pipeline failed for {experiment_id}: {e}")
+
+
+# ============================================================================
 # E1 - VISUAL VALIDATION
 # ============================================================================
 def run_experiment_E1(verbose=False):
-    """
-    E1 - Visual validation of small networks.
-    Generates structured topology maps, cost distributions, and compared color allocations.
-    """
+    plt.close('all')
     scenario_name = "S1"
     data = all_data[scenario_name]
     N = data["N"]
@@ -93,59 +154,118 @@ def run_experiment_E1(verbose=False):
     os.makedirs(e1_csv_dir, exist_ok=True)
 
     # 1. Base Interference Graph Plot
-    fig, ax = plt.subplots(figsize=(8, 6))
-    nx.draw_networkx_nodes(G, pos_dict, ax=ax, node_color='lightblue', node_size=500, edgecolors='black', linewidths=1)
+    # [FIX-LAYOUT] Figure() au lieu de plt.figure() : figure hors registre pyplot.
+    fig, canvas = _new_figure((8, 6))
+    ax = fig.add_subplot(111)
+    nx.draw_networkx_nodes(G, pos_dict, ax=ax, node_color='lightblue',
+                           node_size=500, edgecolors='black', linewidths=1)
     nx.draw_networkx_edges(G, pos_dict, ax=ax, edge_color='gray', width=2)
     nx.draw_networkx_labels(G, pos_dict, ax=ax, font_size=10, font_weight='bold')
-    ax.set_title(f"Scenario {scenario_name} - Interference Graph (N={N}, K={K}, seed={seed})", fontsize=12, fontweight='bold')
+
+    x_coords = [p[0] for p in positions]
+    y_coords = [p[1] for p in positions]
+    x_range = max(x_coords) - min(x_coords)
+    y_range = max(y_coords) - min(y_coords)
+    if x_range <= 0:
+        x_range = 1.0
+    if y_range <= 0:
+        y_range = 1.0
+    margin_x = x_range * 0.15
+    margin_y = y_range * 0.15
+
+    ax.set_xlim(min(x_coords) - margin_x, max(x_coords) + margin_x)
+    ax.set_ylim(min(y_coords) - margin_y, max(y_coords) + margin_y)
+
+    ax.set_title(f"Scenario {scenario_name} - Interference Graph "
+                 f"(N={N}, K={K}, seed={seed})",
+                 fontsize=12, fontweight='bold')
     ax.axis('off')
-    plt.tight_layout()
-    plt.savefig(e1_fig_dir / "interference_graph.png", dpi=300, bbox_inches='tight')
-    plt.close(fig)
+
+    # [FIX-LAYOUT] Marges explicites + fig.savefig (le canvas est deja attache).
+    fig.subplots_adjust(top=0.92, bottom=0.05, left=0.05, right=0.95)
+    fig.savefig(str(e1_fig_dir / "interference_graph.png"), dpi=300)
     print("[INFO] Figure E1/interference_graph.png saved.")
 
     # 2. Matrix W Visualization
-    fig, ax = plt.subplots(figsize=(8, 6))
+    # [FIX-LAYOUT] Figure() + positions en coordonnees figure via add_axes.
+    # La colorbar utilise une cax dediee, ce qui evite tout conflit avec
+    # un eventuel moteur de layout.
+    fig, canvas = _new_figure((8, 6))
+
+    # Axes principal : position explicite [left, bottom, w, h]
+    ax = fig.add_axes([0.12, 0.12, 0.70, 0.75])
     im = ax.imshow(W, cmap='Reds', interpolation='nearest', vmin=0, vmax=4)
+
+    ax.set_xticks(np.arange(N))
+    ax.set_yticks(np.arange(N))
+    ax.set_xticklabels([str(i) for i in range(N)], fontsize=10)
+    ax.set_yticklabels([str(i) for i in range(N)], fontsize=10)
+
     for i in range(N):
         for j in range(N):
             if W[i, j] > 0:
-                ax.text(j, i, int(W[i, j]), ha='center', va='center', color='black', fontsize=9, fontweight='bold')
-    plt.colorbar(im, label="Interference Level", shrink=0.8)
-    ax.set_title(f"Scenario {scenario_name} - Weight Matrix W (N={N}, seed={seed})", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Cell j")
-    ax.set_ylabel("Cell i")
-    plt.tight_layout()
-    plt.savefig(e1_fig_dir / "matrix_W.png", dpi=300)
-    plt.close(fig)
+                text_color = "white" if W[i, j] >= 2 else "black"
+                ax.text(j, i, int(W[i, j]), ha='center', va='center',
+                        color=text_color, fontsize=10, fontweight='bold')
+
+    # Axes dedie exclusivement a la colorbar (position fixe sur la droite)
+    cax = fig.add_axes([0.84, 0.12, 0.03, 0.75])
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Intensite de couplage W_ij", fontsize=10)
+    cbar.ax.tick_params(labelsize=9)
+
+    ax.set_title(f"Scenario {scenario_name} - Weight Matrix W (N={N}, seed={seed})",
+                 fontsize=12, fontweight='bold', pad=10)
+    ax.set_xlabel("Cellule j", fontsize=11)
+    ax.set_ylabel("Cellule i", fontsize=11)
+
+    fig.savefig(str(e1_fig_dir / "matrix_W.png"), dpi=300)
     print("[INFO] Figure E1/matrix_W.png saved.")
 
-    # Helper function for coloring cell nodes
+    # Helper functions for colored graphs
     def draw_colored_graph(ax, x, title):
         node_colors = [colors[c] for c in x]
-        nx.draw_networkx_nodes(G, pos_dict, ax=ax, node_color=node_colors, node_size=500, edgecolors='black', linewidths=1)
+        nx.draw_networkx_nodes(G, pos_dict, ax=ax, node_color=node_colors,
+                               node_size=500, edgecolors='black', linewidths=1)
         nx.draw_networkx_edges(G, pos_dict, ax=ax, edge_color='gray', width=2)
         nx.draw_networkx_labels(G, pos_dict, ax=ax, font_size=10, font_weight='bold')
         ax.set_title(title, fontsize=12)
         ax.axis('off')
 
     def save_colored_graph(method_name, x, fig_dir, subfolder, label_suffix=""):
-        fig, ax = plt.subplots(figsize=(8, 6))
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        # Combine fig.legend global + fig.suptitle + subplots_adjust : c'etait
+        # le pattern le plus sensible au moteur de layout (bug E2 d'origine).
+        fig, canvas = _new_figure((8, 6))
+        ax = fig.add_subplot(111)
         title = f"{method_name}{label_suffix}"
         draw_colored_graph(ax, x, title)
-        legend_elements = [Patch(facecolor=colors[c], edgecolor='black', label=f'Channel {c}') for c in range(K)]
-        fig.legend(handles=legend_elements, loc='lower center', ncol=K, fontsize=10, bbox_to_anchor=(0.5, -0.05))
-        plt.suptitle(f"E1 - {fig_dir.name} - {title} - S1 (N={N}, K={K}, seed={seed})", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+
+        x_coords_col = [p[0] for p in positions]
+        y_coords_col = [p[1] for p in positions]
+        margin_x_col = (max(x_coords_col) - min(x_coords_col)) * 0.15 if len(x_coords_col) > 1 else 10.0
+        margin_y_col = (max(y_coords_col) - min(y_coords_col)) * 0.15 if len(y_coords_col) > 1 else 10.0
+        ax.set_xlim(min(x_coords_col) - margin_x_col, max(x_coords_col) + margin_x_col)
+        ax.set_ylim(min(y_coords_col) - margin_y_col, max(y_coords_col) + margin_y_col)
+
+        legend_elements = [Patch(facecolor=colors[c], edgecolor='black',
+                                 label=f'Channel {c}') for c in range(K)]
+        fig.legend(handles=legend_elements, loc='lower center', ncol=K,
+                   fontsize=10, bbox_to_anchor=(0.5, 0.02))
+        fig.suptitle(f"E1 - {fig_dir.name} - {title} - S1 (N={N}, K={K}, seed={seed})",
+                     fontsize=13, fontweight='bold', y=0.97)
+
+        # Marges explicites : bottom eleve pour accueillir la legende
+        fig.subplots_adjust(top=0.90, bottom=0.14, left=0.05, right=0.95)
+
         filename = f"{method_name.lower().replace(' ', '_')}{label_suffix.replace(' ', '_').replace('(', '').replace(')', '')}.png"
-        plt.savefig(fig_dir / subfolder / filename, dpi=300, bbox_inches='tight')
-        plt.close(fig)
+        fig.savefig(str(fig_dir / subfolder / filename), dpi=300)
         print(f"[INFO] Figure E1/{subfolder}/{filename} saved.")
 
-    # Run execution pathways for co-channel and adjacent-channel models
     models = [
         {"name": "cochannel", "M": None, "suffix": " (co-channel)", "folder": "cochannel"},
-        {"name": "adjacent", "M": create_channel_interference_matrix(K), "suffix": " (adjacent)", "folder": "adjacent"}
+        {"name": "adjacent", "M": create_channel_interference_matrix(K),
+         "suffix": " (adjacent)", "folder": "adjacent"}
     ]
 
     for model in models:
@@ -162,86 +282,83 @@ def run_experiment_E1(verbose=False):
         x_greedy = greedy_allocation(N, K, W, M=M)
         x_dsatur = dsatur_allocation(N, K, W, M=M)
 
-        # Execute Multi-Restart BD-CeNN
-        x_bd_final, history_bd, _, _, _ = bdcenn_allocation(
+        x_bd_final, history_bd, _, n_cci, n_aci, best_sweep = bdcenn_allocation(
             N, K, W, M=M,
             num_restarts=config.NUM_RESTARTS,
-            max_iter=config.MAX_ITER_BD,
+            max_sweeps=config.MAX_SWEEPS_BD,
             random_order=True,
             seed=seed,
             verbose=False
         )
         x_bd_initial = history_bd[0][2]
 
-        # Calculate comparative metrics
-        if M is None:
-            cost_rand = compute_cochannel_cost(x_rand, W)
-            conf_rand = count_cochannel_conflicts(x_rand, W)
-            cost_greedy = compute_cochannel_cost(x_greedy, W)
-            conf_greedy = count_cochannel_conflicts(x_greedy, W)
-            cost_dsatur = compute_cochannel_cost(x_dsatur, W)
-            conf_dsatur = count_cochannel_conflicts(x_dsatur, W)
-            cost_bd = compute_cochannel_cost(x_bd_final, W)
-            conf_bd = count_cochannel_conflicts(x_bd_final, W)
-            cost_bd_initial = compute_cochannel_cost(x_bd_initial, W)
-            conf_bd_initial = count_cochannel_conflicts(x_bd_initial, W)
-        else:
-            cost_rand = compute_adjacent_cost(x_rand, W, M)
-            conf_rand = count_adjacent_conflicts(x_rand, W, M)
-            cost_greedy = compute_adjacent_cost(x_greedy, W, M)
-            conf_greedy = count_adjacent_conflicts(x_greedy, W, M)
-            cost_dsatur = compute_adjacent_cost(x_dsatur, W, M)
-            conf_dsatur = count_adjacent_conflicts(x_dsatur, W, M)
-            cost_bd = compute_adjacent_cost(x_bd_final, W, M)
-            conf_bd = count_adjacent_conflicts(x_bd_final, W, M)
-            cost_bd_initial = compute_adjacent_cost(x_bd_initial, W, M)
-            conf_bd_initial = count_adjacent_conflicts(x_bd_initial, W, M)
+        results = {}
+        for name, x_arr in [("Random", x_rand), ("Greedy", x_greedy),
+                            ("DSATUR", x_dsatur), ("BD-CeNN_initial", x_bd_initial),
+                            ("BD-CeNN_final", x_bd_final)]:
+            cost = _compute_cost(x_arr, W, M)
+            c_cci, c_aci, c_tot = _compute_all_conflicts(x_arr, W, M)
+            results[name] = {
+                "cost": cost,
+                "conflicts_cci": c_cci,
+                "conflicts_aci": c_aci,
+                "conflicts_total": c_tot,
+                "used_channels": len(set(x_arr))
+            }
 
-        used_rand = len(set(x_rand))
-        used_greedy = len(set(x_greedy))
-        used_dsatur = len(set(x_dsatur))
-        used_bd = len(set(x_bd_final))
-
-        # Save comparative colored topologies
         save_colored_graph("Random", x_rand, e1_fig_dir, folder, suffix)
         save_colored_graph("Greedy", x_greedy, e1_fig_dir, folder, suffix)
         save_colored_graph("DSATUR", x_dsatur, e1_fig_dir, folder, suffix)
-        save_colored_graph("BD-CeNN initial", x_bd_initial, e1_fig_dir, folder, suffix + " (initial)")
-        save_colored_graph("BD-CeNN final", x_bd_final, e1_fig_dir, folder, suffix + " (final)")
+        save_colored_graph("BD-CeNN initial", x_bd_initial, e1_fig_dir, folder,
+                           suffix + " (initial)")
+        save_colored_graph("BD-CeNN final", x_bd_final, e1_fig_dir, folder,
+                           suffix + " (final)")
 
-        # Save channel data csv tables
         df_cell_channels = pd.DataFrame({
             "Cell": list(range(N)),
             "Random": x_rand,
             "Greedy": x_greedy,
             "DSATUR": x_dsatur,
             "BD-CeNN_initial": x_bd_initial,
-            "BD-CeNN_final": x_bd_final
+            "BD-CeNN_final": x_bd_final,
+            "seed": seed
         })
-        df_cell_channels.to_csv(model_csv_dir / "cell_channels.csv", index=False)
+        df_cell_channels.to_csv(str(model_csv_dir / "cell_channels.csv"), index=False)
         print(f"[SUCCESS] CSV E1/{folder}/cell_channels.csv saved.")
 
-        # Save metrics comparison csv
-        df_metrics = pd.DataFrame({
-            "Method": ["Random", "Greedy", "DSATUR", "BD-CeNN_initial", "BD-CeNN_final"],
-            "Global Cost": [cost_rand, cost_greedy, cost_dsatur, cost_bd_initial, cost_bd],
-            "Conflicts": [conf_rand, conf_greedy, conf_dsatur, conf_bd_initial, conf_bd],
-            "Channels Used": [used_rand, used_greedy, used_dsatur, len(set(x_bd_initial)), used_bd]
-        })
-        df_metrics.to_csv(model_csv_dir / "method_metrics.csv", index=False)
+        df_metrics = pd.DataFrame([
+            {
+                "Method": name,
+                "Cout": v["cost"],
+                "conflicts_cci": v["conflicts_cci"],
+                "conflicts_aci": v["conflicts_aci"],
+                "conflicts_total": v["conflicts_total"],
+                "used_channels": v["used_channels"],
+                "seed": seed
+            }
+            for name, v in results.items()
+        ])
+        df_metrics.to_csv(str(model_csv_dir / "method_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E1/{folder}/method_metrics.csv saved.")
 
+    _validate_if_available("E1")
     print("[SUCCESS] Experiment E1 completed.")
 
 
 # ============================================================================
-# E2 - FACTORIAL RUN
+# E2 - FACTORIAL RUN  [FIX-LAYOUT] deja migre
 # ============================================================================
 def run_experiment_E2(verbose=False):
     """
     E2 - Factorial runtime comparison over multiple settings.
     Studies the sensitivity profile of N, K, and density across algorithms.
+
+    Note de mise en page : les figures 2x2 avec fig.legend + fig.suptitle
+    utilisent le pattern Figure() + FigureCanvasAgg() + set_layout_engine('none')
+    avec positions explicites via add_axes(), ce qui garantit l'absence de
+    chevauchement et de page blanche.
     """
+    plt.close('all')
     sc_instances = {}
     for sc_name in ["S2", "S3"]:
         inst = all_instances.get(sc_name, {})
@@ -328,31 +445,29 @@ def run_experiment_E2(verbose=False):
                         if method_name == "Random":
                             np.random.seed(seed)
                             x = method_func(N, K)
+                            n_sweeps = np.nan
                         elif method_name == "Greedy":
                             np.random.seed(seed)
                             order = np.random.permutation(N).tolist()
                             x = method_func(N, K, W, order=order, M=M)
+                            n_sweeps = np.nan
                         elif method_name == "DSATUR":
                             x = method_func(N, K, W, M=M)
+                            n_sweeps = np.nan
                         else:
-                            x, _, _, _, best_iter = method_func(
+                            x, _, _, _, _, best_sweep = method_func(
                                 N, K, W, M=M,
                                 num_restarts=config.NUM_RESTARTS,
-                                max_iter=config.MAX_ITER_BD,
+                                max_sweeps=config.MAX_SWEEPS_BD,
                                 random_order=True,
                                 seed=seed,
                                 verbose=False
                             )
+                            n_sweeps = best_sweep
                         elapsed = time.perf_counter() - start_time
 
-                        if M is None:
-                            cost = compute_cochannel_cost(x, W)
-                            conflicts = count_cochannel_conflicts(x, W)
-                        else:
-                            cost = compute_adjacent_cost(x, W, M)
-                            conflicts = count_adjacent_conflicts(x, W, M)
-                        used_channels = len(set(x))
-                        iterations = best_iter if method_name == "BD-CeNN" else np.nan
+                        cost = _compute_cost(x, W, M)
+                        c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
 
                         raw_data.append({
                             "N": N,
@@ -363,47 +478,54 @@ def run_experiment_E2(verbose=False):
                             "seed": seed,
                             "method": method_name,
                             "cost": cost,
-                            "conflicts": conflicts,
-                            "used_channels": used_channels,
+                            "conflicts_cci": c_cci,
+                            "conflicts_aci": c_aci,
+                            "conflicts_total": c_tot,
+                            "used_channels": len(set(x)),
                             "time": elapsed,
-                            "iterations": iterations
+                            "n_sweeps": n_sweeps
                         })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False)
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E2/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["N", "K", "density_label", "threshold", "method"]).agg({
             "cost": ["mean", "std", "min", "max", "median"],
-            "conflicts": ["mean", "std", "min", "max", "median"],
+            "conflicts_cci": ["mean", "std", "min", "max", "median"],
+            "conflicts_aci": ["mean", "std", "min", "max", "median"],
+            "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"],
             "time": ["mean", "std", "min", "max", "median"],
-            "iterations": ["mean", "std", "min", "max", "median"]
+            "n_sweeps": ["mean", "std", "min", "max", "median"]
         }).reset_index()
-        
-        summary.columns = ['N', 'K', 'density_label', 'threshold', 'method',
-                           'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
-                           'conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                           'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
-                           'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-                           'iterations_mean', 'iterations_std', 'iterations_min', 'iterations_max', 'iterations_median']
 
-        for col in ['conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
-                    'iterations_mean', 'iterations_std', 'iterations_min', 'iterations_max', 'iterations_median']:
+        summary.columns = [
+            'N', 'K', 'density_label', 'threshold', 'method',
+            'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
+            'conflicts_cci_mean', 'conflicts_cci_std', 'conflicts_cci_min', 'conflicts_cci_max', 'conflicts_cci_median',
+            'conflicts_aci_mean', 'conflicts_aci_std', 'conflicts_aci_min', 'conflicts_aci_max', 'conflicts_aci_median',
+            'conflicts_total_mean', 'conflicts_total_std', 'conflicts_total_min', 'conflicts_total_max', 'conflicts_total_median',
+            'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
+            'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
+            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
+        ]
+
+        for col in summary.columns[5:]:
             summary[col] = summary[col].round(1)
 
-        for col in ['conflicts_mean', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_min', 'used_channels_max', 'used_channels_median']:
-            summary[col] = summary[col].fillna(0).round(0).astype(int)
+        # n_sweeps est exclu pour preserver NaN sur les baselines
+        for col in summary.columns:
+            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
+                summary[col] = summary[col].fillna(0).round(0).astype(int)
 
-        summary.to_csv(model_csv_dir / "summary_metrics.csv", index=False)
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E2/{folder}/summary_metrics.csv saved.")
 
-        # Condense comparison layouts into a single grouped figure grid
+        # ---- Figures ----
         metrics_to_plot = [
             ('cost', 'Mean Global Cost J(x)'),
-            ('conflicts', 'Mean Conflicted Links'),
+            ('conflicts_total', 'Mean Conflicted Links'),
             ('used_channels', 'Mean Channels Used'),
             ('time', 'Execution Runtime (seconds)')
         ]
@@ -415,11 +537,25 @@ def run_experiment_E2(verbose=False):
             (50, 6, "N=50, K=6")
         ]
 
-        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen', 'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
+        method_colors = {
+            'Random': 'royalblue',
+            'Greedy': 'forestgreen',
+            'DSATUR': 'darkorange',
+            'BD-CeNN': 'firebrick'
+        }
 
         for metric_col, ylabel in metrics_to_plot:
-            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-            axes_flat = axes.flatten()
+            # [FIX-LAYOUT] Figure() + FigureCanvasAgg() : figure hors pyplot.
+            fig, canvas = _new_figure((14, 10))
+
+            # Positions en coordonnees figure [left, bottom, width, height]
+            positions = [
+                (0.07, 0.54, 0.41, 0.34),  # haut-gauche   : N=30, K=4
+                (0.55, 0.54, 0.41, 0.34),  # haut-droite   : N=30, K=6
+                (0.07, 0.13, 0.41, 0.34),  # bas-gauche    : N=50, K=4
+                (0.55, 0.13, 0.41, 0.34),  # bas-droite    : N=50, K=6
+            ]
+            axes_flat = [fig.add_axes(pos) for pos in positions]
 
             for ax, (N, K, title) in zip(axes_flat, subplots_config):
                 sub = summary[(summary['N'] == N) & (summary['K'] == K)]
@@ -429,19 +565,25 @@ def run_experiment_E2(verbose=False):
                     continue
 
                 density_order = ["Low", "Medium", "High"]
-                pivot_mean = sub.pivot(index='density_label', columns='method', values=f'{metric_col}_mean').reindex(density_order)
-                pivot_std = sub.pivot(index='density_label', columns='method', values=f'{metric_col}_std').reindex(density_order)
+                pivot_mean = sub.pivot(
+                    index='density_label', columns='method',
+                    values=f'{metric_col}_mean'
+                ).reindex(density_order)
+                pivot_std = sub.pivot(
+                    index='density_label', columns='method',
+                    values=f'{metric_col}_std'
+                ).reindex(density_order)
 
                 x = np.arange(len(density_order))
                 width = 0.2
                 for i, method in enumerate(methods.keys()):
                     if method not in pivot_mean.columns:
                         continue
-                    means = pivot_mean[method].values
-                    stds = pivot_std[method].values
+                    means = pivot_mean[method].fillna(0).values
+                    stds = pivot_std[method].fillna(0).values
                     offset = (i - 1.5) * width
                     ax.bar(x + offset, means, width, yerr=stds,
-                           capsize=3, label=method if ax == axes_flat[0] else "",
+                           capsize=3, label=method,
                            color=method_colors[method], alpha=0.8)
 
                 ax.set_xticks(x)
@@ -450,17 +592,28 @@ def run_experiment_E2(verbose=False):
                 ax.set_ylabel(ylabel, fontsize=10)
                 ax.grid(axis='y', linestyle='--', alpha=0.3)
                 if metric_col == 'used_channels':
-                    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
             handles, labels = axes_flat[0].get_legend_handles_labels()
-            fig.legend(handles, labels, loc='lower center', ncol=len(methods), fontsize=10, bbox_to_anchor=(0.5, -0.02))
-            fig.suptitle(f"E2 - {ylabel} Evaluation - {model_name}", fontsize=14, fontweight='bold')
-            plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+            fig.legend(
+                handles, labels,
+                loc='lower center',
+                ncol=len(methods),
+                fontsize=10,
+                bbox_to_anchor=(0.5, 0.005),
+                frameon=False
+            )
+
+            fig.suptitle(
+                f"E2 - {ylabel} Evaluation - {model_name}",
+                fontsize=14, fontweight='bold', y=0.96
+            )
+
             fname = f"E2_{metric_col}_{model_name}.png"
-            plt.savefig(model_fig_dir / fname, dpi=300, bbox_inches='tight')
-            plt.close(fig)
+            fig.savefig(str(model_fig_dir / fname), dpi=300)
             print(f"[INFO] Figure E2/{folder}/{fname} saved.")
 
+    _validate_if_available("E2")
     print("[SUCCESS] Experiment E2 completed.")
 
 
@@ -468,14 +621,11 @@ def run_experiment_E2(verbose=False):
 # E3 - SPECTRUM SCALING (K-SENSITIVITY)
 # ============================================================================
 def run_experiment_E3(verbose=False):
-    """
-    E3 - Sensitivity evaluation of K variations under tight bounds.
-    """
+    plt.close('all')
     scenario_name = "S4"
     instances = all_instances.get(scenario_name, {})
     if not instances:
-        print(f"[ERROR] Scenario {scenario_name} missing from database.")
-        return
+        print(f"[ERROR] Scenario {scenario_name} missing from database."); return
 
     first_inst = list(instances.values())[0]
     N = first_inst["N"]
@@ -529,116 +679,124 @@ def run_experiment_E3(verbose=False):
                     elif method_name == "DSATUR":
                         x = method_func(N, K, W, M=M)
                     else:
-                        x, _, _, _, _ = method_func(
+                        x, _, _, _, _, _ = method_func(
                             N, K, W, M=M,
                             num_restarts=config.NUM_RESTARTS,
-                            max_iter=config.MAX_ITER_BD,
+                            max_sweeps=config.MAX_SWEEPS_BD,
                             random_order=True,
                             seed=seed,
                             verbose=False
                         )
 
-                    if M is None:
-                        cost = compute_cochannel_cost(x, W)
-                        conflicts = count_cochannel_conflicts(x, W)
-                    else:
-                        cost = compute_adjacent_cost(x, W, M)
-                        conflicts = count_adjacent_conflicts(x, W, M)
-                    used_channels = len(set(x))
+                    cost = _compute_cost(x, W, M)
+                    c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
 
                     raw_data.append({
                         "K": K,
                         "seed": seed,
                         "method": method_name,
                         "cost": cost,
-                        "conflicts": conflicts,
-                        "used_channels": used_channels
+                        "conflicts_cci": c_cci,
+                        "conflicts_aci": c_aci,
+                        "conflicts_total": c_tot,
+                        "used_channels": len(set(x))
                     })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False)
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E3/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["K", "method"]).agg({
             "cost": ["mean", "std", "min", "max", "median"],
-            "conflicts": ["mean", "std", "min", "max", "median"],
+            "conflicts_cci": ["mean", "std", "min", "max", "median"],
+            "conflicts_aci": ["mean", "std", "min", "max", "median"],
+            "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"]
-        }).reset_index()
-        
-        summary.columns = ['K', 'method', 
-                           'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
-                           'conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                           'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median']
-        
-        for col in ['conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median']:
-            summary[col] = summary[col].round(1)
-            
-        for col in ['conflicts_mean', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_min', 'used_channels_max', 'used_channels_median']:
-            summary[col] = summary[col].round(0).astype(int)
+        })
 
-        summary.to_csv(summary_csv_path := model_csv_dir / "summary_metrics.csv", index=False)
+        # Aplatissement des colonnes multi-niveaux vers la nomenclature du projet
+        summary.columns = [
+            f"{col}_{stat}" for col, stat in summary.columns
+        ]
+        summary = summary.reset_index()
+
+        for col in summary.columns[2:]:
+            summary[col] = summary[col].round(1)
+
+        for col in summary.columns:
+            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
+                summary[col] = summary[col].round(0).astype(int)
+
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E3/{folder}/summary_metrics.csv saved.")
 
         pivot_cost = summary.pivot(index='K', columns='method', values=['cost_mean', 'cost_std'])
-        pivot_conflicts = summary.pivot(index='K', columns='method', values=['conflicts_mean', 'conflicts_std'])
+        pivot_conflicts = summary.pivot(index='K', columns='method',
+                                        values=['conflicts_total_mean', 'conflicts_total_std'])
 
-        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen', 'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
+        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen',
+                         'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
         method_markers = {'Random': 'o', 'Greedy': 's', 'DSATUR': '^', 'BD-CeNN': 'D'}
 
-        # Plot 1: Cost vs K
-        fig1, ax1 = plt.subplots(figsize=(10, 6))
+        # ---- Figure 1 : Cost vs K ----
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig1, canvas1 = _new_figure((10, 6))
+        ax1 = fig1.add_subplot(111)
+
         for method in methods.keys():
             means = pivot_cost[('cost_mean', method)].values
             stds = pivot_cost[('cost_std', method)].values
-            ax1.errorbar(K_values, means, yerr=stds, 
-                         label=method, color=method_colors[method], marker=method_markers[method],
+            ax1.errorbar(K_values, means, yerr=stds,
+                         label=method, color=method_colors[method],
+                         marker=method_markers[method],
                          capsize=5, linewidth=2, markersize=8)
 
-        ax1.set_xlabel("Number of Available Channels K", fontsize=11)
-        ax1.set_ylabel("Mean Global Network Cost J(x)", fontsize=11)
-        ax1.set_title(f"E3 - Cost Sensitivity to Spectrum Scale - {model_name}", fontsize=12, fontweight='bold')
+        ax1.set_xlabel("Nombre de canaux K", fontsize=12)
+        ax1.set_ylabel("Coût global moyen J(x)", fontsize=12)
+        ax1.set_title(f"E3 - Impact de K sur le coût moyen - {model_name}",
+                      fontsize=14, fontweight='bold')
         ax1.legend()
         ax1.grid(True, linestyle='--', alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(model_fig_dir / f"cost_vs_K_{model_name}.png", dpi=300)
-        plt.close(fig1)
+        fig1.subplots_adjust(top=0.92, bottom=0.10, left=0.09, right=0.97)
+        fig1.savefig(str(model_fig_dir / f"cost_vs_K_{model_name}.png"), dpi=300)
+        print(f"[INFO] Figure E3/{folder}/cost_vs_K_{model_name}.png saved.")
 
-        # Plot 2: Conflicts vs K
-        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        # ---- Figure 2 : Conflicts vs K ----
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig2, canvas2 = _new_figure((10, 6))
+        ax2 = fig2.add_subplot(111)
+
         for method in methods.keys():
-            means = pivot_conflicts[('conflicts_mean', method)].values
-            stds = pivot_conflicts[('conflicts_std', method)].values
+            means = pivot_conflicts[('conflicts_total_mean', method)].values
+            stds = pivot_conflicts[('conflicts_total_std', method)].values
             ax2.errorbar(K_values, means, yerr=stds,
-                         label=method, color=method_colors[method], marker=method_markers[method],
+                         label=method, color=method_colors[method],
+                         marker=method_markers[method],
                          capsize=5, linewidth=2, markersize=8)
 
-        ax2.set_xlabel("Number of Available Channels K", fontsize=11)
-        ax2.set_ylabel("Mean Active Violations", fontsize=11)
-        ax2.set_title(f"E3 - Active Violation Sensitivity to Spectrum Scale - {model_name}", fontsize=12, fontweight='bold')
+        ax2.set_xlabel("Nombre de canaux K", fontsize=12)
+        ax2.set_ylabel("Conflits totaux moyens", fontsize=12)
+        ax2.set_title(f"E3 - Impact de K sur les conflits moyens - {model_name}",
+                      fontsize=14, fontweight='bold')
         ax2.legend()
         ax2.grid(True, linestyle='--', alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(model_fig_dir / f"conflicts_vs_K_{model_name}.png", dpi=300)
-        plt.close(fig2)
-        print(f"[INFO] Performance charts saved inside E3/{folder}/.")
+        fig2.subplots_adjust(top=0.92, bottom=0.10, left=0.09, right=0.97)
+        fig2.savefig(str(model_fig_dir / f"conflicts_vs_K_{model_name}.png"), dpi=300)
+        print(f"[INFO] Figure E3/{folder}/conflicts_vs_K_{model_name}.png saved.")
 
+    _validate_if_available("E3")
     print("[SUCCESS] Experiment E3 completed.")
 
 
 # ============================================================================
-# E4 - STRUCTURAL DENSITY SENSITIVITY
+# E4 - IMPACT DE LA DENSITÉ
 # ============================================================================
 def run_experiment_E4(verbose=False):
-    """
-    E4 - Density threshold analysis over the cell structure.
-    """
+    plt.close('all')
     scenario_name = "S3"
     instances = all_instances.get(scenario_name, {})
     if not instances:
-        print(f"[ERROR] Scenario {scenario_name} missing from database.")
-        return
+        print(f"[ERROR] Scenario {scenario_name} missing from database."); return
 
     first_inst = list(instances.values())[0]
     N = first_inst["N"]
@@ -709,31 +867,29 @@ def run_experiment_E4(verbose=False):
                     if method_name == "Random":
                         np.random.seed(seed)
                         x = method_func(N, K)
+                        n_sweeps = np.nan
                     elif method_name == "Greedy":
                         np.random.seed(seed)
                         order = np.random.permutation(N).tolist()
                         x = method_func(N, K, W, order=order, M=M)
+                        n_sweeps = np.nan
                     elif method_name == "DSATUR":
                         x = method_func(N, K, W, M=M)
+                        n_sweeps = np.nan
                     else:
-                        x, _, _, _, best_iter = method_func(
+                        x, _, _, _, _, best_sweep = method_func(
                             N, K, W, M=M,
                             num_restarts=config.NUM_RESTARTS,
-                            max_iter=config.MAX_ITER_BD,
+                            max_sweeps=config.MAX_SWEEPS_BD,
                             random_order=True,
                             seed=seed,
                             verbose=False
                         )
+                        n_sweeps = best_sweep
                     elapsed = time.perf_counter() - start_time
 
-                    if M is None:
-                        cost = compute_cochannel_cost(x, W)
-                        conflicts = count_cochannel_conflicts(x, W)
-                    else:
-                        cost = compute_adjacent_cost(x, W, M)
-                        conflicts = count_adjacent_conflicts(x, W, M)
-                    used_channels = len(set(x))
-                    iterations = best_iter if method_name == "BD-CeNN" else np.nan
+                    cost = _compute_cost(x, W, M)
+                    c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
 
                     raw_data.append({
                         "density_label": label,
@@ -741,112 +897,106 @@ def run_experiment_E4(verbose=False):
                         "seed": seed,
                         "method": method_name,
                         "cost": cost,
-                        "conflicts": conflicts,
-                        "used_channels": used_channels,
+                        "conflicts_cci": c_cci,
+                        "conflicts_aci": c_aci,
+                        "conflicts_total": c_tot,
+                        "used_channels": len(set(x)),
                         "time": elapsed,
-                        "iterations": iterations
+                        "n_sweeps": n_sweeps
                     })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False)
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E4/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["density_label", "threshold", "method"]).agg({
             "cost": ["mean", "std", "min", "max", "median"],
-            "conflicts": ["mean", "std", "min", "max", "median"],
+            "conflicts_cci": ["mean", "std", "min", "max", "median"],
+            "conflicts_aci": ["mean", "std", "min", "max", "median"],
+            "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"],
             "time": ["mean", "std", "min", "max", "median"],
-            "iterations": ["mean", "std", "min", "max", "median"]
+            "n_sweeps": ["mean", "std", "min", "max", "median"]
         }).reset_index()
-        
-        summary.columns = ['density_label', 'threshold', 'method',
-                           'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
-                           'conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                           'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
-                           'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-                           'iterations_mean', 'iterations_std', 'iterations_min', 'iterations_max', 'iterations_median']
 
-        for col in ['conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median']:
+        summary.columns = [
+            'density_label', 'threshold', 'method',
+            'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
+            'conflicts_cci_mean', 'conflicts_cci_std', 'conflicts_cci_min',
+            'conflicts_cci_max', 'conflicts_cci_median',
+            'conflicts_aci_mean', 'conflicts_aci_std', 'conflicts_aci_min',
+            'conflicts_aci_max', 'conflicts_aci_median',
+            'conflicts_total_mean', 'conflicts_total_std', 'conflicts_total_min',
+            'conflicts_total_max', 'conflicts_total_median',
+            'used_channels_mean', 'used_channels_std', 'used_channels_min',
+            'used_channels_max', 'used_channels_median',
+            'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
+            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
+        ]
+
+        for col in summary.columns[3:]:
             summary[col] = summary[col].round(1)
-            if 'std' not in col:
-                summary[col] = summary[col].round(0).astype(int)
+            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
+                summary[col] = summary[col].fillna(0).round(0).astype(int)
 
-        for col in ['iterations_mean', 'iterations_std', 'iterations_min', 'iterations_max', 'iterations_median']:
-            summary[col] = summary[col].round(1)
-
-        summary.to_csv(model_csv_dir / "summary_metrics.csv", index=False)
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E4/{folder}/summary_metrics.csv saved.")
 
-        pivot_cost = summary.pivot(index='threshold', columns='method', values=['cost_mean', 'cost_std'])
+        pivot_cost = summary.pivot(index='threshold', columns='method',
+                                   values=['cost_mean', 'cost_std'])
         x_vals = sorted(summary['threshold'].unique())
         density_labels = [d["label"] for d in density_configs]
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen', 'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        # Cas sensible : combine ax.twiny() + ax.legend() + marges explicites.
+        # On utilise add_axes() pour fixer la position en coordonnees figure,
+        # ce qui empeche tout moteur de layout de recalculer les marges.
+        fig, canvas = _new_figure((10, 6))
+        ax = fig.add_axes([0.09, 0.22, 0.88, 0.68])  # bottom=0.22 pour twiny
+        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen',
+                         'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
         method_markers = {'Random': 'o', 'Greedy': 's', 'DSATUR': '^', 'BD-CeNN': 'D'}
 
         for method in methods.keys():
             means = pivot_cost[('cost_mean', method)].values
             stds = pivot_cost[('cost_std', method)].values
             ax.errorbar(x_vals, means, yerr=stds,
-                         label=method, color=method_colors[method], marker=method_markers[method],
-                         capsize=5, linewidth=2, markersize=8)
+                        label=method, color=method_colors[method],
+                        marker=method_markers[method],
+                        capsize=5, linewidth=2, markersize=8)
 
-        ax.set_xlabel("Interference Threshold (Spatial Node Density Scale)", fontsize=11)
-        ax.set_ylabel("Mean Global Cost J(x)", fontsize=11)
-        ax.set_title(f"E4 - Penalty Distribution vs Spatial Link Density - {model_name}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Seuil d'interférence (threshold) - Densité croissante", fontsize=12)
+        ax.set_ylabel("Coût global moyen J(x)", fontsize=12)
+        ax.set_title(f"E4 - Impact de la densité sur le coût moyen - {model_name}",
+                     fontsize=14, fontweight='bold')
         ax.set_xticks(x_vals)
         ax.set_xticklabels([f"{th}" for th in x_vals])
-        
+
         ax2 = ax.twiny()
         ax2.set_xticks(x_vals)
         ax2.set_xticklabels(density_labels)
-        ax2.set_xlabel("Structural Node Coupling Degree")
+        ax2.set_xlabel("Niveau de densité")
         ax2.xaxis.set_label_position('bottom')
         ax2.xaxis.tick_bottom()
         ax2.xaxis.set_ticks_position('bottom')
         ax2.spines['bottom'].set_position(('outward', 40))
 
-        ax.legend()
+        ax.legend(loc='upper left')
         ax.grid(True, linestyle='--', alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(model_fig_dir / f"cost_vs_density_{model_name}.png", dpi=300)
-        plt.close(fig)
-        print(f"[INFO] Figure E4/{folder}/cost_vs_density_{model_name}.png saved.")
+        # [FIX-LAYOUT] subplots_adjust supprime : position deja fixee par add_axes.
+        fig.savefig(str(model_fig_dir / f"cost_vs_density_{model_name}.png"), dpi=300)
 
+    _validate_if_available("E4")
     print("[SUCCESS] Experiment E4 completed.")
 
+
 # ============================================================================
-# E5 - CONVERGENCE DYNAMICS OF BD-CeNN (Forward Fill & First Minimum)
+# E5 - CONVERGENCE DYNAMICS
 # ============================================================================
 def run_experiment_E5(verbose=False):
-    """
-    E5 - Convergence dynamics of the BD-CeNN solver.
-
-    Analyzes the internal energy minimization trajectory J(x) of BD-CeNN
-    across iterations (network sweeps). Uses the Forward Fill technique
-    to avoid biasing the mean curve toward the slowest instances.
-
-    CRITICAL METHODOLOGICAL CORRECTION:
-        The iteration count for the histogram and quantitative statistics
-        measures the exact step where the global minimum was FIRST reached
-        (best_iter), isolating the true optimization speed from the arbitrary
-        patience window overhead (10 stagnation sweeps).
-
-    Scenarios:
-        S2 - Medium network: N = 30, K = 4
-        S3 - Dense network:  N = 50, K = 6
-
-    Outputs (separated cochannel / adjacent):
-        - convergence_curve_S2_{model}.png : mean +/- 1 SD trajectory for S2
-        - convergence_curve_S3_{model}.png : mean +/- 1 SD trajectory for S3
-        - iterations_histogram_{model}.png : mean iteration count to first minimum
-        - convergence_metrics.csv          : quantitative statistics table
-        - trajectory_S2.csv / trajectory_S3.csv : raw forward-filled trajectories
-    """
+    plt.close('all')
     scenarios_to_run = ["S2", "S3"]
-    horizon = config.MAX_ITER_BD
+    horizon = config.MAX_SWEEPS_BD
 
     e5_fig_dir = config.FIGURES_DIR / "E5"
     e5_csv_dir = config.CSV_DIR / "E5"
@@ -867,25 +1017,22 @@ def run_experiment_E5(verbose=False):
         os.makedirs(model_csv_dir, exist_ok=True)
 
         scenario_trajectories = {}
-        scenario_iterations = {}
+        scenario_sweeps = {}
         scenario_cost_initial = {}
         scenario_cost_final = {}
 
         for scenario_name in scenarios_to_run:
             instances = all_instances.get(scenario_name, {})
             if not instances:
-                print(f"[ERROR] Scenario {scenario_name} missing from database.")
-                continue
+                print(f"[ERROR] Scenario {scenario_name} missing from database."); continue
 
             first_inst = list(instances.values())[0]
-            N = first_inst["N"]
-            K = first_inst["K"]
-
+            N, K = first_inst["N"], first_inst["K"]
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
             seeds = sorted([int(s) for s in instances.keys() if s.isdigit()])
 
             trajectories_matrix = np.zeros((len(seeds), horizon + 1))
-            iterations_per_seed = []
+            sweeps_per_seed = []
             cost_initial_per_seed = []
             cost_final_per_seed = []
 
@@ -894,14 +1041,13 @@ def run_experiment_E5(verbose=False):
 
             for idx, seed in enumerate(seeds):
                 inst = instances.get(str(seed))
-                if inst is None:
-                    continue
+                if inst is None: continue
                 W = np.array(inst["W"])
 
-                x_final, history, elapsed, _, best_iter = bdcenn_allocation(
+                x_final, history, elapsed, _, _, best_sweep = bdcenn_allocation(
                     N, K, W, M=M,
                     num_restarts=config.NUM_RESTARTS,
-                    max_iter=horizon,
+                    max_sweeps=horizon,
                     random_order=True,
                     seed=seed,
                     verbose=False
@@ -914,228 +1060,123 @@ def run_experiment_E5(verbose=False):
                     cost_initial = raw_trajectory[0]
                     cost_final = raw_trajectory[-1]
 
-                    # Forward Fill up to maximum horizon
                     filled = np.zeros(horizon + 1)
                     for t in range(horizon + 1):
-                        if t < actual_length:
-                            filled[t] = raw_trajectory[t]
-                        else:
-                            filled[t] = cost_final
+                        filled[t] = raw_trajectory[t] if t < len(raw_trajectory) else raw_trajectory[-1]
                     trajectories_matrix[idx, :] = filled
 
-                    # CORRECTION: use best_iter (first minimal cost) instead of trajectory length
-                    iterations_per_seed.append(best_iter)
+                    sweeps_per_seed.append(best_sweep)
                     cost_initial_per_seed.append(cost_initial)
                     cost_final_per_seed.append(cost_final)
 
-            mean_trajectory = np.mean(trajectories_matrix, axis=0)
-            std_trajectory = np.std(trajectories_matrix, axis=0, ddof=1)
-
             scenario_trajectories[scenario_name] = {
-                "mean": mean_trajectory,
-                "std": std_trajectory,
-                "N": N,
-                "K": K,
-            }
-            scenario_iterations[scenario_name] = np.array(iterations_per_seed)
+                "mean": np.mean(trajectories_matrix, axis=0),
+                "std": np.std(trajectories_matrix, axis=0, ddof=1),
+                "N": N, "K": K}
+            scenario_sweeps[scenario_name] = np.array(sweeps_per_seed)
             scenario_cost_initial[scenario_name] = np.array(cost_initial_per_seed)
             scenario_cost_final[scenario_name] = np.array(cost_final_per_seed)
 
-        # ------------------------------------------------------------------
-        # FIGURES 1 & 2: Mean convergence trajectory with +/- 1 SD band
-        # (One figure per scenario, no LaTeX to avoid Windows filesystem errors)
-        # ------------------------------------------------------------------
+        # ---- Figure 1 : Convergence curves ----
         for scenario_name in scenarios_to_run:
-            if scenario_name not in scenario_trajectories:
-                continue
-
+            if scenario_name not in scenario_trajectories: continue
             data = scenario_trajectories[scenario_name]
-            mean_curve = data["mean"]
-            std_curve = data["std"]
-            N = data["N"]
-            K = data["K"]
-
-            iterations_axis = np.arange(horizon + 1)
-
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.plot(iterations_axis, mean_curve,
-                    color='firebrick', linewidth=2.5,
+            # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+            fig, canvas = _new_figure((10, 6))
+            ax = fig.add_subplot(111)
+            iters = np.arange(horizon + 1)
+            ax.plot(iters, data["mean"], color='firebrick', linewidth=2.5,
                     label='Cout moyen J(t)', zorder=3)
-            ax.fill_between(
-                iterations_axis,
-                mean_curve - std_curve,
-                mean_curve + std_curve,
-                color='firebrick', alpha=0.20,
-                label='Plus ou moins 1 SD (dispersion sur 30 topologies)'
-            )
-
-            ax.set_xlabel("Iterations (balayages complets du reseau)", fontsize=12)
+            ax.fill_between(iters, data["mean"] - data["std"],
+                            data["mean"] + data["std"],
+                            color='firebrick', alpha=0.20,
+                            label='Plus ou moins 1 SD')
+            ax.set_xlabel("Sweeps (balayages complets)", fontsize=12)
             ax.set_ylabel("Cout global J(x)", fontsize=12)
-            ax.set_title(
-                f"E5 - Convergence BD-CeNN - Scenario {scenario_name} "
-                f"(N={N}, K={K}) - {model_name}",
-                fontsize=13, fontweight='bold'
-            )
+            ax.set_title(f"E5 - Convergence BD-CeNN - {scenario_name} "
+                         f"(N={data['N']}, K={data['K']}) - {model_name}",
+                         fontsize=13, fontweight='bold')
             ax.grid(True, linestyle='--', alpha=0.4)
             ax.legend(loc='upper right', fontsize=11)
             ax.set_xlim([0, horizon])
+            fig.subplots_adjust(top=0.90, bottom=0.10, left=0.09, right=0.97)
+            fig.savefig(str(model_fig_dir / f"convergence_curve_{scenario_name}_{model_name}.png"), dpi=300)
 
-            plt.tight_layout()
-            fname = f"convergence_curve_{scenario_name}_{model_name}.png"
-            # Explicit str conversion for Windows compatibility
-            output_path = str(model_fig_dir / fname)
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            plt.close(fig)
-            plt.close('all')  # Free all matplotlib memory
-            print(f"[INFO] Figure E5/{folder}/{fname} saved.")
-
-        # ------------------------------------------------------------------
-        # FIGURE 3: Histogram of mean iterations (Best Iter) for S2 and S3
-        # ------------------------------------------------------------------
-        fig, ax = plt.subplots(figsize=(9, 6))
-        bar_labels = []
-        bar_means = []
-        bar_stds = []
-        bar_colors = ['steelblue', 'darkorange']
-
+        # ---- Figure 2 : Sweeps histogram ----
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig, canvas = _new_figure((9, 6))
+        ax = fig.add_subplot(111)
+        bar_labels, bar_means, bar_stds = [], [], []
         for scenario_name in scenarios_to_run:
-            if scenario_name not in scenario_iterations:
-                continue
-            iters = scenario_iterations[scenario_name]
+            if scenario_name not in scenario_sweeps: continue
+            sw = scenario_sweeps[scenario_name]
             data = scenario_trajectories[scenario_name]
-            label = f"{scenario_name}\n(N={data['N']}, K={data['K']})"
-            bar_labels.append(label)
-
-            mean_val = int(round(np.mean(iters))) if len(iters) > 0 else 0
-            std_val = float(np.std(iters, ddof=1)) if len(iters) > 1 else 0.0
-            bar_means.append(mean_val)
-            bar_stds.append(std_val)
-
-        x_positions = np.arange(len(bar_labels))
-        bars = ax.bar(
-            x_positions, bar_means, yerr=bar_stds,
-            capsize=10, color=bar_colors[:len(bar_labels)],
-            edgecolor='black', linewidth=1.2, alpha=0.85,
-            error_kw={'elinewidth': 2, 'ecolor': 'black'}
-        )
-
-        # Annotate bars with plain-text labels (no LaTeX)
-        for i, (bar, mean_val, std_val) in enumerate(zip(bars, bar_means, bar_stds)):
-            height = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                height + std_val + 0.5,
-                f"{mean_val} +/- {std_val:.1f} iters",
-                ha='center', va='bottom',
-                fontsize=11, fontweight='bold'
-            )
-
-        ax.set_xticks(x_positions)
-        ax.set_xticklabels(bar_labels, fontsize=11)
-        ax.set_ylabel("Nombre moyen d'iterations pour atteindre le minimum", fontsize=12)
-        ax.set_title(
-            f"E5 - Iterations moyennes vers l'optimum - {model_name}",
-            fontsize=13, fontweight='bold'
-        )
+            bar_labels.append(f"{scenario_name}\n(N={data['N']}, K={data['K']})")
+            bar_means.append(int(round(np.mean(sw))) if len(sw) > 0 else 0)
+            bar_stds.append(float(np.std(sw, ddof=1)) if len(sw) > 1 else 0.0)
+        x_pos = np.arange(len(bar_labels))
+        bars = ax.bar(x_pos, bar_means, yerr=bar_stds, capsize=10,
+                      color=['steelblue', 'darkorange'][:len(bar_labels)],
+                      edgecolor='black', linewidth=1.2, alpha=0.85)
+        for i, (bar, m, s) in enumerate(zip(bars, bar_means, bar_stds)):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + s + 0.5,
+                    f"{m} +/- {s:.1f} sweeps", ha='center', va='bottom',
+                    fontsize=11, fontweight='bold')
+        ax.set_xticks(x_pos); ax.set_xticklabels(bar_labels, fontsize=11)
+        ax.set_ylabel("Sweeps moyens vers le minimum", fontsize=12)
+        ax.set_title(f"E5 - Sweeps moyens - {model_name}", fontsize=13, fontweight='bold')
         ax.grid(axis='y', linestyle='--', alpha=0.4)
+        if bar_means:
+            ax.set_ylim([0, max(bar_means) + max(bar_stds)*2 + 5])
+        fig.subplots_adjust(top=0.90, bottom=0.12, left=0.10, right=0.97)
+        fig.savefig(str(model_fig_dir / f"sweeps_histogram_{model_name}.png"), dpi=300)
 
-        if bar_means and bar_stds:
-            y_upper = max(bar_means) + max(bar_stds) * 2 + 5
-        else:
-            y_upper = 10
-        ax.set_ylim([0, y_upper])
-
-        plt.tight_layout()
-        fname_hist = f"iterations_histogram_{model_name}.png"
-        # Explicit str conversion for Windows compatibility
-        output_path_hist = str(model_fig_dir / fname_hist)
-        plt.savefig(output_path_hist, dpi=300, bbox_inches='tight')
-        plt.close(fig)
-        plt.close('all')  # Free all matplotlib memory
-        print(f"[INFO] Figure E5/{folder}/{fname_hist} saved.")
-
-        # ------------------------------------------------------------------
-        # CSV: Quantitative metrics table
-        # ------------------------------------------------------------------
+        # ---- CSV convergence metrics ----
         rows = []
         for scenario_name in scenarios_to_run:
-            if scenario_name not in scenario_iterations:
-                continue
-
-            iters = scenario_iterations[scenario_name]
-            cost_init = scenario_cost_initial[scenario_name]
-            cost_fin = scenario_cost_final[scenario_name]
+            if scenario_name not in scenario_sweeps: continue
+            sw = scenario_sweeps[scenario_name]
+            ci = scenario_cost_initial[scenario_name]
+            cf = scenario_cost_final[scenario_name]
             data = scenario_trajectories[scenario_name]
+            def _s(a):
+                if len(a) == 0: return dict(mean=0,std=0,median=0,min=0,max=0)
+                return dict(mean=float(np.mean(a)),
+                            std=float(np.std(a,ddof=1)) if len(a)>1 else 0.0,
+                            median=float(np.median(a)),
+                            min=float(np.min(a)), max=float(np.max(a)))
+            ss, cis, cfs = _s(sw), _s(ci), _s(cf)
+            rows.append({"scenario": scenario_name, "N": data["N"], "K": data["K"],
+                         "n_seeds": len(sw),
+                         "n_sweeps_mean": round(ss["mean"],2),
+                         "n_sweeps_std": round(ss["std"],2),
+                         "n_sweeps_median": round(ss["median"],2),
+                         "n_sweeps_min": int(ss["min"]),
+                         "n_sweeps_max": int(ss["max"]),
+                         "cost_initial_mean": round(cis["mean"],4),
+                         "cost_initial_std": round(cis["std"],4),
+                         "cost_final_mean": round(cfs["mean"],4),
+                         "cost_final_std": round(cfs["std"],4)})
+        pd.DataFrame(rows).to_csv(str(model_csv_dir / "convergence_metrics.csv"),
+                                  index=False, float_format="%.6f")
 
-            def _stats(arr):
-                if len(arr) == 0:
-                    return dict(mean=0, std=0, median=0, min=0, max=0)
-                return dict(
-                    mean=float(np.mean(arr)),
-                    std=float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
-                    median=float(np.median(arr)),
-                    min=float(np.min(arr)),
-                    max=float(np.max(arr)),
-                )
-
-            it_stats = _stats(iters)
-            ci_stats = _stats(cost_init)
-            cf_stats = _stats(cost_fin)
-
-            rows.append({
-                "scenario": scenario_name,
-                "N": data["N"],
-                "K": data["K"],
-                "n_seeds": len(iters),
-                "iterations_mean": round(it_stats["mean"], 2),
-                "iterations_std": round(it_stats["std"], 2),
-                "iterations_median": round(it_stats["median"], 2),
-                "iterations_min": int(it_stats["min"]),
-                "iterations_max": int(it_stats["max"]),
-                "cost_initial_mean": round(ci_stats["mean"], 4),
-                "cost_initial_std": round(ci_stats["std"], 4),
-                "cost_initial_median": round(ci_stats["median"], 4),
-                "cost_initial_min": round(ci_stats["min"], 4),
-                "cost_initial_max": round(ci_stats["max"], 4),
-                "cost_final_mean": round(cf_stats["mean"], 4),
-                "cost_final_std": round(cf_stats["std"], 4),
-                "cost_final_median": round(cf_stats["median"], 4),
-                "cost_final_min": round(cf_stats["min"], 4),
-                "cost_final_max": round(cf_stats["max"], 4),
-            })
-
-        df_metrics = pd.DataFrame(rows)
-        csv_path = str(model_csv_dir / "convergence_metrics.csv")
-        df_metrics.to_csv(csv_path, index=False, float_format="%.6f")
-        print(f"[SUCCESS] CSV E5/{folder}/convergence_metrics.csv saved.")
-
-        # ------------------------------------------------------------------
-        # Additional CSV: raw forward-filled trajectories for reproducibility
-        # ------------------------------------------------------------------
         for scenario_name in scenarios_to_run:
-            if scenario_name not in scenario_trajectories:
-                continue
+            if scenario_name not in scenario_trajectories: continue
             data = scenario_trajectories[scenario_name]
-            traj_df = pd.DataFrame({
-                "iteration": np.arange(horizon + 1),
-                "mean_cost": data["mean"],
-                "std_cost": data["std"],
-                "mean_minus_std": data["mean"] - data["std"],
-                "mean_plus_std": data["mean"] + data["std"],
-            })
-            traj_path = str(model_csv_dir / f"trajectory_{scenario_name}.csv")
-            traj_df.to_csv(traj_path, index=False, float_format="%.6f")
-            print(f"[SUCCESS] CSV E5/{folder}/trajectory_{scenario_name}.csv saved.")
+            pd.DataFrame({"sweep": np.arange(horizon+1),
+                          "mean_cost": data["mean"], "std_cost": data["std"]
+                          }).to_csv(str(model_csv_dir / f"trajectory_{scenario_name}.csv"),
+                                    index=False, float_format="%.6f")
 
+    _validate_if_available("E5")
     print("[SUCCESS] Experiment E5 completed.")
 
+
 # ============================================================================
-# E6 - COMPUTATIONAL SCALE PROPERTIES (N-SENSITIVITY)
+# E6 - SCALABILITE
 # ============================================================================
 def run_experiment_E6(verbose=False):
-    """
-    E6 - Complexity growth metrics across node scales N.
-    """
+    plt.close('all')
     K = 8
     area = 300
     threshold = 50
@@ -1196,32 +1237,30 @@ def run_experiment_E6(verbose=False):
                     if method_name == "Random":
                         np.random.seed(seed)
                         x = method_func(N, K)
+                        n_sweeps = np.nan
                     elif method_name == "Greedy":
                         np.random.seed(seed)
                         order = np.random.permutation(N).tolist()
                         x = method_func(N, K, W, order=order, M=M)
+                        n_sweeps = np.nan
                     elif method_name == "DSATUR":
                         x = method_func(N, K, W, M=M)
+                        n_sweeps = np.nan
                     else:
-                        x, _, _, _, best_iter = method_func(
+                        x, _, _, _, _, best_sweep = method_func(
                             N, K, W, M=M,
                             num_restarts=config.NUM_RESTARTS,
-                            max_iter=config.MAX_ITER_BD,
+                            max_sweeps=config.MAX_SWEEPS_BD,
                             random_order=True,
                             seed=seed,
                             verbose=False
                         )
+                        n_sweeps = best_sweep
                     elapsed = time.perf_counter() - start_time
 
-                    if M is None:
-                        cost = compute_cochannel_cost(x, W)
-                        conflicts = count_cochannel_conflicts(x, W)
-                    else:
-                        cost = compute_adjacent_cost(x, W, M)
-                        conflicts = count_adjacent_conflicts(x, W, M)
-                    used_channels = len(set(x))
+                    cost = _compute_cost(x, W, M)
+                    c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
                     normalized_cost = cost / sum_weights if sum_weights > 0 else np.nan
-                    iterations = best_iter if method_name == "BD-CeNN" else np.nan
 
                     raw_data.append({
                         "N": N,
@@ -1229,105 +1268,131 @@ def run_experiment_E6(verbose=False):
                         "method": method_name,
                         "cost": cost,
                         "normalized_cost": normalized_cost,
-                        "conflicts": conflicts,
-                        "used_channels": used_channels,
+                        "conflicts_cci": c_cci,
+                        "conflicts_aci": c_aci,
+                        "conflicts_total": c_tot,
+                        "used_channels": len(set(x)),
                         "time": elapsed,
-                        "iterations": iterations
+                        "n_sweeps": n_sweeps
                     })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False)
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E6/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["N", "method"]).agg({
             "cost": ["mean", "std", "min", "max", "median"],
             "normalized_cost": ["mean", "std", "min", "max", "median"],
-            "conflicts": ["mean", "std", "min", "max", "median"],
+            "conflicts_cci": ["mean", "std", "min", "max", "median"],
+            "conflicts_aci": ["mean", "std", "min", "max", "median"],
+            "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"],
             "time": ["mean", "std", "min", "max", "median"],
-            "iterations": ["mean", "std", "min", "max", "median"]
+            "n_sweeps": ["mean", "std", "min", "max", "median"]
         }).reset_index()
-        
-        summary.columns = ['N', 'method',
-                           'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
-                           'normalized_cost_mean', 'normalized_cost_std', 'normalized_cost_min', 'normalized_cost_max', 'normalized_cost_median',
-                           'conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                           'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
-                           'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-                           'iterations_mean', 'iterations_std', 'iterations_min', 'iterations_max', 'iterations_median']
 
-        for col in ['conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
-                    'iterations_mean', 'iterations_std', 'iterations_min', 'iterations_max', 'iterations_median']:
+        summary.columns = [
+            'N', 'method',
+            'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
+            'normalized_cost_mean', 'normalized_cost_std', 'normalized_cost_min',
+            'normalized_cost_max', 'normalized_cost_median',
+            'conflicts_cci_mean', 'conflicts_cci_std', 'conflicts_cci_min',
+            'conflicts_cci_max', 'conflicts_cci_median',
+            'conflicts_aci_mean', 'conflicts_aci_std', 'conflicts_aci_min',
+            'conflicts_aci_max', 'conflicts_aci_median',
+            'conflicts_total_mean', 'conflicts_total_std', 'conflicts_total_min',
+            'conflicts_total_max', 'conflicts_total_median',
+            'used_channels_mean', 'used_channels_std', 'used_channels_min',
+            'used_channels_max', 'used_channels_median',
+            'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
+            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
+        ]
+
+        for col in summary.columns[2:]:
             summary[col] = summary[col].round(1)
 
-        for col in ['conflicts_mean', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                    'used_channels_mean', 'used_channels_min', 'used_channels_max', 'used_channels_median',
-                    'iterations_mean', 'iterations_min', 'iterations_max', 'iterations_median']:
-            summary[col] = summary[col].fillna(0).round(0).astype(int)
+        for col in summary.columns:
+            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
+                summary[col] = summary[col].fillna(0).round(0).astype(int)
 
-        summary.to_csv(model_csv_dir / "summary_metrics.csv", index=False)
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E6/{folder}/summary_metrics.csv saved.")
 
         metrics_to_plot = [
-            ('cost_mean', 'cost_std', 'Mean Global Penalty J(x)'),
-            ('time_mean', 'time_std', 'Computational Runtime (seconds)'),
-            ('iterations_mean', 'iterations_std', 'Active Settling Iterations (BD-CeNN)')
+            ('cost_mean', 'cost_std', 'Cout global moyen J(x)'),
+            ('time_mean', 'time_std', "Temps d'execution moyen (s)"),
+            ('n_sweeps_mean', 'n_sweeps_std', "Sweeps moyens (BD-CeNN)")
         ]
 
+        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen',
+                         'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
+        method_markers = {'Random': 'o', 'Greedy': 's', 'DSATUR': '^', 'BD-CeNN': 'D'}
+
         for metric_col, std_col, ylabel in metrics_to_plot:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            if 'iterations' in metric_col:
+            # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+            fig, canvas = _new_figure((10, 6))
+            ax = fig.add_subplot(111)
+
+            if 'sweeps' in metric_col:
                 sub = summary[summary['method'] == 'BD-CeNN'].set_index('N').reindex(N_values).reset_index()
-                ax.errorbar(sub['N'].values, sub[metric_col].values, yerr=sub[std_col].values, fmt='o-', capsize=5,
-                            color='firebrick', label='BD-CeNN', linewidth=2, markersize=8)
-                ax.set_title(f"E6 - Settling Iterations Growth Profile - {ylabel}")
+                ax.errorbar(sub['N'].values, sub[metric_col].values, yerr=sub[std_col].values,
+                            fmt='o-', capsize=5, color='firebrick', label='BD-CeNN',
+                            linewidth=2, markersize=8)
+                ax.set_title(f"E6 - Complexite dynamique - {ylabel} (BD-CeNN)")
             else:
-                method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen', 'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
-                method_markers = {'Random': 'o', 'Greedy': 's', 'DSATUR': '^', 'BD-CeNN': 'D'}
                 for method in methods.keys():
                     sub = summary[summary['method'] == method].set_index('N').reindex(N_values).reset_index()
-                    ax.errorbar(sub['N'].values, sub[metric_col].values, yerr=sub[std_col].values, fmt=method_markers[method]+'-', capsize=5,
-                                color=method_colors[method], label=method, linewidth=2, markersize=8)
-                ax.set_title(f"E6 - Complexity growth metrics - {ylabel}")
+                    ax.errorbar(sub['N'].values, sub[metric_col].values, yerr=sub[std_col].values,
+                                fmt=method_markers[method]+'-', capsize=5,
+                                color=method_colors[method], label=method,
+                                linewidth=2, markersize=8)
+                ax.set_title(f"E6 - Complexite structurelle - {ylabel}")
 
-            ax.set_xlabel("Number of Cell Antennas N", fontsize=11)
-            ax.set_ylabel(ylabel, fontsize=11)
+            ax.set_xlabel("Nombre de cellules N", fontsize=12)
+            ax.set_ylabel(ylabel, fontsize=12)
             ax.legend()
             ax.grid(True, linestyle='--', alpha=0.3)
-            plt.tight_layout()
-            fname = f"{metric_col.replace('_mean','')}_vs_N_{model_name}.png"
-            plt.savefig(model_fig_dir / fname, dpi=300)
-            plt.close(fig)
+            fig.subplots_adjust(top=0.92, bottom=0.10, left=0.09, right=0.97)
 
-        # Plot 4: Normalized Cost vs N
-        fig, ax = plt.subplots(figsize=(10, 6))
-        method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen', 'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
-        method_markers = {'Random': 'o', 'Greedy': 's', 'DSATUR': '^', 'BD-CeNN': 'D'}
+            fname = f"{metric_col.replace('_mean','')}_vs_N_{model_name}.png"
+            fig.savefig(str(model_fig_dir / fname), dpi=300)
+            print(f"[INFO] Figure E6/{folder}/{fname} saved.")
+
+        # ---- Figure 4 : Normalized Cost vs N ----
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig, canvas = _new_figure((10, 6))
+        ax = fig.add_subplot(111)
+
         for method in methods.keys():
             sub = summary[summary['method'] == method].set_index('N').reindex(N_values).reset_index()
-            ax.errorbar(sub['N'].values, sub['normalized_cost_mean'].values, yerr=sub['normalized_cost_std'].values, fmt=method_markers[method]+'-', capsize=5,
-                        color=method_colors[method], label=method, linewidth=2, markersize=8)
-        ax.set_xlabel("Number of Cells N", fontsize=11)
-        ax.set_ylabel("Normalized Mean Cost Profile", fontsize=11)
-        ax.set_title(f"E6 - Normalized Structural Loss vs Scaling Scale - {model_name}", fontsize=12, fontweight='bold')
+            ax.errorbar(sub['N'].values, sub['normalized_cost_mean'].values,
+                        yerr=sub['normalized_cost_std'].values,
+                        fmt=method_markers[method]+'-', capsize=5,
+                        color=method_colors[method], label=method,
+                        linewidth=2, markersize=8)
+
+        ax.set_xlabel("Nombre de cellules N", fontsize=12)
+        ax.set_ylabel("Cout normalise moyen", fontsize=12)
+        ax.set_title(f"E6 - Cout normalise moyen - {model_name}",
+                     fontsize=14, fontweight='bold')
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(model_fig_dir / f"normalized_cost_vs_N_{model_name}.png", dpi=300)
-        plt.close(fig)
-        print(f"[INFO] Operational charts generated inside E6/{folder}/.")
+        fig.subplots_adjust(top=0.92, bottom=0.10, left=0.09, right=0.97)
 
+        fname = f"normalized_cost_vs_N_{model_name}.png"
+        fig.savefig(str(model_fig_dir / fname), dpi=300)
+        print(f"[INFO] Figure E6/{folder}/{fname} saved.")
+        print(f"[INFO] Operational charts saved inside E6/{folder}/.")
+
+    _validate_if_available("E6")
     print("[SUCCESS] Experiment E6 completed.")
 
 
 # ============================================================================
-# E7 - NOISE ROBUSTNESS
+# E7 - ROBUSTESSE AU BRUIT
 # ============================================================================
 def run_experiment_E7(verbose=False):
-    """
-    E7 - Noise insertion robust analysis under the measurement matrix W.
-    """
+    plt.close('all')
     scenario_name = "S6"
     instances = all_instances.get(scenario_name, {})
     if not instances:
@@ -1391,16 +1456,16 @@ def run_experiment_E7(verbose=False):
 
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
-            x_ref, _, _, _, _ = method_func(
+            x_ref, _, _, _, _, _ = method_func(
                 N, K, W_clean, M=M,
                 num_restarts=config.NUM_RESTARTS,
-                max_iter=config.MAX_ITER_BD,
+                max_sweeps=config.MAX_SWEEPS_BD,
                 random_order=True,
                 seed=seed,
                 verbose=False
             )
             ref_x[seed] = x_ref
-            ref_cost[seed] = compute_adjacent_cost(x_ref, W_clean, M) if M is not None else compute_cochannel_cost(x_ref, W_clean)
+            ref_cost[seed] = _compute_cost(x_ref, W_clean, M)
 
         for b_noise, noise_label in zip(noise_levels, noise_labels):
             for seed in seeds:
@@ -1419,15 +1484,16 @@ def run_experiment_E7(verbose=False):
 
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
                 seed_noisy = seed + int(b_noise * 1000) + 100
-                x_noisy, _, _, _, _ = method_func(
+
+                x_noisy, _, _, _, _, _ = method_func(
                     N, K, W_noisy, M=M,
                     num_restarts=config.NUM_RESTARTS,
-                    max_iter=config.MAX_ITER_BD,
+                    max_sweeps=config.MAX_SWEEPS_BD,
                     random_order=True,
                     seed=seed_noisy,
                     verbose=False
                 )
-                cost_noisy = compute_adjacent_cost(x_noisy, W_noisy, M) if M is not None else compute_cochannel_cost(x_noisy, W_noisy)
+                cost_noisy = _compute_cost(x_noisy, W_noisy, M)
 
                 cost_relatif = ((cost_noisy - ref_cost[seed]) / ref_cost[seed]) * 100 if ref_cost[seed] > 0 else 0.0
                 changes = np.sum(x_noisy != ref_x[seed])
@@ -1443,58 +1509,65 @@ def run_experiment_E7(verbose=False):
                 })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False, float_format='%.6f')
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.6f')
         print(f"[SUCCESS] CSV E7/{folder}/raw_metrics.csv saved.")
 
+        # [FIX-E7] Ordre des statistiques aligne sur la convention du memoire :
+        # moyenne -> ecart-type -> mediane -> minimum -> maximum
         summary = df_raw.groupby("noise_level").agg({
-            "cost_relatif": ["mean", "std", "min", "max", "median"],
-            "change_rate": ["mean", "std", "min", "max", "median"]
+            "cost_relatif": ["mean", "std", "median", "min", "max"],
+            "change_rate": ["mean", "std", "median", "min", "max"]
         }).reset_index()
         summary.columns = ['noise_level',
-                           'cost_relatif_mean', 'cost_relatif_std', 'cost_relatif_min', 'cost_relatif_max', 'cost_relatif_median',
-                           'change_rate_mean', 'change_rate_std', 'change_rate_min', 'change_rate_max', 'change_rate_median']
-        for col in summary.columns:
-            if col != 'noise_level':
-                summary[col] = summary[col].round(1)
+                           'cost_rel_mean', 'cost_rel_std', 'cost_rel_median',
+                           'cost_rel_min', 'cost_rel_max',
+                           'change_mean', 'change_std', 'change_median',
+                           'change_min', 'change_max']
+        for col in summary.columns[1:]:
+            summary[col] = summary[col].round(1)
 
-        summary.to_csv(model_csv_dir / "summary_metrics.csv", index=False, float_format='%.1f')
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.1f')
         print(f"[SUCCESS] CSV E7/{folder}/summary_metrics.csv saved.")
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # [FIX] Pattern robuste + correction du bug : 'change_rate_std' -> 'change_std'
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig, canvas = _new_figure((10, 6))
+        ax = fig.add_subplot(111)
         noise_vals = [0] + sorted(summary['noise_level'].unique())
-        cost_means = [0] + summary['cost_relatif_mean'].tolist()
-        cost_stds = [0] + summary['cost_relatif_std'].tolist()
-        change_means = [0] + summary['change_rate_mean'].tolist()
-        change_stds = [0] + summary['change_rate_std'].tolist()
+        cost_means = [0] + summary['cost_rel_mean'].tolist()
+        cost_stds = [0] + summary['cost_rel_std'].tolist()
+        change_means = [0] + summary['change_mean'].tolist()
+        change_stds = [0] + summary['change_std'].tolist()   # <-- CORRECTION ICI
 
         ax.errorbar(noise_vals, cost_means, yerr=cost_stds, fmt='o-', capsize=6,
-                    color='red', label='Mean Relative Cost Shift (%)', linewidth=2, markersize=8)
+                    color='red', label='Degradation relative du cout (%)',
+                    linewidth=2, markersize=8)
         ax.errorbar(noise_vals, change_means, yerr=change_stds, fmt='s-', capsize=6,
-                    color='blue', label='Node Re-assignment Rate (%)', linewidth=2, markersize=8)
+                    color='blue', label='Taux de changement de canal (%)',
+                    linewidth=2, markersize=8)
 
-        ax.set_xlabel("Injected Measurement Noise Level (%)", fontsize=11)
-        ax.set_ylabel("Deviation Percentage (%)", fontsize=11)
-        ax.set_title(f"E7 - Solver Robustness under Matrix Perturbations - {model_name}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Niveau de bruit injecte (%)", fontsize=11)
+        ax.set_ylabel("Pourcentage (%)", fontsize=11)
+        ax.set_title(f"E7 - Robustesse au bruit de mesure - {model_name}",
+                     fontsize=12, fontweight='bold')
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
         ax.set_ylim(-50, 100)
 
-        plt.tight_layout()
+        fig.subplots_adjust(top=0.90, bottom=0.12, left=0.10, right=0.97)
         fname = f"robustness_{model_name}.png"
-        plt.savefig(model_fig_dir / fname, dpi=300)
-        plt.close(fig)
+        fig.savefig(str(model_fig_dir / fname), dpi=300)
         print(f"[INFO] Figure E7/{folder}/{fname} saved.")
 
+    _validate_if_available("E7")
     print("[SUCCESS] Experiment E7 completed.")
 
 
 # ============================================================================
-# E8 - DYNAMIC TOPOLOGY ADAPTATION (WARM VS COLD)
+# E8 - RESEAU DYNAMIQUE
 # ============================================================================
 def run_experiment_E8(verbose=False):
-    """
-    E8 - Comparative convergence pathways of Warm vs Cold starts.
-    """
+    plt.close('all')
     scenario_name = "S7"
     instances = all_instances.get(scenario_name, {})
     if not instances:
@@ -1557,10 +1630,10 @@ def run_experiment_E8(verbose=False):
 
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
-            x_init, _, _, _, _ = method_func(
+            x_init, _, _, _, _, _ = method_func(
                 N, K, W_orig, M=M,
                 num_restarts=config.NUM_RESTARTS,
-                max_iter=config.MAX_ITER_BD,
+                max_sweeps=config.MAX_SWEEPS_BD,
                 random_order=True,
                 seed=seed,
                 verbose=False
@@ -1595,24 +1668,22 @@ def run_experiment_E8(verbose=False):
 
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
-                # Warm start run (uses x_init directly as anchor)
                 start = time.perf_counter()
-                x_warm, _, _, _, _ = method_func(
+                x_warm, _, _, _, _, _ = method_func(
                     N, K, W_dyn, M=M,
                     num_restarts=1,
-                    max_iter=config.MAX_ITER_BD,
+                    max_sweeps=config.MAX_SWEEPS_BD,
                     random_order=True,
                     seed=seed + int(b_mod * 1000) + 300,
                     verbose=False
                 )
                 time_warm = time.perf_counter() - start
 
-                # Cold start run
                 start = time.perf_counter()
-                x_cold, _, _, _, _ = method_func(
+                x_cold, _, _, _, _, _ = method_func(
                     N, K, W_dyn, M=M,
                     num_restarts=config.NUM_RESTARTS,
-                    max_iter=config.MAX_ITER_BD,
+                    max_sweeps=config.MAX_SWEEPS_BD,
                     random_order=True,
                     seed=seed + int(b_mod * 1000) + 400,
                     verbose=False
@@ -1622,33 +1693,43 @@ def run_experiment_E8(verbose=False):
                 changes_warm = np.sum(x_warm != ref_x[seed])
                 changes_cold = np.sum(x_cold != ref_x[seed])
 
-                cost_warm = compute_adjacent_cost(x_warm, W_dyn, M) if M is not None else compute_cochannel_cost(x_warm, W_dyn)
-                cost_cold = compute_adjacent_cost(x_cold, W_dyn, M) if M is not None else compute_cochannel_cost(x_cold, W_dyn)
+                cost_warm = _compute_cost(x_warm, W_dyn, M)
+                cost_cold = _compute_cost(x_cold, W_dyn, M)
 
-                raw_data.append({"mod_level": b_mod * 100, "seed": seed, "mode": "warm", "time": time_warm, "changes": changes_warm, "cost": cost_warm})
-                raw_data.append({"mod_level": b_mod * 100, "seed": seed, "mode": "cold", "time": time_cold, "changes": changes_cold, "cost": cost_cold})
+                raw_data.append({
+                    "mod_level": b_mod * 100, "seed": seed, "mode": "warm",
+                    "time": time_warm, "changes": changes_warm, "cost": cost_warm
+                })
+                raw_data.append({
+                    "mod_level": b_mod * 100, "seed": seed, "mode": "cold",
+                    "time": time_cold, "changes": changes_cold, "cost": cost_cold
+                })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False, float_format='%.6f')
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.6f')
         print(f"[SUCCESS] CSV E8/{folder}/raw_metrics.csv saved.")
 
+        # [FIX-E8] Ordre des statistiques aligne sur la convention du memoire :
+        # moyenne -> ecart-type -> mediane -> minimum -> maximum
         summary = df_raw.groupby(["mod_level", "mode"]).agg({
-            "time": ["mean", "std", "min", "max", "median"],
-            "changes": ["mean", "std", "min", "max", "median"],
-            "cost": ["mean", "std", "min", "max", "median"]
+            "time": ["mean", "std", "median", "min", "max"],
+            "changes": ["mean", "std", "median", "min", "max"],
+            "cost": ["mean", "std", "median", "min", "max"]
         }).reset_index()
         summary.columns = ['mod_level', 'mode',
-                           'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-                           'changes_mean', 'changes_std', 'changes_min', 'changes_max', 'changes_median',
-                           'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median']
+                           'time_mean', 'time_std', 'time_median', 'time_min', 'time_max',
+                           'changes_mean', 'changes_std', 'changes_median', 'changes_min', 'changes_max',
+                           'cost_mean', 'cost_std', 'cost_median', 'cost_min', 'cost_max']
         for col in summary.columns:
             if col not in ['mod_level', 'mode']:
                 summary[col] = summary[col].round(1) if ('changes' in col or 'cost' in col) else summary[col].round(6)
 
-        summary.to_csv(model_csv_dir / "summary_metrics.csv", index=False, float_format='%.6f')
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.6f')
         print(f"[SUCCESS] CSV E8/{folder}/summary_metrics.csv saved.")
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig, canvas = _new_figure((10, 6))
+        ax = fig.add_subplot(111)
         warm_data = summary[summary['mode'] == 'warm']
         cold_data = summary[summary['mode'] == 'cold']
 
@@ -1660,35 +1741,36 @@ def run_experiment_E8(verbose=False):
         changes_cold_means = [0] + cold_data['changes_mean'].tolist()
         changes_cold_stds = [0] + cold_data['changes_std'].tolist()
 
-        ax.errorbar(mod_vals_warm, changes_warm_means, yerr=changes_warm_stds, fmt='o-', capsize=6,
-                    color='green', label='Warm Start Optimization', linewidth=2, markersize=8)
-        ax.errorbar(mod_vals_cold, changes_cold_means, yerr=changes_cold_stds, fmt='s-', capsize=6,
-                    color='purple', label='Cold Start Optimization', linewidth=2, markersize=8)
+        ax.errorbar(mod_vals_warm, changes_warm_means, yerr=changes_warm_stds,
+                    fmt='o-', capsize=6, color='green',
+                    label='Warm Start Optimization', linewidth=2, markersize=8)
+        ax.errorbar(mod_vals_cold, changes_cold_means, yerr=changes_cold_stds,
+                    fmt='s-', capsize=6, color='purple',
+                    label='Cold Start Optimization', linewidth=2, markersize=8)
 
-        ax.set_xlabel("Dynamic Network Topology Perturbation Level (%)", fontsize=11)
-        ax.set_ylabel("Mean Frequency Reallocations", fontsize=11)
-        ax.set_title(f"E8 - Convergence Efficiency in Volatile Channels - {model_name}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Taux de modification dynamique (%)", fontsize=11)
+        ax.set_ylabel("Nombre moyen de cellules reaffectees", fontsize=11)
+        ax.set_title(f"E8 - Convergence en environnement instable - {model_name}",
+                     fontsize=12, fontweight='bold')
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
         y_min = min(changes_warm_means + changes_cold_means) - 2
         y_max = max(changes_warm_means + changes_cold_means) + 2
         ax.set_ylim([max(y_min, 0), y_max + 5])
-        plt.tight_layout()
+        fig.subplots_adjust(top=0.90, bottom=0.12, left=0.10, right=0.97)
         fname = f"adaptation_{model_name}.png"
-        plt.savefig(model_fig_dir / fname, dpi=300)
-        plt.close(fig)
+        fig.savefig(str(model_fig_dir / fname), dpi=300)
         print(f"[INFO] Figure E8/{folder}/{fname} saved.")
 
+    _validate_if_available("E8")
     print("[SUCCESS] Experiment E8 completed.")
 
 
 # ============================================================================
-# E9 - LOCAL MINIMA & MULTI-RESTART PROFILES
+# E9 - MINIMA LOCAUX
 # ============================================================================
 def run_experiment_E9(verbose=False):
-    """
-    E9 - Mitigation of local minima via multi-restart schedules.
-    """
+    plt.close('all')
     scenario_name = "S3"
     instances = all_instances.get(scenario_name, {})
     if not instances:
@@ -1750,30 +1832,29 @@ def run_experiment_E9(verbose=False):
         for seed, W in topologies.items():
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
-            # 1. BD-CeNN Execution over Restart Schedule
             for num_restarts in values:
                 start = time.perf_counter()
-                x_bd, _, _, _, _ = method_bd(
+                x_bd, _, _, n_cci, n_aci, _ = method_bd(
                     N, K, W, M=M,
                     num_restarts=num_restarts,
-                    max_iter=config.MAX_ITER_BD,
+                    max_sweeps=config.MAX_SWEEPS_BD,
                     random_order=True,
                     seed=seed + num_restarts * 1000,
                     verbose=False
                 )
                 elapsed = time.perf_counter() - start
+                cost = _compute_cost(x_bd, W, M)
 
-                cost = compute_adjacent_cost(x_bd, W, M) if M is not None else compute_cochannel_cost(x_bd, W)
-                conflicts = count_adjacent_conflicts(x_bd, W, M) if M is not None else count_cochannel_conflicts(x_bd, W)
+                raw_data.append({
+                    "seed": seed, "method": "BD-CeNN", "value": num_restarts,
+                    "cost": cost, "conflicts_cci": n_cci, "conflicts_aci": n_aci,
+                    "conflicts_total": n_cci + n_aci, "time": elapsed
+                })
 
-                raw_data.append({"seed": seed, "method": "BD-CeNN", "value": num_restarts, "cost": cost, "conflicts": conflicts, "time": elapsed})
-
-            # 2. Greedy Exploration across multiple random sweeps
             for num_orders in values:
                 best_cost = float('inf')
-                best_conflicts = None
+                best_conf_cci, best_conf_aci = 0, 0
                 best_time = 0.0
-
                 start_total = time.perf_counter()
                 for order_idx in range(num_orders):
                     np.random.seed(seed + order_idx * 100 + num_orders * 1000)
@@ -1781,68 +1862,185 @@ def run_experiment_E9(verbose=False):
                     start = time.perf_counter()
                     x_g = method_greedy(N, K, W, order=order, M=M)
                     best_time += (time.perf_counter() - start)
-
-                    cost_g = compute_adjacent_cost(x_g, W, M) if M is not None else compute_cochannel_cost(x_g, W)
-                    conflicts_g = count_adjacent_conflicts(x_g, W, M) if M is not None else count_cochannel_conflicts(x_g, W)
-
+                    cost_g = _compute_cost(x_g, W, M)
+                    c_cci, c_aci, _ = _compute_all_conflicts(x_g, W, M)
                     if cost_g < best_cost:
                         best_cost = cost_g
-                        best_conflicts = conflicts_g
+                        best_conf_cci = c_cci
+                        best_conf_aci = c_aci
 
-                raw_data.append({"seed": seed, "method": "Greedy", "value": num_orders, "cost": best_cost, "conflicts": best_conflicts, "time": time.perf_counter() - start_total})
+                raw_data.append({
+                    "seed": seed, "method": "Greedy", "value": num_orders,
+                    "cost": best_cost, "conflicts_cci": best_conf_cci,
+                    "conflicts_aci": best_conf_aci,
+                    "conflicts_total": best_conf_cci + best_conf_aci,
+                    "time": time.perf_counter() - start_total
+                })
 
         df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(model_csv_dir / "raw_metrics.csv", index=False)
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E9/{folder}/raw_metrics.csv saved.")
 
+        # [FIX-E9-AMELIORATION] Aggregation complete incluant median/min/max
+        # pour conflicts_cci et conflicts_aci (necessaire pour la table
+        # standalone adjacent en 5 statistiques completes).
         summary = df_raw.groupby(["value", "method"]).agg({
-            "cost": ["mean", "std", "min", "max", "median"],
-            "conflicts": ["mean", "std", "min", "max", "median"],
-            "time": ["mean", "std", "min", "max", "median"]
+            "cost": ["mean", "std", "median", "min", "max"],
+            "conflicts_cci": ["mean", "std", "median", "min", "max"],
+            "conflicts_aci": ["mean", "std", "median", "min", "max"],
+            "conflicts_total": ["mean", "std", "median", "min", "max"],
+            "time": ["mean", "std", "median", "min", "max"]
         }).reset_index()
-        summary.columns = ['value', 'method',
-                           'cost_mean', 'cost_std', 'cost_min', 'cost_max', 'cost_median',
-                           'conflicts_mean', 'conflicts_std', 'conflicts_min', 'conflicts_max', 'conflicts_median',
-                           'time_mean', 'time_std', 'time_min', 'time_max', 'time_median']
+        summary.columns = [
+            'value', 'method',
+            'cost_mean', 'cost_std', 'cost_median', 'cost_min', 'cost_max',
+            'conflicts_cci_mean', 'conflicts_cci_std',
+            'conflicts_cci_median', 'conflicts_cci_min', 'conflicts_cci_max',
+            'conflicts_aci_mean', 'conflicts_aci_std',
+            'conflicts_aci_median', 'conflicts_aci_min', 'conflicts_aci_max',
+            'conflicts_total_mean', 'conflicts_total_std',
+            'conflicts_total_median', 'conflicts_total_min', 'conflicts_total_max',
+            'time_mean', 'time_std', 'time_median', 'time_min', 'time_max'
+        ]
         for col in summary.columns:
             if col not in ['value', 'method']:
                 summary[col] = summary[col].round(1) if ('cost' in col or 'conflicts' in col) else summary[col].round(6)
 
-        summary.to_csv(model_csv_dir / "summary_metrics.csv", index=False, float_format='%.6f')
+        # [FIX-E9-AMELIORATION] Calcul du Gain(R) et du CostRatio(R)
+        # pour chaque methode, par rapport a R=1 (baseline).
+        summary = summary.sort_values(["method", "value"]).reset_index(drop=True)
+        gains = []
+        ratios = []
+        for _, row in summary.iterrows():
+            ref = summary[
+                (summary["method"] == row["method"]) &
+                (summary["value"] == 1)
+            ]
+            if ref.empty:
+                gains.append(0.0)
+                ratios.append(1.0)
+                continue
+            J1 = float(ref.iloc[0]["cost_mean"])
+            T1 = float(ref.iloc[0]["time_mean"])
+            JR = float(row["cost_mean"])
+            TR = float(row["time_mean"])
+            gain = ((J1 - JR) / J1 * 100.0) if J1 > 0 else 0.0
+            ratio = (TR / T1) if T1 > 0 else 1.0
+            gains.append(round(gain, 1))
+            ratios.append(round(ratio, 2))
+
+        summary["gain_pct"] = gains
+        summary["cost_ratio"] = ratios
+
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.6f')
         print(f"[SUCCESS] CSV E9/{folder}/summary_metrics.csv saved.")
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # [FIX-E9-AMELIORATION] Export dedie des metriques de compromis
+        trade_off = summary[[
+            "value", "method", "cost_mean", "time_mean",
+            "gain_pct", "cost_ratio"
+        ]].copy()
+        trade_off.to_csv(
+            str(model_csv_dir / "trade_off_metrics.csv"),
+            index=False, float_format="%.4f"
+        )
+        print(f"[SUCCESS] CSV E9/{folder}/trade_off_metrics.csv saved.")
+
+        # [FIX-LAYOUT] Figure() au lieu de plt.figure().
+        fig, canvas = _new_figure((10, 6))
+        ax = fig.add_subplot(111)
         bd_data = summary[summary['method'] == 'BD-CeNN'].sort_values('value')
         greedy_data = summary[summary['method'] == 'Greedy'].sort_values('value')
 
         x_vals = values
-        ax.errorbar(x_vals, bd_data['cost_mean'], yerr=bd_data['cost_std'], fmt='o-', capsize=6, color='red', label='BD-CeNN Solver', linewidth=2, markersize=8)
-        ax.errorbar(x_vals, greedy_data['cost_mean'], yerr=greedy_data['cost_std'], fmt='s-', capsize=6, color='blue', label='Greedy Randomized Sweeps', linewidth=2, markersize=8)
+        ax.errorbar(x_vals, bd_data['cost_mean'], yerr=bd_data['cost_std'],
+                    fmt='o-', capsize=6, color='red', label='BD-CeNN Solver',
+                    linewidth=2, markersize=8)
+        ax.errorbar(x_vals, greedy_data['cost_mean'], yerr=greedy_data['cost_std'],
+                    fmt='s-', capsize=6, color='blue', label='Greedy Permutations',
+                    linewidth=2, markersize=8)
 
-        ax.set_xlabel("Re-evaluations Scale (Restarts for CeNN, Trial Counts for Greedy)", fontsize=11)
-        ax.set_ylabel("Mean Settled Energy Cost J(x)", fontsize=11)
-        ax.set_title(f"E9 - Mitigation of Local Minima via Multi-restart Schedules - {model_name}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Nombre de tentatives de reallocation (Restarts pour CeNN, Essais pour Greedy)",
+                      fontsize=11)
+        ax.set_ylabel("Cout moyen de l'optimum local J(x)", fontsize=11)
+        ax.set_title(f"E9 - Robustesse aux minima locaux - {model_name}",
+                     fontsize=12, fontweight='bold')
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
         ax.set_xticks(values)
         ax.set_xticklabels([str(v) for v in values])
 
-        plt.tight_layout()
+        fig.subplots_adjust(top=0.90, bottom=0.12, left=0.12, right=0.97)
         fname = f"minima_locaux_{model_name}.png"
-        plt.savefig(model_fig_dir / fname, dpi=300)
-        plt.close(fig)
+        fig.savefig(str(model_fig_dir / fname), dpi=300)
         print(f"[INFO] Figure E9/{folder}/{fname} saved.")
 
+        # [FIX-E9-AMELIORATION] Figure de compromis qualite / cout computationnel
+        # Deux panneaux : Gain(%) vs R et CostRatio vs R, avec Greedy et BD-CeNN.
+        fig, canvas = _new_figure((13, 6))
+
+        ax_gain = fig.add_axes([0.06, 0.15, 0.42, 0.75])
+        ax_ratio = fig.add_axes([0.55, 0.15, 0.42, 0.75])
+
+        method_colors = {"Greedy": "forestgreen", "BD-CeNN": "firebrick"}
+        method_markers = {"Greedy": "s", "BD-CeNN": "D"}
+
+        for method in ["Greedy", "BD-CeNN"]:
+            sub = trade_off[trade_off["method"] == method].sort_values("value")
+            if sub.empty:
+                continue
+
+            ax_gain.plot(
+                sub["value"].values, sub["gain_pct"].values,
+                color=method_colors[method],
+                marker=method_markers[method],
+                linewidth=2.2, markersize=9,
+                label=method
+            )
+            ax_ratio.plot(
+                sub["value"].values, sub["cost_ratio"].values,
+                color=method_colors[method],
+                marker=method_markers[method],
+                linewidth=2.2, markersize=9,
+                label=method
+            )
+
+        for ax in (ax_gain, ax_ratio):
+            ax.set_xticks(values)
+            ax.set_xticklabels([str(v) for v in values])
+            ax.set_xlabel("Nombre de restarts R", fontsize=11)
+            ax.grid(True, linestyle="--", alpha=0.35)
+            ax.legend(fontsize=10, loc="best")
+
+        ax_gain.set_ylabel("Gain relatif du coût J(x) (%)", fontsize=11)
+        ax_gain.set_title(
+            r"Gain$(R) = (J_1 - J_R)\,/\,J_1 \times 100$",
+            fontsize=12, fontweight="bold"
+        )
+
+        ax_ratio.set_ylabel(r"Ratio de temps $T_R / T_1$", fontsize=11)
+        ax_ratio.set_title(
+            r"CostRatio$(R) = T_R / T_1$",
+            fontsize=12, fontweight="bold"
+        )
+
+        fig.suptitle(
+            f"E9 — Compromis qualité de solution / coût computationnel ({model_name})",
+            fontsize=13, fontweight="bold", y=0.97
+        )
+
+        fname = f"trade_off_{model_name}.png"
+        fig.savefig(str(model_fig_dir / fname), dpi=300)
+        print(f"[INFO] Figure E9/{folder}/{fname} saved.")
+
+    _validate_if_available("E9")
     print("[SUCCESS] Experiment E9 completed.")
 
 
 # ============================================================================
-# E10 - NEURO-SYMBOLIC LLM AUDITING & ALIGNMENT
+# E10 - AUDIT DE FIDELITE NEURO-SYMBOLIQUE
 # ============================================================================
 def run_experiment_E10(verbose=False):
-    """
-    E10 - Auditing of qualitative LLM text summaries vs certified database metrics.
-    """
     e10_csv_dir = config.CSV_DIR / "E10"
     os.makedirs(e10_csv_dir, exist_ok=True)
 
@@ -1988,10 +2186,10 @@ def run_experiment_E10(verbose=False):
             num_restarts = 1 if case["case_id"] == "#20" else config.NUM_RESTARTS
 
             start_t = time.perf_counter()
-            x_bd, history_bd, _, _, best_iter = bdcenn_allocation(
+            x_bd, history_bd, _, n_cci, n_aci, best_sweep = bdcenn_allocation(
                 N, K, W, M=M,
                 num_restarts=num_restarts,
-                max_iter=config.MAX_ITER_BD,
+                max_sweeps=config.MAX_SWEEPS_BD,
                 random_order=True,
                 seed=seed,
                 verbose=False,
@@ -2000,17 +2198,12 @@ def run_experiment_E10(verbose=False):
 
             if history_bd:
                 alloc_init = history_bd[0][2]
-                cost_init = compute_adjacent_cost(alloc_init, W, M) if M is not None else compute_cochannel_cost(alloc_init, W)
+                cost_init = _compute_cost(alloc_init, W, M)
             else:
                 cost_init = 0.0
 
-            if M is None:
-                cost_final = compute_cochannel_cost(x_bd, W)
-                conflicts_final = count_cochannel_conflicts(x_bd, W)
-            else:
-                cost_final = compute_adjacent_cost(x_bd, W, M)
-                conflicts_final = count_adjacent_conflicts(x_bd, W, M)
-
+            cost_final = _compute_cost(x_bd, W, M)
+            n_cci_f, n_aci_f, n_total_f = _compute_all_conflicts(x_bd, W, M)
             used_channels = len(set(x_bd))
 
             np.random.seed(seed)
@@ -2022,9 +2215,15 @@ def run_experiment_E10(verbose=False):
 
             baselines = {}
             for name, x_b, t_b in [("Random", x_rand, 0.0), ("Greedy", x_greedy, 0.0), ("DSATUR", x_dsatur, 0.0)]:
-                c = compute_adjacent_cost(x_b, W, M) if M is not None else compute_cochannel_cost(x_b, W)
-                cf = count_adjacent_conflicts(x_b, W, M) if M is not None else count_cochannel_conflicts(x_b, W)
-                baselines[name] = {"cost": float(c), "conflicts": int(cf), "time": float(t_b)}
+                c = _compute_cost(x_b, W, M)
+                c_cci_b, c_aci_b, _ = _compute_all_conflicts(x_b, W, M)
+                baselines[name] = {
+                    "cost": float(c),
+                    "conflicts_cci": int(c_cci_b),
+                    "conflicts_aci": int(c_aci_b),
+                    "conflicts_total": int(c_cci_b + c_aci_b),
+                    "time": float(t_b)
+                }
 
             conflicting_cells = []
             for i in range(N):
@@ -2065,7 +2264,9 @@ def run_experiment_E10(verbose=False):
                 cell_strength[j] += w
 
             top_cells_idx = np.argsort(-cell_strength)[:10]
-            cell_summary = [{"cell": int(idx), "degree": int(cell_degree[idx]), "strength": int(cell_strength[idx])} for idx in top_cells_idx]
+            cell_summary = [{"cell": int(idx),
+                             "degree": int(cell_degree[idx]),
+                             "strength": int(cell_strength[idx])} for idx in top_cells_idx]
 
             threshold_value = float(inst["threshold"]) if (inst is not None and "threshold" in inst) else 0.0
             topology_meta = {"seed": int(seed), "threshold": threshold_value, "N": int(N), "K": int(K)}
@@ -2075,17 +2276,17 @@ def run_experiment_E10(verbose=False):
             case_data = {
                 "case_id": case["case_id"],
                 "scenario": case["scenario"],
-                "N": N,
-                "K": K,
-                "seed": seed,
+                "N": N, "K": K, "seed": seed,
                 "context": case["context"] + f" [{model_label}]",
                 "model_label": model_label,
                 "metrics": {
                     "cost_initial": float(cost_init),
                     "cost_final": float(cost_final),
-                    "conflicts": int(conflicts_final),
+                    "conflicts": int(n_total_f),
+                    "conflicts_cci": int(n_cci_f),
+                    "conflicts_aci": int(n_aci_f),
                     "time_seconds": float(time_bd),
-                    "iterations": int(best_iter),
+                    "iterations": int(best_sweep),
                     "used_channels": int(used_channels),
                 },
                 "baselines": baselines,
@@ -2143,9 +2344,10 @@ def run_experiment_E10(verbose=False):
                     "Final Accuracy Rate": r["verification_final"]["accuracy_rate"],
                 })
         df_eval = pd.DataFrame(rows)
-        df_eval.to_csv(model_csv_dir / "llm_fidelity_evaluation.csv", index=False, float_format="%.2f")
+        df_eval.to_csv(str(model_csv_dir / "llm_fidelity_evaluation.csv"), index=False, float_format="%.2f")
         print(f"[SUCCESS] CSV E10/{folder}/llm_fidelity_evaluation.csv saved.")
 
+    _validate_if_available("E10")
     print("\n" + "=" * 80)
     print("[SUCCESS] GLOBAL EXPERIMENT E10 COMPLETED.")
     print("=" * 80)
@@ -2155,9 +2357,6 @@ def run_experiment_E10(verbose=False):
 # MASTER ORCHESTRATOR
 # ============================================================================
 def run_all_experiments(verbose=False):
-    """
-    Sequentially launches all project evaluation procedures.
-    """
     print("\n[START] Executing standard analysis pipeline...")
     run_experiment_E1(verbose)
     run_experiment_E2(verbose)
@@ -2170,6 +2369,7 @@ def run_all_experiments(verbose=False):
     run_experiment_E9(verbose)
     run_experiment_E10(verbose)
     print("\n[FINISH] All execution pipelines fully completed.")
+
 
 if __name__ == "__main__":
     run_all_experiments()

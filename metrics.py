@@ -5,93 +5,22 @@ Computes co-channel costs, adjacent-channel interference penalties, conflict cou
 and formal statistical confidence intervals.
 """
 
+import warnings
 import numpy as np
 
 
 # ============================================================================
-# 1. CO-CHANNEL INTERFERENCE METRICS (CCI-ONLY)
-# ============================================================================
-
-def compute_cochannel_cost(x, W):
-    """
-    Computes total penalty violation under the Co-Channel Interference (CCI) model:
-    J_CCI(x) = sum_{i < j, x_i == x_j} W[i, j]
-
-    Args:
-        x (ndarray): Vector of channel assignments (length N).
-        W (ndarray): Symmetric interference weight matrix (N x N).
-
-    Returns:
-        float: Scalar objective cost value.
-    """
-    N = len(x)
-    cost = 0.0
-    for i in range(N):
-        for j in range(i + 1, N):
-            if x[i] == x[j]:
-                cost += W[i, j]
-    return float(cost)
-
-
-def count_cochannel_conflicts(x, W):
-    """
-    Counts the number of active interfering links sharing identical channels.
-
-    Args:
-        x (ndarray): Vector of channel assignments (length N).
-        W (ndarray): Symmetric interference weight matrix (N x N).
-
-    Returns:
-        int: Number of interfering pairs where W[i, j] > 0 and x[i] == x[j].
-    """
-    N = len(x)
-    conflicts = 0
-    for i in range(N):
-        for j in range(i + 1, N):
-            if W[i, j] > 0 and x[i] == x[j]:
-                conflicts += 1
-    return conflicts
-
-
-def compute_metrics_cochannel(x, W):
-    """
-    Aggregates all scalar indicators under the Co-Channel model.
-
-    Args:
-        x (ndarray): Vector of channel assignments.
-        W (ndarray): Interference weight matrix.
-
-    Returns:
-        dict: Summary containing cost, conflicts count, and distinct channels used.
-    """
-    cost = compute_cochannel_cost(x, W)
-    conflicts = count_cochannel_conflicts(x, W)
-    used_channels = len(set(x))
-    return {
-        "cost": cost,
-        "conflicts": conflicts,
-        "used_channels": used_channels,
-    }
-
-
-# ============================================================================
-# 2. ADJACENT CHANNEL INTERFERENCE METRICS (CCI+ACI)
+# 1. MATRICE SPECTRALE M (interférence inter-canaux)
 # ============================================================================
 
 def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
     """
-    Constructs a K x K inter-channel spectral leakage penalty matrix M.
-    M[k, l] = 1.0 if k == l,
-              decay^(|k - l|) if |k - l| <= cutoff,
-              0.0 otherwise.
+    Construit la matrice spectrale M de taille K x K.
 
-    Args:
-        K (int): Total number of available frequency channels.
-        decay (float): Power attenuation factor per channel separation unit.
-        cutoff (int): Maximum channel distance experiencing adjacent leakage.
+    M[k, l] = 1           si k = l
+    M[k, l] = decay^|k-l| si 1 <= |k-l| <= cutoff
+    M[k, l] = 0           si |k-l| > cutoff
 
-    Returns:
-        ndarray: K x K symmetric channel penalty matrix.
     """
     M = np.zeros((K, K), dtype=float)
     for k in range(K):
@@ -106,86 +35,246 @@ def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
     return M
 
 
-def compute_adjacent_cost(x, W, M):
+# ============================================================================
+# 2. FONCTIONS DE COÛT GLOBAL J(x)
+# ============================================================================
+
+def compute_cost_cci(x, W):
     """
-    Computes total penalty violation under the extended CCI+ACI model:
-    J_ACI(x) = sum_{i < j, W[i, j] > 0} W[i, j] * M[x_i, x_j]
+    Calcule le coût global sous le régime CCI-only (Eq. 2).
 
-    Args:
-        x (ndarray): Vector of channel assignments (length N).
-        W (ndarray): Spatial cell weight matrix (N x N).
-        M (ndarray): Channel spectral penalty matrix (K x K).
+    J_CCI(x) = sum_{i<j} W_ij * 1_{x_i = x_j}
 
-    Returns:
-        float: Scalar objective cost accounting for co-channel and adjacent leakage.
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation (canaux attribués).
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+
+    Returns
+    -------
+    cost : float
+        Coût global pondéré.
     """
     N = len(x)
-    energy = 0.0
+    cost = 0.0
+    for i in range(N):
+        for j in range(i + 1, N):
+            if W[i, j] > 0 and x[i] == x[j]:
+                cost += W[i, j]
+    return float(cost)
+
+
+def compute_cost_cci_aci(x, W, M):
+    """
+    Calcule le coût global sous le régime CCI+ACI (Eq. 3).
+
+    J_CCI+ACI(x) = sum_{i<j} W_ij * M_{x_i, x_j}
+
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation.
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+    M : ndarray, shape (K, K)
+        Matrice spectrale d'interférence inter-canaux.
+
+    Returns
+    -------
+    cost : float
+        Coût global pondéré incluant les fuites adjacentes.
+    """
+    N = len(x)
+    cost = 0.0
     for i in range(N):
         for j in range(i + 1, N):
             if W[i, j] > 0:
-                energy += W[i, j] * M[x[i], x[j]]
-    return float(energy)
+                cost += W[i, j] * M[x[i], x[j]]
+    return float(cost)
 
 
-def count_adjacent_conflicts(x, W, M, threshold=0.0):
+# ============================================================================
+# 3. COMPTEURS DE CONFLITS (Eq. 4, 5, 6)
+# ============================================================================
+
+def count_conflicts_cci(x, W):
     """
-    Counts pairs with active physical interference under adjacent channel leakage.
+    Compte les conflits co-canal stricts (Eq. 4).
 
-    Args:
-        x (ndarray): Vector of channel assignments.
-        W (ndarray): Spatial cell weight matrix.
-        M (ndarray): Channel penalty matrix.
-        threshold (float): Minimum penalty threshold to consider as active conflict.
+    C_CCI(x) = #{(i,j) : i < j, W_ij > 0 et x_i = x_j}
 
-    Returns:
-        int: Number of interfering pairs with W[i, j] > 0 and M[x_i, x_j] > threshold.
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation.
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+
+    Returns
+    -------
+    n_cci : int
+        Nombre de paires en conflit co-canal.
     """
     N = len(x)
-    conflicts = 0
+    n_cci = 0
     for i in range(N):
         for j in range(i + 1, N):
-            if W[i, j] > 0 and M[x[i], x[j]] > threshold:
-                conflicts += 1
-    return conflicts
+            if W[i, j] > 0 and x[i] == x[j]:
+                n_cci += 1
+    return n_cci
 
 
-def compute_metrics_adjacent(x, W, M):
+def count_conflicts_aci(x, W, cutoff=2):
     """
-    Aggregates all scalar indicators under the combined CCI+ACI model.
+    Compte les conflits de canal adjacent stricts (Eq. 5).
 
-    Args:
-        x (ndarray): Vector of channel assignments.
-        W (ndarray): Spatial interference weight matrix.
-        M (ndarray): Channel penalty matrix.
+    C_ACI(x) = #{(i,j) : i < j, W_ij > 0 et 0 < |x_i - x_j| <= cutoff}
 
-    Returns:
-        dict: Summary containing adjacent cost, conflict count, and channels used.
+    Ce compteur est mutuellement exclusif avec C_CCI : une paire dont
+    les canaux sont identiques (|x_i - x_j| = 0) n'est PAS comptée ici.
+
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation.
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+    cutoff : int, optionnel
+        Distance spectrale maximale de couplage (défaut 2).
+
+    Returns
+    -------
+    n_aci : int
+        Nombre de paires en conflit de canal adjacent.
     """
-    cost = compute_adjacent_cost(x, W, M)
-    conflicts = count_adjacent_conflicts(x, W, M)
-    used_channels = len(set(x))
+    N = len(x)
+    n_aci = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            if W[i, j] > 0:
+                diff = abs(int(x[i]) - int(x[j]))
+                if 0 < diff <= cutoff:
+                    n_aci += 1
+    return n_aci
+
+
+def count_conflicts_total(x, W, cutoff=2):
+    """
+    Compte le nombre total de conflits (Eq. 6).
+
+    C_total(x) = C_CCI(x) + C_ACI(x)
+
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation.
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+    cutoff : int, optionnel
+        Distance spectrale maximale de couplage (défaut 2).
+
+    Returns
+    -------
+    n_total : int
+        Nombre total de paires en conflit (co-canal + adjacent).
+    """
+    return count_conflicts_cci(x, W) + count_conflicts_aci(x, W, cutoff)
+
+
+# ============================================================================
+# 4. FONCTIONS AGRÉGÉES (dictionnaires de métriques)
+# ============================================================================
+
+def compute_metrics_cci(x, W):
+    """
+    Calcule l'ensemble des métriques sous le régime CCI-only.
+
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation.
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+
+    Returns
+    -------
+    metrics : dict
+        Dictionnaire contenant :
+        - "cost" : float, coût J_CCI(x)
+        - "n_conflicts_cci" : int, nombre de conflits co-canal
+        - "n_conflicts_aci" : int, toujours 0 en régime CCI-only
+        - "n_conflicts_total" : int, égal à n_conflicts_cci
+        - "used_channels" : int, nombre de canaux distincts utilisés
+    """
+    n_cci = count_conflicts_cci(x, W)
     return {
-        "cost": cost,
-        "conflicts": conflicts,
-        "used_channels": used_channels,
+        "cost": compute_cost_cci(x, W),
+        "n_conflicts_cci": n_cci,
+        "n_conflicts_aci": 0,
+        "n_conflicts_total": n_cci,
+        "used_channels": len(set(x)),
+    }
+
+
+def compute_metrics_cci_aci(x, W, M, cutoff=2):
+    """
+    Calcule l'ensemble des métriques sous le régime CCI+ACI.
+
+    Paramètres
+    ----------
+    x : array-like, shape (N,)
+        Vecteur d'allocation.
+    W : ndarray, shape (N, N)
+        Matrice de poids géographiques.
+    M : ndarray, shape (K, K)
+        Matrice spectrale d'interférence inter-canaux.
+    cutoff : int, optionnel
+        Distance spectrale maximale de couplage (défaut 2).
+
+    Returns
+    -------
+    metrics : dict
+        Dictionnaire contenant :
+        - "cost" : float, coût J_CCI+ACI(x)
+        - "n_conflicts_cci" : int, nombre de conflits co-canal
+        - "n_conflicts_aci" : int, nombre de conflits de canal adjacent
+        - "n_conflicts_total" : int, somme des deux
+        - "used_channels" : int, nombre de canaux distincts utilisés
+    """
+    n_cci = count_conflicts_cci(x, W)
+    n_aci = count_conflicts_aci(x, W, cutoff)
+    return {
+        "cost": compute_cost_cci_aci(x, W, M),
+        "n_conflicts_cci": n_cci,
+        "n_conflicts_aci": n_aci,
+        "n_conflicts_total": n_cci + n_aci,
+        "used_channels": len(set(x)),
     }
 
 
 # ============================================================================
-# 3. STATISTICAL FUNCTIONS
+# 5. FONCTIONS STATISTIQUES
 # ============================================================================
 
 def compute_confidence_interval(data, confidence=0.95):
     """
-    Computes parametric confidence interval for an array of experimental observations.
+    Calcule l'intervalle de confiance paramétrique pour un échantillon.
 
-    Args:
-        data (array-like): Sample measurement values.
-        confidence (float): Desired confidence level (default: 0.95).
+    Paramètres
+    ----------
+    data : array-like
+        Échantillon de mesures.
+    confidence : float, optionnel
+        Niveau de confiance (défaut 0.95).
 
-    Returns:
-        tuple: (lower_bound, upper_bound)
+    Returns
+    -------
+    lower : float
+        Borne inférieure de l'intervalle.
+    upper : float
+        Borne supérieure de l'intervalle.
     """
     arr = np.asarray(data, dtype=float)
     n = len(arr)
@@ -198,3 +287,76 @@ def compute_confidence_interval(data, confidence=0.95):
     z_score = 1.96 if confidence == 0.95 else 2.576
     margin = z_score * std_err
     return float(mean_val - margin), float(mean_val + margin)
+
+
+# ============================================================================
+# 6. ALIAS DE RÉTROCOMPATIBILITÉ (dépréciés, Chantier A)
+# ============================================================================
+# Ces wrappers permettent aux modules existants (experiments.py,
+# bdcenn_solver.py, etc.) de continuer à fonctionner pendant la
+# période de transition. Ils émettent un DeprecationWarning discret.
+
+def compute_cochannel_cost(x, W):
+    """
+    Déprécié. Utiliser compute_cost_cci(x, W).
+    """
+    return compute_cost_cci(x, W)
+
+
+def compute_adjacent_cost(x, W, M):
+    """
+    Déprécié. Utiliser compute_cost_cci_aci(x, W, M).
+    """
+    return compute_cost_cci_aci(x, W, M)
+
+
+def count_cochannel_conflicts(x, W):
+    """
+    Déprécié. Utiliser count_conflicts_cci(x, W).
+    """
+    return count_conflicts_cci(x, W)
+
+
+def count_adjacent_conflicts(x, W, M=None, threshold=0.0):
+    """
+    Déprécié. Utiliser count_conflicts_cci, count_conflicts_aci
+    ou count_conflicts_total selon le besoin.
+
+    Cet alias retourne C_total (C_CCI + C_ACI) pour préserver la
+    sémantique de l'ancien comportement (toute paire avec M[x_i,x_j] > 0
+    inclut le co-canal puisque M[k,k] = 1).
+
+    Le paramètre M est ignoré dans le nouveau calcul mais conservé
+    dans la signature pour la compatibilité des appels existants.
+    """
+    warnings.warn(
+        "count_adjacent_conflicts est déprécié. Utilisez count_conflicts_cci, "
+        "count_conflicts_aci ou count_conflicts_total selon le besoin.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return count_conflicts_total(x, W, cutoff=2)
+
+
+def compute_metrics_cochannel(x, W):
+    """
+    Déprécié. Utiliser compute_metrics_cci(x, W).
+    """
+    warnings.warn(
+        "compute_metrics_cochannel est déprécié. Utilisez compute_metrics_cci.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return compute_metrics_cci(x, W)
+
+
+def compute_metrics_adjacent(x, W, M):
+    """
+    Déprécié. Utiliser compute_metrics_cci_aci(x, W, M).
+    """
+    warnings.warn(
+        "compute_metrics_adjacent est déprécié. Utilisez compute_metrics_cci_aci.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return compute_metrics_cci_aci(x, W, M)

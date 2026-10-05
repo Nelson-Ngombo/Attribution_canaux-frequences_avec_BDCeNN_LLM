@@ -9,7 +9,6 @@ from typing import Dict, Optional
 from datetime import datetime
 import uuid
 
-# Use absolute imports to prevent Streamlit hot-reloading context issues
 from data_structures.topology import NetworkTopology
 from data_structures.solver_result import SolverResult
 from data_structures.audit_report import AuditReport
@@ -18,33 +17,36 @@ from data_structures.audit_report import AuditReport
 @dataclass
 class MetricsRecord:
     """
-    Compact scalar metrics for a single (solver, interference_mode) pair.
+    Indicateurs condensés d'exécution pour un couple (solveur, régime).
     """
     solver_name: str
     interference_mode: str
     cost: float
-    n_conflicts: int
+    n_conflicts_cci: int
+    n_conflicts_aci: int
+    n_conflicts_total: int
     used_channels: int
     wall_time_seconds: float
-    n_iterations: int = 0
+    n_sweeps: int = 0
 
     def to_dict(self) -> dict:
         return {
             "solver_name": self.solver_name,
             "interference_mode": self.interference_mode,
             "cost": float(self.cost),
-            "n_conflicts": int(self.n_conflicts),
+            "n_conflicts_cci": int(self.n_conflicts_cci),
+            "n_conflicts_aci": int(self.n_conflicts_aci),
+            "n_conflicts_total": int(self.n_conflicts_total),
             "used_channels": int(self.used_channels),
             "wall_time_seconds": float(self.wall_time_seconds),
-            "n_iterations": int(self.n_iterations),
+            "n_sweeps": int(self.n_sweeps),
         }
 
 
 @dataclass
 class ExperimentRecord:
     """
-    Full experiment result bundle: topology, all solver outcomes,
-    aggregated metrics, and optional LLM audit trail.
+    Enregistrement maître d'une expérience interactive ou batch.
     """
     experiment_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -57,8 +59,7 @@ class ExperimentRecord:
 
     def add_solver_result(self, result: SolverResult) -> None:
         """
-        Registers a SolverResult under the correct (solver_name, mode) slot
-        and derives its MetricsRecord.
+        Inscrit un SolverResult dans le dictionnaire et dérive son MetricsRecord.
         """
         solver_name = result.solver_name
         mode = result.interference_mode
@@ -69,20 +70,22 @@ class ExperimentRecord:
 
         if solver_name not in self.metrics:
             self.metrics[solver_name] = {}
+        
         self.metrics[solver_name][mode] = MetricsRecord(
             solver_name=solver_name,
             interference_mode=mode,
             cost=result.cost,
-            n_conflicts=result.n_conflicts,
+            n_conflicts_cci=result.n_conflicts_cci,
+            n_conflicts_aci=result.n_conflicts_aci,
+            n_conflicts_total=result.n_conflicts_total,
             used_channels=result.used_channels,
             wall_time_seconds=result.wall_time_seconds,
-            n_iterations=result.n_iterations,
+            n_sweeps=result.n_sweeps,
         )
 
     def compute_delta_aci(self, solver_name: str = "BD-CeNN") -> Optional[float]:
         """
-        Computes relative cost increase from CCI-only to CCI+ACI models
-        for a given solver.
+        Calcule le surcoût relatif Delta_ACI entre les deux régimes d'interférence.
         """
         if solver_name not in self.metrics:
             return None
@@ -98,7 +101,7 @@ class ExperimentRecord:
         return delta
 
     def to_dict(self) -> dict:
-        """Serializes the full record to a JSON-compatible dictionary."""
+        """Sérialise en dictionnaire JSON."""
         return {
             "experiment_id": self.experiment_id,
             "timestamp": self.timestamp,

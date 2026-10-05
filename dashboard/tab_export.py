@@ -16,7 +16,6 @@ import json
 import io
 import zipfile
 import numpy as np
-
 import streamlit as st
 
 from dashboard import session_manager as sm
@@ -31,7 +30,6 @@ from dashboard.chart_factory import (
 from dashboard.components import (
     section_title,
     empty_state,
-    info_banner,
     render_scenario_summary,
 )
 from dashboard.pdf_export import generate_llm_pdf
@@ -46,15 +44,93 @@ from export_manager import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Case data reconstruction (mirrors tab_llm_report.py)
-# ---------------------------------------------------------------------------
+def _Figures_for_bundle(record):
+    figures = []
+    try:
+        figures.append(("cost_comparison", create_comparison_bar_chart(record, metric="cost")))
+        figures.append(("conflicts_cci_comparison", create_comparison_bar_chart(record, metric="conflicts_cci")))
+        figures.append(("conflicts_aci_comparison", create_comparison_bar_chart(record, metric="conflicts_aci")))
+        figures.append(("conflicts_total_comparison", create_comparison_bar_chart(record, metric="conflicts_total")))
+        figures.append(("runtime_comparison", create_comparison_bar_chart(record, metric="wall_time_seconds")))
+
+        delta_fig = create_delta_aci_chart(record)
+        if delta_fig is not None:
+            figures.append(("delta_aci", delta_fig))
+
+        bd_results = record.solver_results.get("BD-CeNN", {})
+        for mode, result in bd_results.items():
+            figures.append((f"convergence_{mode}", create_convergence_plot(result, mode)))
+    except Exception as e:
+        toast.warning(f"Echec de preparation de certaines figures : {e}")
+
+    return figures
+
+
+def _generate_llm_pdf_bytes(record, mode: str):
+    response = sm.get(f"llm_response_{mode}")
+    audit = sm.get(f"audit_report_{mode}")
+
+    if not response or response.startswith("[ERREUR"):
+        return None
+
+    case_data = _build_case_data(record, mode)
+    if case_data is None:
+        return None
+
+    try:
+        from llm_assistant import build_prompt, get_active_model
+        prompt = build_prompt(case_data)
+        model_name = get_active_model().replace("models/", "") if get_active_model() else None
+    except Exception:
+        prompt = "(prompt indisponible)"
+        model_name = None
+
+    # Extraction du rapport d'audit au format dictionnaire
+    verification_initial = _audit_to_verification_dict(audit)
+
+    try:
+        pdf_bytes = generate_llm_pdf(
+            case_data=case_data,
+            prompt=prompt,
+            raw_response=response,
+            verification_initial=verification_initial,
+            corrected_response=response,
+            verification_final=verification_initial,
+            output_path=None,
+            model_name=model_name,
+        )
+        return pdf_bytes
+    except Exception as e:
+        toast.error(f"Echec de gènèration du PDF ({MODE_LABELS[mode]}) : {e}")
+        return None
+
+
+def _audit_to_verification_dict(audit) -> dict:
+    if audit is None:
+        return {
+            "all_numbers": [],
+            "allowed_numbers": set(),
+            "valid_numbers": [],
+            "invented_numbers": [],
+            "has_hallucination": False,
+            "accuracy_rate": 100.0,
+        }
+
+    valid = [(v.extracted_value, v.extracted_raw) for v in audit.verifications if v.matched]
+    invented = [(v.extracted_value, v.extracted_raw) for v in audit.verifications if not v.matched]
+    all_numbers = [(v.extracted_value, v.extracted_raw) for v in audit.verifications]
+
+    return {
+        "all_numbers": all_numbers,
+        "allowed_numbers": set(),
+        "valid_numbers": valid,
+        "invented_numbers": invented,
+        "has_hallucination": audit.invented_count > 0,
+        "accuracy_rate": audit.accuracy_rate,
+    }
+
 
 def _build_case_data(record, mode: str) -> dict:
-    """
-    Rebuilds the case_data payload used originally to query the LLM.
-    Required for regenerating the PDF with identical structure to E10.
-    """
     from graph_model import InterferenceGraph
 
     topology = record.topology
@@ -68,7 +144,9 @@ def _build_case_data(record, mode: str) -> dict:
         if bres:
             baselines[name] = {
                 "cost": float(bres.cost),
-                "conflicts": int(bres.n_conflicts),
+                "conflicts_cci": int(bres.n_conflicts_cci),
+                "conflicts_aci": int(bres.n_conflicts_aci),
+                "conflicts_total": int(bres.n_conflicts_total),
                 "time": float(bres.wall_time_seconds),
             }
 
@@ -112,8 +190,7 @@ def _build_case_data(record, mode: str) -> dict:
         cell_strength[j] += w
     top_idx = np.argsort(-cell_strength)[:10]
     cell_summary = [
-        {"cell": int(idx), "degree": int(cell_degree[idx]),
-         "strength": int(cell_strength[idx])}
+        {"cell": int(idx), "degree": int(cell_degree[idx]), "strength": int(cell_strength[idx])}
         for idx in top_idx
     ]
 
@@ -137,9 +214,11 @@ def _build_case_data(record, mode: str) -> dict:
         "metrics": {
             "cost_initial": float(cost_init),
             "cost_final": float(bd_result.cost),
-            "conflicts": int(bd_result.n_conflicts),
+            "conflicts": int(bd_result.n_conflicts_total),
+            "conflicts_cci": int(bd_result.n_conflicts_cci),
+            "conflicts_aci": int(bd_result.n_conflicts_aci),
             "time_seconds": float(bd_result.wall_time_seconds),
-            "iterations": int(bd_result.best_iteration),
+            "iterations": int(bd_result.n_sweeps),
             "used_channels": int(bd_result.used_channels),
         },
         "baselines": baselines,
@@ -153,113 +232,8 @@ def _build_case_data(record, mode: str) -> dict:
     }
 
 
-def _generate_llm_pdf_bytes(record, mode: str):
-    """
-    Generates the LLM PDF for a given mode.
-    Returns bytes if successful, None otherwise.
-    """
-    response = sm.get(f"llm_response_{mode}")
-    audit = sm.get(f"audit_report_{mode}")
-
-    if not response or response.startswith("[ERREUR"):
-        return None
-
-    case_data = _build_case_data(record, mode)
-    if case_data is None:
-        return None
-
-    # Rebuild prompt exactly as it was sent
-    try:
-        from llm_assistant import build_prompt, get_active_model
-        prompt = build_prompt(case_data)
-        model_name = get_active_model().replace("models/", "") if get_active_model() else None
-    except Exception:
-        prompt = "(prompt indisponible)"
-        model_name = None
-
-    # Build verification dict from AuditReport
-    verification_initial = _audit_to_verification_dict(audit)
-    verification_final = verification_initial  # No re-correction here
-    corrected_response = response
-
-    try:
-        pdf_bytes = generate_llm_pdf(
-            case_data=case_data,
-            prompt=prompt,
-            raw_response=response,
-            verification_initial=verification_initial,
-            corrected_response=corrected_response,
-            verification_final=verification_final,
-            output_path=None,
-            model_name=model_name,
-        )
-        return pdf_bytes
-    except Exception as e:
-        toast.error(f"Erreur generation PDF {MODE_LABELS[mode]}: {e}")
-        return None
-
-
-def _audit_to_verification_dict(audit) -> dict:
-    """Converts an AuditReport dataclass into the dict format expected by generate_llm_pdf."""
-    if audit is None:
-        return {
-            "all_numbers": [],
-            "allowed_numbers": set(),
-            "valid_numbers": [],
-            "invented_numbers": [],
-            "has_hallucination": False,
-            "accuracy_rate": 100.0,
-        }
-
-    valid = [(v.extracted_value, v.extracted_raw) for v in audit.verifications if v.matched]
-    invented = [(v.extracted_value, v.extracted_raw) for v in audit.verifications if not v.matched]
-    all_numbers = [(v.extracted_value, v.extracted_raw) for v in audit.verifications]
-
-    return {
-        "all_numbers": all_numbers,
-        "allowed_numbers": set(),
-        "valid_numbers": valid,
-        "invented_numbers": invented,
-        "has_hallucination": audit.invented_count > 0,
-        "accuracy_rate": audit.accuracy_rate,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Figures collection (for ZIP)
-# ---------------------------------------------------------------------------
-
-def _figures_for_bundle(record):
-    """Collects Plotly figures to embed in the ZIP bundle as HTML."""
-    figures = []
-    try:
-        figures.append(("cost_comparison",
-                        create_comparison_bar_chart(record, metric="cost")))
-        figures.append(("conflicts_comparison",
-                        create_comparison_bar_chart(record, metric="n_conflicts")))
-        figures.append(("runtime_comparison",
-                        create_comparison_bar_chart(record, metric="wall_time_seconds")))
-
-        delta_fig = create_delta_aci_chart(record)
-        if delta_fig is not None:
-            figures.append(("delta_aci", delta_fig))
-
-        bd_results = record.solver_results.get("BD-CeNN", {})
-        for mode, result in bd_results.items():
-            figures.append((f"convergence_{mode}",
-                            create_convergence_plot(result, mode)))
-    except Exception as e:
-        toast.warning(f"Certaines figures n'ont pas pu etre generees: {e}")
-
-    return figures
-
-
-# ---------------------------------------------------------------------------
-# MAIN RENDERER
-# ---------------------------------------------------------------------------
-
 def render():
-    """Main tab entrypoint."""
+    """Point d'entree de l'onglet."""
     st.header("Exportation des resultats")
 
     record = sm.get("experiment_record")
@@ -267,17 +241,13 @@ def render():
         empty_state(
             icon_text="[+]",
             title="Aucun resultat a exporter",
-            description=(
-                "Lancez d'abord une simulation dans l'onglet 'Convergence' "
-                "pour produire des resultats exportables."
-            ),
+            description="Lancez d'abord la simulation dans l'onglet 'Convergence'.",
         )
         return
 
     st.caption(
-        "Telechargez les resultats dans plusieurs formats. Les fichiers sont "
-        "egalement sauvegardes automatiquement dans "
-        "`outputs/interactive_runs/{cochannel|adjacent}/` a la fin de chaque simulation."
+        "Ce module centralise les fonctions de téléchargement de l'experience courante. "
+        "Les formats respectent scrupuleusement le decoupage CCI et ACI."
     )
 
     topology = sm.get("topology")
@@ -286,30 +256,20 @@ def render():
 
     st.divider()
 
-    # ------------------------------------------------------------------
-    # Preview table (kept for context)
-    # ------------------------------------------------------------------
-    section_title("Apercu du tableau des metriques")
+    # 1. Aperçu
+    section_title("Tableau recapitulatif de controle")
     try:
         df = build_metrics_dataframe(record)
         st.dataframe(df, use_container_width=True, height=300)
     except Exception as e:
-        toast.error(f"Erreur d'affichage du tableau: {e}")
+        toast.error(f"Echec d'affichage du tableau : {e}")
         return
 
     st.divider()
 
-    # ------------------------------------------------------------------
-    # Individual downloads
-    # ------------------------------------------------------------------
+    # 2. Téléchargements individuels
     section_title("Telechargements individuels")
 
-    st.caption(
-        "Formats disponibles : CSV des metriques (combine ou par mode), "
-        "JSON complet du run, rapports LLM (texte et PDF audit format E10), audit JSON."
-    )
-
-    # Row 1: JSON, CSV combined, CSV CCI-only
     dl_col1, dl_col2, dl_col3 = st.columns(3)
 
     with dl_col1:
@@ -325,7 +285,6 @@ def render():
             )
         except Exception as e:
             st.button("JSON complet", disabled=True, use_container_width=True)
-            st.caption(f"Erreur: {e}")
 
     with dl_col2:
         try:
@@ -353,10 +312,8 @@ def render():
                 key="dl_csv_cci",
             )
         else:
-            st.button("CSV metriques (CCI-only)", disabled=True, use_container_width=True,
-                      help="Aucun resultat en mode CCI-only")
+            st.button("CSV metriques (CCI-only)", disabled=True, use_container_width=True)
 
-    # Row 2: CSV CCI+ACI, LLM TXT, Audit JSON
     dl_col4, dl_col5, dl_col6 = st.columns(3)
 
     with dl_col4:
@@ -371,8 +328,7 @@ def render():
                 key="dl_csv_aci",
             )
         else:
-            st.button("CSV metriques (CCI+ACI)", disabled=True, use_container_width=True,
-                      help="Aucun resultat en mode CCI+ACI")
+            st.button("CSV metriques (CCI+ACI)", disabled=True, use_container_width=True)
 
     with dl_col5:
         llm_cci = sm.get("llm_response_cci")
@@ -392,8 +348,7 @@ def render():
                 key="dl_llm_txt",
             )
         else:
-            st.button("Rapport LLM (TXT)", disabled=True, use_container_width=True,
-                      help="Generez d'abord un rapport LLM dans l'onglet Rapport LLM")
+            st.button("Rapport LLM (TXT)", disabled=True, use_container_width=True)
 
     with dl_col6:
         audit_cci = sm.get("audit_report_cci")
@@ -414,15 +369,13 @@ def render():
                 key="dl_audit_json",
             )
         else:
-            st.button("Audit (JSON)", disabled=True, use_container_width=True,
-                      help="Generez d'abord un rapport LLM avec audit")
+            st.button("Audit (JSON)", disabled=True, use_container_width=True)
 
-    # Row 3: LLM PDF audits (one per mode, format E10)
+    # 3. Rapports PDF LLM d'Audit (Style E10, Chantier B+C)
     st.markdown("")
     st.caption(
-        "**Rapports PDF LLM** (format identique a l'experience E10) : "
-        "prompt envoye, reponse brute, audit numerique automatique, "
-        "reponse corrigee si hallucination detectee, badge de certification."
+        "**Rapports d'Audit PDF formatte (Style E10)** : intègre les questions du prompt, "
+        "la rēponse brute, le badge d'audit du vèrifieur et les corrections le cas echeant."
     )
 
     dl_col7, dl_col8 = st.columns(2)
@@ -430,140 +383,120 @@ def render():
     with dl_col7:
         llm_cci = sm.get("llm_response_cci")
         if llm_cci and not llm_cci.startswith("[ERREUR"):
-            if st.button(
-                "Generer rapport PDF (CCI-only)",
-                use_container_width=True,
-                key="btn_gen_pdf_cci",
-            ):
-                with st.spinner("Generation du PDF CCI-only..."):
+            if st.button("Generer PDF d'Audit (CCI-only)", use_container_width=True, key="btn_gen_pdf_cci"):
+                with st.spinner("Generation en cours..."):
                     pdf_bytes = _generate_llm_pdf_bytes(record, "cci")
                 if pdf_bytes is not None:
                     st.session_state["_pdf_cci_bytes"] = pdf_bytes
-                    toast.success("PDF CCI-only pret")
+                    toast.success("Rapport PDF CCI-only genere.")
                 else:
-                    toast.error("Echec de la generation")
+                    toast.error("Echec de la gènèration.")
 
             pdf_cci_bytes = st.session_state.get("_pdf_cci_bytes")
             if pdf_cci_bytes:
                 st.download_button(
-                    label="Telecharger PDF (CCI-only)",
+                    label="Telecharger l'Audit PDF (CCI-only)",
                     data=pdf_cci_bytes,
-                    file_name=f"rapport_llm_{record.experiment_id}_cci.pdf",
+                    file_name=f"rapport_audit_llm_{record.experiment_id}_cci.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                     key="dl_pdf_cci",
                 )
         else:
-            st.button("Generer rapport PDF (CCI-only)", disabled=True, use_container_width=True,
-                      help="Aucun rapport LLM CCI-only disponible")
+            st.button("Generer PDF d'Audit (CCI-only)", disabled=True, use_container_width=True)
 
     with dl_col8:
         llm_aci = sm.get("llm_response_cci_aci")
         if llm_aci and not llm_aci.startswith("[ERREUR"):
-            if st.button(
-                "Generer rapport PDF (CCI+ACI)",
-                use_container_width=True,
-                key="btn_gen_pdf_aci",
-            ):
-                with st.spinner("Generation du PDF CCI+ACI..."):
+            if st.button("Generer PDF d'Audit (CCI+ACI)", use_container_width=True, key="btn_gen_pdf_aci"):
+                with st.spinner("Generation en cours..."):
                     pdf_bytes = _generate_llm_pdf_bytes(record, "cci_aci")
                 if pdf_bytes is not None:
                     st.session_state["_pdf_aci_bytes"] = pdf_bytes
-                    toast.success("PDF CCI+ACI pret")
+                    toast.success("Rapport PDF CCI+ACI genere.")
                 else:
-                    toast.error("Echec de la generation")
+                    toast.error("Echec de la gènèration.")
 
             pdf_aci_bytes = st.session_state.get("_pdf_aci_bytes")
             if pdf_aci_bytes:
                 st.download_button(
-                    label="Telecharger PDF (CCI+ACI)",
+                    label="Telecharger l'Audit PDF (CCI+ACI)",
                     data=pdf_aci_bytes,
-                    file_name=f"rapport_llm_{record.experiment_id}_cci_aci.pdf",
+                    file_name=f"rapport_audit_llm_{record.experiment_id}_cci_aci.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                     key="dl_pdf_aci",
                 )
         else:
-            st.button("Generer rapport PDF (CCI+ACI)", disabled=True, use_container_width=True,
-                      help="Aucun rapport LLM CCI+ACI disponible")
+            st.button("Generer PDF d'Audit (CCI+ACI)", disabled=True, use_container_width=True)
 
     st.divider()
 
-    # ------------------------------------------------------------------
-    # Complete ZIP bundle
-    # ------------------------------------------------------------------
-    section_title("Archive complete (ZIP)")
+    # 4. ZIP Bundle complet
+    section_title("Archive ZIP de synthese")
 
     st.caption(
-        "Regroupe tous les artefacts dans une archive unique : JSON, CSVs par mode, "
-        "trajectoires de convergence, rapports LLM (TXT), audit JSON, figures HTML "
-        "interactives, et PDF LLM au format E10 pour chaque mode."
+        "Assemble tous les livrables du run au sein d'une seule archive compresse."
     )
 
     include_llm = st.checkbox(
-        "Inclure les rapports LLM (TXT + PDF)",
+        "Inclure les rapports d'Audit et texte du LLM",
         value=sm.get("export_include_llm", True),
         key="chk_bundle_llm",
     )
     include_figs = st.checkbox(
-        "Inclure les figures HTML interactives",
+        "Inclure les graphes de synthese HTML interactifs",
         value=sm.get("export_include_figures", True),
         key="chk_bundle_figs",
     )
     sm.set_value("export_include_llm", include_llm)
     sm.set_value("export_include_figures", include_figs)
 
-    if st.button("Preparer l'archive ZIP", type="primary", key="btn_prepare_zip"):
-        with st.spinner("Construction de l'archive..."):
+    if st.button("Compiler l'archive ZIP", type="primary", key="btn_prepare_zip"):
+        with st.spinner("Compression des donnees..."):
             try:
-                figures = _figures_for_bundle(record) if include_figs else None
+                figures = _Figures_for_bundle(record) if include_figs else None
                 zip_bytes = build_zip_bundle(
                     record,
                     figures=figures,
                     include_llm_report=include_llm,
                 )
 
-                # Append LLM PDFs to ZIP
                 if include_llm:
                     buffer = io.BytesIO(zip_bytes)
                     with zipfile.ZipFile(buffer, "a", zipfile.ZIP_DEFLATED) as zf:
                         for mode_key in ["cci", "cci_aci"]:
                             pdf_bytes = _generate_llm_pdf_bytes(record, mode_key)
                             if pdf_bytes is not None:
-                                fname = f"rapport_llm_{mode_key}.pdf"
-                                zf.writestr(fname, pdf_bytes)
+                                zf.writestr(f"rapport_audit_llm_{mode_key}.pdf", pdf_bytes)
                     buffer.seek(0)
                     zip_bytes = buffer.getvalue()
 
                 st.download_button(
-                    label="Telecharger l'archive ZIP",
+                    label="Telecharger le ZIP de synthese",
                     data=zip_bytes,
-                    file_name=f"experiment_{record.experiment_id}_bundle.zip",
+                    file_name=f"run_bundle_{record.experiment_id}.zip",
                     mime="application/zip",
                     use_container_width=True,
                     key="dl_zip_final",
                 )
-                toast.success("Archive prete pour telechargement")
+                toast.success("L'archive ZIP est prete.")
             except Exception as e:
                 import traceback
-                toast.error(f"Erreur de construction: {e}")
-                with st.expander("Traceback"):
+                toast.error(f"Echec de compilation ZIP : {e}")
+                with st.expander("Details techniques"):
                     st.code(traceback.format_exc())
 
     st.divider()
 
-    # ------------------------------------------------------------------
-    # Save to disk
-    # ------------------------------------------------------------------
-    section_title("Sauvegarde manuelle vers le disque")
+    # 5. Sauvegarde disque manuelle
+    section_title("Ecrire la session sur le stockage physique")
 
     st.caption(
-        "Persiste tous les artefacts dans `results/dashboard_runs/` avec "
-        "separation stricte cochannel / adjacent. Cette action est distincte "
-        "de la sauvegarde automatique qui se produit apres chaque simulation."
+        "Exporte et classe la session dans l'arborescence `results/dashboard_runs/`."
     )
 
-    if st.button("Sauvegarder tout sur disque", key="btn_save_disk"):
+    if st.button("Sauvegarder la session", key="btn_save_disk"):
         try:
             saved_paths = []
 
@@ -596,15 +529,14 @@ def render():
                     )
                     saved_paths.append(str(audit_path))
 
-                # Save PDF audit for this mode
                 pdf_bytes = _generate_llm_pdf_bytes(record, mode)
                 if pdf_bytes is not None:
                     dirs = get_output_dirs(mode)
-                    pdf_path = dirs["reports"] / f"rapport_llm_{record.experiment_id}_{mode}.pdf"
+                    pdf_path = dirs["reports"] / f"rapport_audit_llm_{record.experiment_id}_{mode}.pdf"
                     pdf_path.write_bytes(pdf_bytes)
                     saved_paths.append(str(pdf_path))
 
-            figures = _figures_for_bundle(record)
+            figures = _Figures_for_bundle(record)
             for fname, fig in figures:
                 mode_key = "cci_aci" if "cci_aci" in fname else "cci"
                 dirs = get_output_dirs(mode_key)
@@ -612,14 +544,14 @@ def render():
                 export_figure_html(fig, fig_path)
                 saved_paths.append(str(fig_path))
 
-            toast.success(f"{len(saved_paths)} fichiers sauvegardes sur disque")
+            toast.success(f"Session archivee : {len(saved_paths)} fichiers ecrits.")
 
-            with st.expander("Chemins des fichiers sauvegardes"):
+            with st.expander("Consulter les chemins de sauvegarde"):
                 for p in saved_paths:
                     st.code(p)
 
         except Exception as e:
             import traceback
-            toast.error(f"Echec de la sauvegarde: {e}")
-            with st.expander("Traceback"):
+            toast.error(f"Echec d'ecriture sur le disque : {e}")
+            with st.expander("Details techniques"):
                 st.code(traceback.format_exc())

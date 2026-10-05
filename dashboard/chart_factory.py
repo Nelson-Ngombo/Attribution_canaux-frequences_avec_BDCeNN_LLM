@@ -8,12 +8,14 @@ All figures include transition_duration for smooth animations on data updates.
 from typing import Dict, List, Optional
 import numpy as np
 import plotly.graph_objects as go
+import pandas as pd
 
-from data_structures import ExperimentRecord, SolverResult
+from data_structures.solver_result import SolverResult
+from data_structures.experiment_record import ExperimentRecord
 
 
 # ============================================================================
-# COLOR MAPS (aligned with dashboard/theme.py)
+# CHART COLOR PALETTES
 # ============================================================================
 
 SOLVER_COLORS = {
@@ -23,9 +25,10 @@ SOLVER_COLORS = {
     "BD-CeNN": "#c0392b",
 }
 
+# Couleurs sémantiques par régime (Chantier A)
 MODE_COLORS = {
-    "cci": "#3b82f6",
-    "cci_aci": "#ef4444",
+    "cci": "#3b82f6",      # Bleu pour CCI-only
+    "cci_aci": "#ef4444",  # Rouge pour CCI+ACI
 }
 
 MODE_LABELS = {
@@ -35,29 +38,39 @@ MODE_LABELS = {
 
 
 # ============================================================================
-# CONVERGENCE CURVES (forward-filled)
+# 1. COURBES DE CONVERGENCE (BD-CeNN)
 # ============================================================================
 
 def create_convergence_plot(bd_result: SolverResult, mode: str) -> go.Figure:
     """
-    Renders the BD-CeNN convergence trajectory with forward fill.
-    Displays a monotone non-increasing best-so-far curve.
+    Génère la trajectoire d'optimisation lissée (best-so-far) en sweeps (Chantier D).
+
+    Parameters
+    ----------
+    bd_result : SolverResult
+        Résultat de l'exécution du solveur BD-CeNN.
+    mode : str
+        Régime d'interférence ("cci" ou "cci_aci").
+
+    Returns
+    -------
+    fig : go.Figure
     """
     curve = bd_result.energy_curve_forward_filled() if bd_result else []
-    iterations = list(range(len(curve)))
+    sweeps_axis = list(range(len(curve)))
     color = MODE_COLORS.get(mode, "#666666")
 
     fig = go.Figure()
 
     if curve:
         fig.add_trace(go.Scatter(
-            x=iterations,
+            x=sweeps_axis,
             y=curve,
             mode="lines+markers",
             line=dict(color=color, width=2.5, shape="hv"),
             marker=dict(size=5),
             name="J(x) best-so-far",
-            hovertemplate="Iteration %{x}<br>Cout: %{y:.4f}<extra></extra>",
+            hovertemplate="Sweep %{x}<br>Cout: %{y:.4f}<extra></extra>",
         ))
         fig.add_annotation(
             x=len(curve) - 1,
@@ -73,11 +86,11 @@ def create_convergence_plot(bd_result: SolverResult, mode: str) -> go.Figure:
 
     fig.update_layout(
         title=dict(
-            text=f"Convergence BD-CeNN ({MODE_LABELS.get(mode, mode)})",
+            text=f"Courbe de convergence de l'energie ({MODE_LABELS.get(mode, mode)})",
             x=0.5, font=dict(size=13),
         ),
-        xaxis_title="Iteration globale (tous redemarrages)",
-        yaxis_title="Cout J(x)",
+        xaxis_title="Indice de balayage global (sweeps cumulatifs)",
+        yaxis_title="Energie globale J(x)",
         hovermode="x unified",
         plot_bgcolor="white",
         height=450,
@@ -94,7 +107,8 @@ def create_dual_convergence_plot(
     bd_cci_aci: Optional[SolverResult],
 ) -> go.Figure:
     """
-    Overlays both CCI-only and CCI+ACI convergence curves.
+    Superpose les trajectoires de convergence des deux régimes (CCI vs CCI+ACI)
+    sur le même graphique (Chantier D).
     """
     fig = go.Figure()
 
@@ -111,7 +125,7 @@ def create_dual_convergence_plot(
             line=dict(color=MODE_COLORS[mode], width=2.5, shape="hv"),
             marker=dict(size=4),
             name=MODE_LABELS[mode],
-            hovertemplate=f"{MODE_LABELS[mode]}<br>Iter %{{x}}<br>Cout %{{y:.4f}}<extra></extra>",
+            hovertemplate=f"{MODE_LABELS[mode]}<br>Sweep %{{x}}<br>Cout %{{y:.4f}}<extra></extra>",
         ))
 
     fig.update_layout(
@@ -119,8 +133,8 @@ def create_dual_convergence_plot(
             text="Convergence BD-CeNN : CCI-only vs CCI+ACI",
             x=0.5, font=dict(size=13),
         ),
-        xaxis_title="Iteration globale",
-        yaxis_title="Cout J(x) (best-so-far)",
+        xaxis_title="Indice de balayage global (sweeps)",
+        yaxis_title="Energie globale J(x)",
         hovermode="x unified",
         plot_bgcolor="white",
         height=450,
@@ -134,7 +148,7 @@ def create_dual_convergence_plot(
 
 
 # ============================================================================
-# COMPARISON BAR CHARTS
+# 2. COMPARATEURS HISTOGRAMMES (BAR CHARTS GROUPÉS)
 # ============================================================================
 
 def create_comparison_bar_chart(
@@ -142,13 +156,19 @@ def create_comparison_bar_chart(
     metric: str = "cost",
 ) -> go.Figure:
     """
-    Grouped bar chart comparing solvers across CCI-only and CCI+ACI.
+    Génère un histogramme groupé comparant les solveurs sur une mètric donnée.
+
+    Chantier A : Prise en compte de conflicts_cci, conflicts_aci et conflicts_total.
+    Chantier D : Remplacement de wall_time par n_sweeps.
     """
     metric_labels = {
         "cost": "Cout J(x)",
-        "n_conflicts": "Nombre de conflits",
+        "conflicts_cci": "Conflits co-canal C_CCI",
+        "conflicts_aci": "Conflits adjacents C_ACI",
+        "conflicts_total": "Conflits totaux C_total",
         "used_channels": "Canaux utilises",
-        "wall_time_seconds": "Temps d'execution (s)",
+        "wall_time_seconds": "Temps de calcul t_exec (s)",
+        "n_sweeps": "Nombre de balayages (sweeps)",
     }
     ylabel = metric_labels.get(metric, metric)
 
@@ -156,29 +176,36 @@ def create_comparison_bar_chart(
     modes = ["cci", "cci_aci"]
 
     fig = go.Figure()
-
     any_data = False
+
     for mode in modes:
         values = []
         for solver in solvers:
-            if (solver in record.metrics
-                    and mode in record.metrics[solver]):
+            if solver in record.metrics and mode in record.metrics[solver]:
                 mr = record.metrics[solver][mode]
-                val = getattr(mr, metric, None)
+                # Mapping dynamique des clés internes vers les variables SolverResult (Chantier A & D)
+                if metric == "conflicts_cci":
+                    val = getattr(mr, "n_conflicts_cci", 0)
+                elif metric == "conflicts_aci":
+                    val = getattr(mr, "n_conflicts_aci", 0)
+                elif metric == "conflicts_total":
+                    val = getattr(mr, "n_conflicts_total", 0)
+                elif metric == "n_sweeps":
+                    val = getattr(mr, "n_sweeps", 0)
+                else:
+                    val = getattr(mr, metric, 0)
                 values.append(val if val is not None else 0)
                 any_data = True
             else:
                 values.append(0)
 
-        # Skip empty trace if all zero and mode never appeared
-        mode_present_at_all = any(
-            mode in record.metrics.get(s, {}) for s in solvers
-        )
-        if not mode_present_at_all:
+        # On n'affiche la barre que si le mode d'interférence a produit des métriques
+        mode_present = any(mode in record.metrics.get(s, {}) for s in solvers)
+        if not mode_present:
             continue
 
         text_labels = [
-            f"{v:.2f}" if isinstance(v, float) else str(v)
+            f"{v:.2f}" if isinstance(v, float) and metric in ["cost", "wall_time_seconds"] else str(int(v)) if isinstance(v, (int, float)) else str(v)
             for v in values
         ]
 
@@ -211,7 +238,7 @@ def create_comparison_bar_chart(
 
     if not any_data:
         fig.add_annotation(
-            text="Aucune donnee disponible",
+            text="Aucun resultat disponible pour generer l'analyse comparative.",
             x=0.5, y=0.5, xref="paper", yref="paper",
             showarrow=False, font=dict(size=14, color="#888888"),
         )
@@ -220,13 +247,12 @@ def create_comparison_bar_chart(
 
 
 # ============================================================================
-# DELTA_ACI VISUALIZATION
+# 3. COMPARAISON DE SENSIBILITÉ SPECTRE (DELTA_ACI)
 # ============================================================================
 
 def create_delta_aci_chart(record: ExperimentRecord) -> Optional[go.Figure]:
     """
-    Bar chart of Delta_ACI (%) per solver.
-    Returns None if neither mode is available for any solver.
+    Génère la métrique Delta_ACI (%) de surcoût entre les deux régimes.
     """
     solvers = ["Random", "Greedy", "DSATUR", "BD-CeNN"]
     deltas = []
@@ -261,7 +287,7 @@ def create_delta_aci_chart(record: ExperimentRecord) -> Optional[go.Figure]:
 
     fig.update_layout(
         title=dict(
-            text="Delta_ACI : augmentation relative du cout de CCI-only vers CCI+ACI",
+            text="Delta_ACI : degradation du cout en regime adjacent",
             x=0.5, font=dict(size=13),
         ),
         xaxis_title="Solveur",
@@ -277,17 +303,22 @@ def create_delta_aci_chart(record: ExperimentRecord) -> Optional[go.Figure]:
 
 
 # ============================================================================
-# RADAR CHART
+# 4. DIAGRAMME RADAR (MULTI-METRIC PROFILES)
 # ============================================================================
 
 def create_radar_chart(record: ExperimentRecord, mode: str) -> Optional[go.Figure]:
     """
-    Normalized radar chart for a given mode.
-    Higher radar value = better performance.
+    Rend le radar multi-métriques normalisé pour un régime donné.
+
+    Chantiers rattachés :
+        - Chantier A : Inclusion des compteurs séparés (C_CCI, C_ACI).
+        - Chantier D : Intégration de n_sweeps à la place des itérations.
     """
     solvers = ["Random", "Greedy", "DSATUR", "BD-CeNN"]
-    metrics_keys = ["cost", "n_conflicts", "wall_time_seconds", "used_channels"]
-    metrics_labels = ["Cout", "Conflits", "Temps", "Canaux"]
+    
+    # Axes du radar (Chantiers A & D)
+    metrics_keys = ["cost", "n_conflicts_cci", "n_conflicts_aci", "wall_time_seconds", "n_sweeps"]
+    metrics_labels = ["Cout", "Conflits CCI", "Conflits ACI", "Temps calcul", "Sweeps"]
 
     matrix = []
     valid_solvers = []
@@ -297,7 +328,13 @@ def create_radar_chart(record: ExperimentRecord, mode: str) -> Optional[go.Figur
             continue
         mr = modes_dict[mode]
         try:
-            row = [float(getattr(mr, k, 0) or 0) for k in metrics_keys]
+            row = [
+                float(getattr(mr, "cost", 0) or 0),
+                float(getattr(mr, "n_conflicts_cci", 0) or 0),
+                float(getattr(mr, "n_conflicts_aci", 0) or 0),
+                float(getattr(mr, "wall_time_seconds", 0) or 0),
+                float(getattr(mr, "n_sweeps", 0) or 0)
+            ]
         except Exception:
             continue
         matrix.append(row)
@@ -308,6 +345,7 @@ def create_radar_chart(record: ExperimentRecord, mode: str) -> Optional[go.Figur
 
     matrix = np.array(matrix, dtype=float)
 
+    # Normalisation : convertit en échelle d'efficacité [0, 1] où 1 est le meilleur
     normalized = np.zeros_like(matrix)
     for j in range(matrix.shape[1]):
         col = matrix[:, j]
@@ -315,12 +353,13 @@ def create_radar_chart(record: ExperimentRecord, mode: str) -> Optional[go.Figur
         if col_max - col_min < 1e-9:
             normalized[:, j] = 1.0
         else:
+            # Toutes ces métriques sont à minimiser -> on inverse
             normalized[:, j] = 1.0 - (col - col_min) / (col_max - col_min)
 
     fig = go.Figure()
     for i, solver in enumerate(valid_solvers):
         values = normalized[i].tolist()
-        values.append(values[0])
+        values.append(values[0])  # Fermeture du polygone
         labels_closed = metrics_labels + [metrics_labels[0]]
         fig.add_trace(go.Scatterpolar(
             r=values,
@@ -333,7 +372,7 @@ def create_radar_chart(record: ExperimentRecord, mode: str) -> Optional[go.Figur
 
     fig.update_layout(
         title=dict(
-            text=f"Profil multi-metriques ({MODE_LABELS.get(mode, mode)}) - plus grand = meilleur",
+            text=f"Empreinte comportementale ({MODE_LABELS.get(mode, mode)})",
             x=0.5, font=dict(size=13),
         ),
         polar=dict(
@@ -349,21 +388,21 @@ def create_radar_chart(record: ExperimentRecord, mode: str) -> Optional[go.Figur
 
 
 # ============================================================================
-# HEATMAP W
+# 5. HEATMAP DE COUPLAGE GÉOGRAPHIQUE W
 # ============================================================================
 
 def create_weight_matrix_heatmap(W: np.ndarray) -> go.Figure:
-    """Interactive heatmap of the interference weight matrix."""
+    """Rend la carte thermique d'intensité W."""
     fig = go.Figure(data=go.Heatmap(
         z=W,
         colorscale="Reds",
         zmin=0,
         zmax=max(4, float(W.max()) if W.size > 0 else 4),
-        hovertemplate="Cellule i: %{y}<br>Cellule j: %{x}<br>W[i,j] = %{z}<extra></extra>",
+        hovertemplate="Cellule i: %{y}<br>Cellule j: %{x}<br>W_ij = %{z}<extra></extra>",
         colorbar=dict(title="Poids"),
     ))
     fig.update_layout(
-        title=dict(text="Matrice d'interference W", x=0.5, font=dict(size=13)),
+        title=dict(text="Intensite des couplages geographiques W_ij", x=0.5, font=dict(size=13)),
         xaxis_title="Cellule j",
         yaxis_title="Cellule i",
         height=500,
@@ -375,14 +414,13 @@ def create_weight_matrix_heatmap(W: np.ndarray) -> go.Figure:
 
 
 # ============================================================================
-# METRICS DATAFRAME
+# 6. EXPORT DE DATAFRAME FLATTENED (Chantiers A + D)
 # ============================================================================
 
 def build_metrics_dataframe(record: ExperimentRecord):
     """
-    Flattens metrics into a pandas DataFrame ready for display.
+    Rend la table condensée pour l'onglet de comparaison.
     """
-    import pandas as pd
     rows = []
     for solver_name, modes in record.metrics.items():
         for mode, mr in modes.items():
@@ -390,14 +428,17 @@ def build_metrics_dataframe(record: ExperimentRecord):
                 "Solveur": solver_name,
                 "Mode": MODE_LABELS.get(mode, mode),
                 "Cout J(x)": round(mr.cost, 4),
-                "Conflits": mr.n_conflicts,
-                "Canaux utilises": mr.used_channels,
-                "Temps (s)": round(mr.wall_time_seconds, 4),
-                "Iterations": mr.n_iterations,
+                "Conflits CCI (C_CCI)": int(mr.n_conflicts_cci),
+                "Conflits ACI (C_ACI)": int(mr.n_conflicts_aci),
+                "Conflits Totaux (C_total)": int(mr.n_conflicts_total),
+                "Canaux utilises": int(mr.used_channels),
+                "Temps t_exec (s)": round(mr.wall_time_seconds, 4),
+                "Sweeps de convergence": int(mr.n_sweeps) if mr.n_sweeps > 0 else "N/A",
             })
     if not rows:
         return pd.DataFrame(columns=[
-            "Solveur", "Mode", "Cout J(x)", "Conflits",
-            "Canaux utilises", "Temps (s)", "Iterations"
+            "Solveur", "Mode", "Cout J(x)", "Conflits CCI (C_CCI)",
+            "Conflits ACI (C_ACI)", "Conflits Totaux (C_total)",
+            "Canaux utilises", "Temps t_exec (s)", "Sweeps de convergence"
         ])
     return pd.DataFrame(rows)

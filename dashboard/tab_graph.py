@@ -29,7 +29,6 @@ from dashboard.components import (
 
 
 def _get_assignment_for_view(record, solver_name, mode):
-    """Retrieves the assignment vector for a (solver, mode) tuple."""
     if record is None or solver_name not in record.solver_results:
         return None
     modes_dict = record.solver_results[solver_name]
@@ -39,36 +38,32 @@ def _get_assignment_for_view(record, solver_name, mode):
 
 
 def render():
-    """Main tab entrypoint."""
-    st.header("Graphe d'interference interactif")
+    """Point d'entree de l'onglet."""
+    st.header("Graphe topologique interactif")
 
     topology = sm.get("topology")
     if topology is None:
         empty_state(
             icon_text="[]",
-            title="Aucune topologie generee",
-            description=(
-                "Configurez et generez d'abord une topologie dans l'onglet "
-                "'Configuration'."
-            ),
+            title="Aucune topologie disponible",
+            description="Generez d'abord une topologie dans l'onglet 'Configuration'.",
         )
         return
 
     render_scenario_summary(topology)
-
     st.divider()
 
     record = sm.get("experiment_record")
 
     st.caption(
-        "Les noeuds sont colores selon le canal attribue par le solveur choisi. "
-        "Les aretes sont colorees dynamiquement selon leur statut : "
-        "**vert** = pas de conflit, **rouge** = conflit co-canal, "
-        "**orange (pointille)** = conflit de canal adjacent (visible uniquement en mode CCI+ACI)."
+        "Les noeuds du graphe representent les cellules du rèseau. "
+        "Les couleurs des noeuds correspondent aux canaux affectes. Les aretes representent "
+        "les couplages radio geographiques. Elles s'affichent en rouge si elles violent la contrainte "
+        "co-canal, et en orange si elles provoquent un debordement adjacent."
     )
 
     # ------------------------------------------------------------------
-    # Control panel
+    # Panneau de contrôle de la vue
     # ------------------------------------------------------------------
     ctrl_cols = st.columns([1.2, 1, 1, 1])
 
@@ -78,14 +73,14 @@ def render():
             solver = solver_selector(
                 available_solvers=available_solvers,
                 session_key="graph_view_solver",
-                label="Solveur a afficher",
+                label="Choix du solveur",
                 default="BD-CeNN",
             )
         else:
             solver = None
             st.selectbox(
-                "Solveur a afficher",
-                options=["(pas de resultat)"],
+                "Choix du solveur",
+                options=["(Aucun run effectue)"],
                 disabled=True,
                 key="graph_solver_disabled",
             )
@@ -94,12 +89,12 @@ def render():
         mode = mode_selector(
             session_key="graph_view_mode",
             available_modes=["cci", "cci_aci"],
-            label="Mode",
+            label="Regime d'analyse",
         )
 
     with ctrl_cols[2]:
         show_only_conflicts = st.checkbox(
-            "Uniquement les conflits",
+            "Masquer les liens sains",
             value=sm.get("graph_show_only_conflicts", False),
             key="graph_only_conflicts_chk",
         )
@@ -107,28 +102,26 @@ def render():
 
     with ctrl_cols[3]:
         show_labels = st.checkbox(
-            "Etiquettes des cellules",
-            value=(topology.N <= 60),
+            "Numeros de cellules",
+            value=sm.get("graph_show_labels", True),
             key="graph_show_labels",
         )
 
-    # ------------------------------------------------------------------
-    # Legend
-    # ------------------------------------------------------------------
-    with st.expander("Legende des couleurs"):
+    # Légende explicite
+    with st.expander("Voir la nomenclature des aretes d'interfèrence"):
         st.markdown("""
-        **Noeuds** : chaque couleur correspond a un canal different attribue a la cellule.
-
-        **Aretes** :
-        - **Vert (fin)** : lien d'interference actif sans conflit (canaux differents et distants)
-        - **Rouge (epais)** : conflit co-canal (les deux cellules utilisent le meme canal)
-        - **Orange (pointille, mode CCI+ACI uniquement)** : fuite de canal adjacent
+        **Noeuds** : Chaque couleur est un canal discret affecte.
+        
+        **Aretes actives** :
+        - **Vert** : Liaison saine. Les deux cellules sont spectralement ecartees.
+        - **Rouge** : Conflit co-canal strict ($C_{\mathrm{CCI}}$). Même canal sur deux voisines.
+        - **Orange pointille** : Conflit adjacent strict ($C_{\mathrm{ACI}}$). Canaux contigus ($0 < |x_i - x_j| \\le 2$).
         """)
 
     st.divider()
 
     # ------------------------------------------------------------------
-    # Graph rendering
+    # Rendu du Graphe
     # ------------------------------------------------------------------
     graph = InterferenceGraph(topology)
     assignment = None
@@ -138,45 +131,40 @@ def render():
         assignment = _get_assignment_for_view(record, solver_selected, mode)
         if assignment is None:
             st.warning(
-                f"Aucun resultat pour le solveur **{solver_selected}** en mode "
-                f"**{'CCI-only' if mode == 'cci' else 'CCI+ACI'}**. "
-                f"Lancez une simulation dans l'onglet Convergence."
+                f"Pas de resultats pour le solveur {solver_selected} sous le mode "
+                f"{'CCI-only' if mode == 'cci' else 'CCI+ACI'}. Lancez d'abord une simulation."
             )
 
-    # Metrics for current view
+    # Affichage des KPIs d'affectation (Chantier A)
     if assignment is not None:
         cost = graph.compute_cost(assignment, mode)
-        n_conf = graph.count_conflicts(assignment, mode)
+        counts = graph.get_all_conflict_counts(assignment, mode)
         n_used = len(set(assignment.tolist()))
+        
         kpi_row([
-            {"label": "Cout J(x)", "value": f"{cost:.4f}"},
-            {"label": "Conflits", "value": str(n_conf)},
-            {"label": "Canaux utilises", "value": str(n_used)},
-            {"label": "Aretes actives", "value": str(topology.n_edges)},
+            {"label": "Cout final J(x*)", "value": f"{cost:.4f}"},
+            {"label": "Conflits co-canal C_CCI", "value": str(counts["n_conflicts_cci"])},
+            {"label": "Conflits adjacents C_ACI", "value": str(counts["n_conflicts_aci"])},
+            {"label": "Total C_total", "value": str(counts["n_conflicts_total"])},
         ])
 
     st.markdown("---")
 
     title = (
-        f"{solver_selected or 'Topologie'} - "
+        f"{solver_selected or 'Topologie nue'} - "
         f"{'CCI-only' if mode == 'cci' else 'CCI+ACI'} - "
-        f"Scenario {topology.scenario_name} (N={topology.N}, K={topology.K})"
+        f"Scenario {topology.scenario_name} (N={topology.N}, seed={topology.seed})"
     )
 
-    # Backend selector
     render_cols = st.columns([4, 1])
     with render_cols[1]:
         backend = st.radio(
-            "Moteur",
+            "Type de rendu",
             options=["Plotly", "PyVis (experimental)"],
             key="graph_backend_radio",
             index=0,
         )
 
-    # ------------------------------------------------------------------
-    # BUG FIX: full-width rendering from first paint
-    # Use a stable container and force autosize with explicit width handling
-    # ------------------------------------------------------------------
     graph_container = st.container()
 
     with graph_container:
@@ -189,15 +177,12 @@ def render():
                 show_labels=show_labels,
                 title=title,
             )
-            # Force autosize and disable fixed dimensions in layout
             fig.update_layout(
                 autosize=True,
                 width=None,
                 height=650,
                 transition_duration=400,
             )
-            # Use a stable key that doesn't change on filter toggles
-            # to prevent Streamlit from re-mounting the component with wrong dims
             stable_key = f"graph_plot_{topology.scenario_name}_{topology.seed}"
             st.plotly_chart(
                 fig,
@@ -220,39 +205,29 @@ def render():
                 )
                 components.html(html_str, height=680, scrolling=True)
             except Exception as e:
-                st.error(f"Erreur PyVis : {type(e).__name__}: {e}")
-                st.info("Basculez sur Plotly pour un rendu garanti.")
+                st.error(f"Erreur PyVis : {e}")
 
-    # ------------------------------------------------------------------
-    # Conflict details
-    # ------------------------------------------------------------------
+    # Détails des liaisons incriminées
     if assignment is not None:
         st.divider()
         conflict_edges = graph.get_conflict_edges_cci(assignment)
         adj_edges = graph.get_conflict_edges_adjacent(assignment) if mode == "cci_aci" else []
 
         with st.expander(
-            f"Detail des conflits ({len(conflict_edges)} co-canal"
-            + (f", {len(adj_edges)} adjacent" if mode == "cci_aci" else "")
+            f"Consulter la liste detaillee des liaisons conflictuelles ({len(conflict_edges)} CCI"
+            + (f", {len(adj_edges)} ACI" if mode == "cci_aci" else "")
             + ")"
         ):
             if conflict_edges:
-                st.markdown("**Aretes en conflit co-canal :**")
+                st.markdown("**Aretes en conflit co-canal strict (C_CCI) :**")
                 for (i, j) in conflict_edges[:50]:
-                    st.text(
-                        f"  Cellule {i} <-> Cellule {j} | canal {int(assignment[i])} | "
-                        f"poids {graph.W[i, j]:.1f}"
-                    )
+                    st.text(f"  Cellule {i} <-> Cellule {j} | canal commun {int(assignment[i])} | poids W_ij={graph.W[i, j]:.1d}")
                 if len(conflict_edges) > 50:
-                    st.caption(f"... et {len(conflict_edges) - 50} autres")
+                    st.caption(f"... et {len(conflict_edges) - 50} autres arêtes.")
 
             if adj_edges and mode == "cci_aci":
-                st.markdown("**Aretes en conflit de canal adjacent :**")
+                st.markdown("**Aretes en conflit adjacent strict (C_ACI) :**")
                 for (i, j) in adj_edges[:50]:
-                    st.text(
-                        f"  Cellule {i} <-> Cellule {j} | canaux "
-                        f"{int(assignment[i])}/{int(assignment[j])} | "
-                        f"poids {graph.W[i, j]:.1f}"
-                    )
+                    st.text(f"  Cellule {i} <-> Cellule {j} | canaux voisins {int(assignment[i])}/{int(assignment[j])} | poids W_ij={graph.W[i, j]:.1d}")
                 if len(adj_edges) > 50:
-                    st.caption(f"... et {len(adj_edges) - 50} autres")
+                    st.caption(f"... et {len(adj_edges) - 50} autres arêtes.")

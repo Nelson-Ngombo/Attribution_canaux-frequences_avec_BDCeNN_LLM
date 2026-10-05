@@ -6,7 +6,6 @@ and colored nodes per assigned channel.
 Uses Plotly as the primary backend. PyVis is available as an experimental
 alternative but fails gracefully if unavailable or if rendering errors occur.
 """
-
 from typing import Optional
 import numpy as np
 import plotly.graph_objects as go
@@ -14,7 +13,7 @@ import plotly.graph_objects as go
 from graph_model import InterferenceGraph
 
 
-# Standard channel color palette (up to 20 distinct colors)
+# Configuration des couleurs conformes au thème d'architecture
 CHANNEL_PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -22,14 +21,13 @@ CHANNEL_PALETTE = [
     "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5",
 ]
 
-# Edge colors
-EDGE_COLOR_CLEAR = "#2ecc71"
-EDGE_COLOR_COCHANNEL = "#e74c3c"
-EDGE_COLOR_ADJACENT = "#f39c12"
+EDGE_COLOR_CLEAR = "#2ecc71"       # Vert : hors conflit
+EDGE_COLOR_COCHANNEL = "#e74c3c"   # Rouge : conflit co-canal strict (Eq. 4)
+EDGE_COLOR_ADJACENT = "#f39c12"    # Orange : conflit adjacent strict (Eq. 5)
 
 
 def _channel_color(channel_index: int) -> str:
-    """Stable color for a given channel index."""
+    """Attribue une couleur stable à chaque canal."""
     return CHANNEL_PALETTE[channel_index % len(CHANNEL_PALETTE)]
 
 
@@ -42,9 +40,7 @@ def render_topology_plotly(
     title: str = "",
 ) -> go.Figure:
     """
-    Builds a fully interactive Plotly figure of the interference graph.
-
-    Returns a Plotly Figure that never raises even if data is empty.
+    Dessine la topologie géographique du rèseau avec Plotly.
     """
     try:
         topology = graph.topology
@@ -53,12 +49,13 @@ def render_topology_plotly(
     except Exception:
         fig = go.Figure()
         fig.add_annotation(
-            text="Topologie invalide",
+            text="Topologie corrompue ou inexistante.",
             x=0.5, y=0.5, xref="paper", yref="paper",
             showarrow=False, font=dict(size=16, color="#c0392b"),
         )
         return fig
 
+    # Dispatch des arêtes selon leur nature (Chantier A)
     edges_by_status = {"clear": [], "cochannel": [], "adjacent": []}
 
     for i in range(N):
@@ -103,15 +100,15 @@ def render_topology_plotly(
         if t: edge_traces.append(t)
 
     t = _make_edge_trace(edges_by_status["cochannel"], EDGE_COLOR_COCHANNEL,
-                          "Conflit co-canal", width_scale=1.2)
+                          "Conflit co-canal strict", width_scale=1.2)
     if t: edge_traces.append(t)
 
     if mode == "cci_aci":
         t = _make_edge_trace(edges_by_status["adjacent"], EDGE_COLOR_ADJACENT,
-                              "Conflit adjacent", width_scale=1.0, dash="dash")
+                              "Conflit adjacent strict", width_scale=1.0, dash="dash")
         if t: edge_traces.append(t)
 
-    # Node traces
+    # Tracé des nœuds
     node_traces = []
     if assignment is not None:
         unique_channels = sorted(set(int(c) for c in assignment))
@@ -154,7 +151,7 @@ def render_topology_plotly(
             textfont=dict(size=10, color="black"),
             hovertext=hover_texts,
             hoverinfo="text",
-            name="Cellules (pas d'affectation)",
+            name="Cellules",
             showlegend=True,
         ))
 
@@ -187,15 +184,14 @@ def render_topology_pyvis_html(
     height: str = "600px",
 ) -> str:
     """
-    Alternative renderer via PyVis. Returns HTML string.
-    Fails gracefully with an HTML error message if PyVis unavailable.
+    Dessine la topologie du rèseau avec PyVis.
     """
     try:
         from pyvis.network import Network
     except ImportError:
         return (
             '<div style="padding: 2rem; text-align: center; color: #c0392b;">'
-            'PyVis non installe. Executez : pip install pyvis'
+            'Le package pyvis est absent du systeme.'
             '</div>'
         )
 
@@ -241,7 +237,6 @@ def render_topology_pyvis_html(
     except Exception as e:
         return (
             f'<div style="padding: 2rem; text-align: center; color: #c0392b;">'
-            f'Erreur PyVis: {type(e).__name__}: {e}<br>'
-            f'Utilisez le moteur Plotly a la place.'
+            f'Echec de rendu PyVis: {e}'
             f'</div>'
         )

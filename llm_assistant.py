@@ -11,7 +11,6 @@ Non-blocking initialization architecture:
 Fully compatible with main.py imports (get_llm_status_label,
 is_llm_available, is_llm_initializing, get_initialization_error).
 
-Author: Nelson Ngombo
 """
 
 import os
@@ -24,19 +23,13 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
-
 import numpy as np
 
-# -----------------------------------------------------------------------------
-# 0. SUPPRESS COSMETIC SDK WARNINGS
-# -----------------------------------------------------------------------------
+# Supprime les avertissements cosmétiques de l'API Google GenAI
 warnings.filterwarnings("ignore", message=".*automatic function calling.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*AFC.*", category=UserWarning)
 
-
-# -----------------------------------------------------------------------------
-# 1. CONFIGURATION & ENVIRONMENT
-# -----------------------------------------------------------------------------
+# --- 1. CONFIGURATION ET CHARGEMENT DU FICHIER ENVIRONNEMENTAL ---
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,7 +37,7 @@ load_dotenv(BASE_DIR / ".env")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip().strip('"').strip("'")
 
-# Qualified model names (verified against user's API key)
+# Suite de modèles prioritaires et de secours
 GOOGLE_MODEL_PREFERRED = "models/gemini-3.6-flash"
 GOOGLE_MODEL_FALLBACKS = [
     "models/gemini-3.7-flash",
@@ -70,7 +63,7 @@ LLM_RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -----------------------------------------------------------------------------
-# 2. BACKGROUND INITIALIZATION STATE MACHINE
+# 2. CONSOLE D'INITIALISATION SÉCURISÉE (LOCK ET THREAD DAEMON)
 # -----------------------------------------------------------------------------
 
 class LLMStatus(Enum):
@@ -133,14 +126,9 @@ def _get_active_model_internal() -> str:
         return _state["active_model"] or ""
 
 
-# -----------------------------------------------------------------------------
-# BACKGROUND PROBE ENGINE
-# -----------------------------------------------------------------------------
-
 def _probe_single_model(client, model_name: str, types_module) -> bool:
     """
-    Probes a single model with strict timeout. Returns True if responsive.
-    Runs entirely in the caller thread (which is already the background init thread).
+    Envoie un ping réseau léger pour vérifier l'accès au modèle.
     """
     result = {"ok": False}
 
@@ -164,8 +152,7 @@ def _probe_single_model(client, model_name: str, types_module) -> bool:
 
 def _background_init():
     """
-    Runs in a daemon thread. Never touches Streamlit session state.
-    Updates _state atomically as models are probed.
+    Moteur de validation de connectivité s'exécutant de manière asynchrone.
     """
     _set_status(LLMStatus.INITIALIZING)
     _set_progress("Chargement du package google-genai...")
@@ -176,18 +163,18 @@ def _background_init():
     except ImportError:
         _set_status(
             LLMStatus.UNAVAILABLE,
-            error="Package google-genai non installe. Executez : pip install google-genai"
+            error="Le package 'google-genai' est requis pour ce module."
         )
         return
 
     if not GOOGLE_API_KEY:
         _set_status(
             LLMStatus.UNAVAILABLE,
-            error="Cle GOOGLE_API_KEY absente du fichier .env"
+            error="La variable GOOGLE_API_KEY est manquante dans .env"
         )
         return
 
-    _set_progress("Creation du client Gemini...")
+    _set_progress("Instanciation de l'API...")
 
     try:
         client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -195,7 +182,7 @@ def _background_init():
     except Exception as e:
         _set_status(
             LLMStatus.UNAVAILABLE,
-            error=f"Echec de creation du client : {type(e).__name__}: {e}"
+            error=f"Erreur d'initialisation du client : {e}"
         )
         return
 
@@ -207,7 +194,7 @@ def _background_init():
 
     for i, model_name in enumerate(candidates, start=1):
         display_name = model_name.replace("models/", "")
-        _set_progress(f"Test du modele {i}/{len(candidates)} : {display_name}")
+        _set_progress(f"Vérification {i}/{len(candidates)} : {display_name}")
 
         try:
             if _probe_single_model(client, model_name, types):
@@ -217,22 +204,19 @@ def _background_init():
                 _set_progress("")
                 return
             else:
-                errors_collected.append(f"{display_name}: timeout")
+                errors_collected.append(f"{display_name} : hors-ligne")
         except Exception as e:
-            errors_collected.append(f"{display_name}: {type(e).__name__}")
+            errors_collected.append(f"{display_name} : {type(e).__name__}")
 
     _set_status(
         LLMStatus.UNAVAILABLE,
-        error="Aucun modele disponible. Details: " + "; ".join(errors_collected[:3])
+        error="Tous les pings API ont échoué : " + "; ".join(errors_collected[:3])
     )
     _set_progress("")
 
 
 def ensure_init_started():
-    """
-    Triggers the background initialization once per session.
-    Fully non-blocking: returns immediately after spawning the thread.
-    """
+    """Démarre le thread de contrôle en arrière-plan sans bloquer l'UI."""
     with _init_lock:
         with _state_lock:
             if _state["init_thread_started"]:
@@ -242,49 +226,31 @@ def ensure_init_started():
     thread = threading.Thread(
         target=_background_init,
         daemon=True,
-        name="llm-background-init",
+        name="llm-background-init-sequence",
     )
     thread.start()
 
 
-# -----------------------------------------------------------------------------
-# PUBLIC API (CALLED BY main.py AND OTHER DASHBOARD MODULES)
-# -----------------------------------------------------------------------------
-
 def is_llm_available() -> bool:
-    """
-    Non-blocking check. Triggers background init if not started.
-    Returns True only when a model has been confirmed responsive.
-    """
     ensure_init_started()
     return _get_status() == LLMStatus.AVAILABLE
 
 
 def is_llm_initializing() -> bool:
-    """
-    Returns True while the background probe is running.
-    Triggers background init if not started.
-    """
     ensure_init_started()
     return _get_status() == LLMStatus.INITIALIZING
 
 
 def get_active_model() -> str:
-    """Returns the verified working model name (empty string if none)."""
     return _get_active_model_internal()
 
 
 def get_initialization_error() -> str:
-    """Returns the current error message (empty string if none)."""
     with _state_lock:
         return _state["error_message"] or ""
 
 
 def get_llm_status_label() -> str:
-    """
-    Returns a human-readable status label for the sidebar.
-    Updates dynamically as the background probe progresses.
-    """
     ensure_init_started()
     status = _get_status()
 
@@ -308,7 +274,6 @@ def get_llm_status_label() -> str:
 
 
 def _get_mode_folders(model_label: str):
-    """Routes logging paths based on interference constraints."""
     if not model_label:
         sub = "misc"
     elif "CCI+ACI" in model_label or "adjacent" in model_label.lower():
@@ -344,120 +309,99 @@ def _conflicts_label(model_label: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# A. PROMPT SYNTHESIZER WITH ZERO-HALLUCINATION DIRECTIVES (IN FRENCH)
+# A. SYSTEM DIRECTIVES AND PROMPT SCHEMAS (Chantiers A + D)
 # -----------------------------------------------------------------------------
 
 ZERO_HALLUCINATION_DIRECTIVE = """
 === DIRECTIVE SYSTEME (ZERO-HALLUCINATION) ===
-Tu es un assistant d'ingenierie radio. Ton role est d'auditer et d'expliquer
-les resultats d'une simulation d'attribution de canaux.
+Tu es un ingenieur radio senior. Ton role est d'analyser et d'auditer
+les resultats de l'optimisation BD-CeNN appliquee a l'attribution de canaux.
 
-REGLES STRICTES :
-1. Tu ne dois JAMAIS inventer, alterer ou extrapoler un chiffre.
-2. Tu dois citer EXCLUSIVEMENT les valeurs numeriques presentes dans les
-   donnees fournies.
-3. Si une information n'est pas presente dans les donnees, ecris simplement :
-   "Information non disponible dans les donnees fournies."
-4. Toute valeur numerique que tu cites doit pouvoir etre retrouvee textuellement
-   dans le bloc "DONNEES DE SIMULATION" ci-dessous.
-5. Si tu detectes une incoherence dans les donnees, signale-le sans inventer.
-6. Redige une analyse structuree et concise, comme un rapport d'ingenieur.
+RÈGLES DE CONDUITE MATHEMATIQUE :
+1. Tu ne dois sous aucun pretexte modifier, inventer ou deviner un chiffre.
+2. Tout chiffre cite doit etre verifies et correspondre exactement aux donnees fournies.
+3. Si une variable n'est pas explicitee dans le bloc de donnees, declare-la comme non disponible.
+4. Rédige un rapport technique froid, scientifique et depouille de tout qualificatif trompeur.
 
-=== REGLE D'ENUMERATION ===
-- Pour enumerer tes points, utilise OBLIGATOIREMENT des LETTRES MAJUSCULES
-  suivies d'une parenthese fermante : A), B), C), D)...
-- N'utilise JAMAIS de chiffres suivis d'un point (1., 2., 3...), car tout
-  chiffre dans ta reponse est interprete comme une DONNEE NUMERIQUE de la
-  simulation et sera verifie par le controleur automatique.
+=== NOMENCLATURE DE L'ENUMERATION ===
+- Structure ton argumentation uniquement avec des lettres majuscules :
+  A), B), C), D), E), F).
+- N'emploie jamais de listes numerotees (1., 2...) qui fausseraient le parsing automatique.
 
-=== REGLE SUR LES NOMBRES (TRES IMPORTANTE) ===
-Un controleur automatique independant verifie CHAQUE nombre ecrit en chiffres
-dans ta reponse. Tout chiffre qui n'est pas un resultat de la simulation
-fournie sera CONSIDERE COMME UNE HALLUCINATION NUMERIQUE, meme s'il s'agit
-d'un simple numero dans une phrase.
+=== COMPORTEMENT AVEC LES COMPTEURS ENTIERS (TRES IMPORTANT) ===
+Un parseur regex externe audite tous les chiffres de ta reponse. Pour eviter de fausses
+alertes, respecte les consignes de redaction suivantes :
 
-  REGLE 1 - RESULTATS DE SIMULATION : EN CHIFFRES.
-  Ecris en chiffres UNIQUEMENT les valeurs qui proviennent du bloc
-  "DONNEES DE SIMULATION" ci-dessous (cout, conflits, temps, iterations,
-  canaux utilises, N, K, seed, identifiant du cas, nom du scenario).
+  REGLE 1 - DONNEES EXPERIMENTALES : EN CHIFFRES.
+  Rapporte en chiffres uniquement les valeurs issues des donnees de simulation :
+  coûts J(x), nombres de conflits, temps d'execution, nombres de balayages (sweeps).
 
-  REGLE 2 - NOMBRES HORS SIMULATION : EN TOUTES LETTRES.
-  Tous les autres nombres que tu souhaites introduire dans ton texte
-  (numeros d'ordre, bornes d'echelle, effectifs generiques, dates,
-  numeros de version, etc.) DOIVENT etre ecrits EN TOUTES LETTRES.
-
-  EXEMPLES CORRECTS :
-    "sur les trois baselines..."
-    "au cours des deux premieres iterations..."
-    "la note de confiance est quatre sur cinq"
-    "Le cout final s'eleve a 37.75"  (37.75 = resultat, donc en chiffres)
-
-  EXEMPLES INTERDITS :
-    "sur les 3 baselines..."
-    "pendant les 2 premieres..."
-    "la note de confiance est 4 sur 5"
-
-POURQUOI CETTE REGLE ?
-Le controleur automatique ne fait pas la difference entre un chiffre qui est
-un RESULTAT de la simulation et un chiffre qui est un simple NUMERO dans une
-phrase. Ecrire les numeros non-resultats en toutes lettres elimine toute
-ambiguite et garantit qu'aucun faux positif d'hallucination n'est declenche.
-
-=== REGLE DE SINCERITE ===
-- Reste strictement factuel dans tes comparaisons. Si une baseline (Random,
-  Greedy, DSATUR) est meilleure que BD-CeNN sur un critere (cout ou temps),
-  dis-le explicitement sans enjoliver.
-=== FIN DIRECTIVE ===
+  REGLE 2 - COMPTEURS LITTERAIRES : EN TOUTES LETTRES.
+  Epelle en toutes lettres toutes les autres valeurs d'ordre de grandeur :
+  "trois algorithmes de reference", "deux regimes d'interference", "cinq sweeps consecutifs".
 """
 
 
 def build_prompt(case_data: dict) -> str:
+    """Construit le prompt de simulation."""
     m = case_data.get("metrics", {})
     b = case_data.get("baselines", {})
     model_label = case_data.get("model_label", "CCI-only")
 
+    # Construction du bloc baselines (Chantier A)
     baseline_lines = []
     for name in ["Random", "Greedy", "DSATUR"]:
         if name in b:
+            # En mode adjacent, on fournit conflicts_cci et conflicts_aci distinctement
+            if model_label == "CCI+ACI":
+                conflict_text = (
+                    f"conflits co-canal C_CCI = {int(b[name].get('conflicts_cci', 0))}, "
+                    f"conflits adjacents C_ACI = {int(b[name].get('conflicts_aci', 0))}, "
+                    f"conflits totaux C_tot = {int(b[name].get('conflicts_total', 0))}"
+                )
+            else:
+                conflict_text = f"conflits co-canal C_CCI = {int(b[name].get('conflicts_cci', 0))}"
+
             baseline_lines.append(
-                f"  - {name} : cout = {_fmt(b[name].get('cost'))}, "
-                f"conflits = {_fmt(b[name].get('conflicts'))}, "
-                f"temps = {_fmt(b[name].get('time'), 6)} s"
+                f"  - {name} : cout J = {_fmt(b[name].get('cost'))}, "
+                f"{conflict_text}, "
+                f"temps t_exec = {_fmt(b[name].get('time'), 6)} s"
             )
-    baseline_str = "\n".join(baseline_lines) if baseline_lines else "  (aucune baseline fournie)"
+    baseline_str = "\n".join(baseline_lines) if baseline_lines else "  (aucune baseline)"
 
     conflicting_cells = case_data.get("conflicting_cells", [])
     conflicting_str = (
         ", ".join(str(c) for c in conflicting_cells)
-        if conflicting_cells else "aucune (ou non disponible)"
+        if conflicting_cells else "aucune"
     )
 
+    # Note sur le régime et distinctions des conflits (Chantier A)
     if model_label == "CCI+ACI":
-        conflicts_label = "Conflits totaux (CCI+ACI)"
         mode_note = (
-            "Le cout et le nombre de conflits presentes ci-dessous integrent\n"
-            "A LA FOIS les interferences co-canal (meme canal) ET les\n"
-            "interferences entre canaux adjacents. C'est UN SEUL chiffre\n"
-            "combine, pas deux chiffres separes."
+            "Le regime d'interference considere est le modele etendu CCI+ACI.\n"
+            "Les conflits sont categorises sous deux compteurs mutuellement exclusifs :\n"
+            f"  - C_CCI (co-canal stricts, même frequence) : {int(m.get('conflicts_cci', 0))}\n"
+            f"  - C_ACI (canal adjacent strict, distance <= 2) : {int(m.get('conflicts_aci', 0))}\n"
+            f"  - C_total (somme des deux compteurs) : {int(m.get('conflicts', 0))}"
         )
     else:
-        conflicts_label = "Conflits co-canal (CCI)"
         mode_note = (
-            "Le cout et le nombre de conflits presentes ci-dessous prennent en\n"
-            "compte UNIQUEMENT les interferences co-canal (meme canal attribue\n"
-            "a deux cellules interferentes)."
+            "Le regime d'interference considere est le modele co-canal seul CCI-only.\n"
+            "Aucun debordement spectral n'est evalue.\n"
+            f"  - C_CCI (conflits co-canal stricts) : {int(m.get('conflicts_cci', 0))}\n"
+            "  - C_ACI (conflits adjacents) : 0 (par definition)"
         )
 
     topology_meta = case_data.get("topology_meta", {})
     if topology_meta:
         meta_str = (
-            f"  - Seed de la topologie (fichier JSON) : {topology_meta.get('seed', 'N/A')}\n"
-            f"  - Threshold (seuil de portee radio)    : {topology_meta.get('threshold', 'N/A')}\n"
-            f"  - Nombre de cellules N                 : {topology_meta.get('N', 'N/A')}\n"
-            f"  - Nombre de canaux K                   : {topology_meta.get('K', 'N/A')}"
+            f"  - Graine de topologie (seed) : {topology_meta.get('seed', 'N/A')}\n"
+            f"  - Seuil d'interference radio (threshold) : {topology_meta.get('threshold', 'N/A')}\n"
+            f"  - Nombre de cellules N : {topology_meta.get('N', 'N/A')}\n"
+            f"  - Nombre de canaux K : {topology_meta.get('K', 'N/A')}"
         )
     else:
-        meta_str = "  (metadonnees non disponibles)"
+        meta_str = "  (metadonnees indisponibles)"
 
     cell_positions = case_data.get("cell_positions", {})
     if cell_positions and len(cell_positions) <= 20:
@@ -471,29 +415,28 @@ def build_prompt(case_data: dict) -> str:
             f"  - Cellule {cid:3d} : (x = {cell_positions[cid][0]:.2f}, y = {cell_positions[cid][1]:.2f})"
             for cid in sorted(cell_positions.keys())[:20]
         ]
-        pos_lines.append(f"  ... ({len(cell_positions) - 20} autres cellules non affichees)")
+        pos_lines.append(f"  ... ({len(cell_positions) - 20} autres cellules)")
         positions_str = "\n".join(pos_lines)
     else:
-        positions_str = "  (positions non disponibles)"
+        positions_str = "  (positions indisponibles)"
 
     topology_edges = case_data.get("topology_edges", [])
     total_edges = case_data.get("total_edges", 0)
     if topology_edges:
         topology_lines = [
-            f"  - Cellule {i} <-> Cellule {j} : poids W = {w}"
+            f"  - Cellule {i} <-> Cellule {j} : poids W_ij = {w}"
             for (i, j, w) in topology_edges
         ]
         topology_body = "\n".join(topology_lines)
         if total_edges > len(topology_edges):
             topology_header = (
-                f"({len(topology_edges)} aretes affichees sur {total_edges} au total ; "
-                f"triees par poids decroissant)"
+                f"({len(topology_edges)} aretes affichees sur {total_edges} au total)"
             )
         else:
             topology_header = f"({total_edges} aretes au total)"
         topology_str = f"{topology_header}\n{topology_body}"
     else:
-        topology_str = "  (topologie non disponible)"
+        topology_str = "  (topologie indisponible)"
 
     cell_summary = case_data.get("cell_summary", [])
     if cell_summary:
@@ -503,7 +446,7 @@ def build_prompt(case_data: dict) -> str:
         ]
         cell_summary_str = "\n".join(cs_lines)
     else:
-        cell_summary_str = "  (resume non disponible)"
+        cell_summary_str = "  (resume indisponible)"
 
     allocations = case_data.get("allocations", {})
     if allocations:
@@ -515,111 +458,82 @@ def build_prompt(case_data: dict) -> str:
         allocations_str = "\n".join(alloc_lines)
         allocations_header = "(La i-eme valeur est le canal attribue a la cellule i.)"
     else:
-        allocations_str = "  (affectations non disponibles)"
+        allocations_str = "  (affectations indisponibles)"
         allocations_header = ""
 
     prompt = f"""
 {ZERO_HALLUCINATION_DIRECTIVE}
 
-=== CONTEXTE DU CAS ===
-- Cas : {case_data.get('case_id')}
+=== DONNEES DE SIMULATION EXPERIMENTALE ===
+- Identifiant du run : {case_data.get('case_id')}
 - Scenario : {case_data.get('scenario')}
-- Configuration : N = {case_data.get('N')} cellules, K = {case_data.get('K')} canaux
-- Seed de topologie : {case_data.get('seed')}
-- Mode d'interference : {model_label}
-- Contexte : {case_data.get('context')}
+- Taille du reseau : N = {case_data.get('N')} cellules, K = {case_data.get('K')} canaux
+- Regime spectral : {model_label}
+- Description contextuelle : {case_data.get('context')}
 
-=== NOTE SUR LE MODE D'INTERFERENCE ===
+=== REGIME SPECTRAL ET CONFLITS (Eq. 4, 5, 6) ===
 {mode_note}
 
-=== DONNEES DE SIMULATION (SOLVEUR BD-CeNN) ===
-- Cout initial J_0 : {_fmt(m.get('cost_initial'))}
-- Cout final J(x) : {_fmt(m.get('cost_final'))}
-- {conflicts_label} : {_fmt(m.get('conflicts'))}
-- Temps d'execution du BD-CeNN : {_fmt(m.get('time_seconds'), 6)} s
-- Nombre d'iterations avant convergence : {_fmt(m.get('iterations'))}
-- Canaux utilises : {_fmt(m.get('used_channels'))}
+=== METRIQUES DE CONVERGENCE (BD-CeNN) ===
+- Cout initial de l'energie J_0 : {_fmt(m.get('cost_initial'))}
+- Cout final J(x*) : {_fmt(m.get('cost_final'))}
+- Temps d'execution du solveur t_exec : {_fmt(m.get('time_seconds'), 6)} s
+- Nombre de balayages (sweeps) effectues : {_fmt(m.get('iterations'))}
+- Nombre de canaux utilises : {_fmt(m.get('used_channels'))}
 
-=== BASELINES (COMPARAISON) ===
+=== ANALYSE COMPARATIVE (BASELINES) ===
 {baseline_str}
 
-=== METADONNEES DE LA TOPOLOGIE (fichier JSON) ===
-{meta_str}
-
-=== POSITIONS DES CELLULES (coordonnees x, y) ===
-{positions_str}
-
-=== TOPOLOGIE DU RESEAU (aretes d'interference) ===
+=== TOPOLOGIE DU RESEAU CELLULAIRE ===
 {topology_str}
 
-=== RESUME DES CELLULES LES PLUS CONTRAINTES (top 10) ===
+=== CELLULES LES PLUS CONTRAINTES (TOP 10) ===
 {cell_summary_str}
 
-=== AFFECTATIONS PAR METHODE (cellule -> canal) ===
+=== VECTEURS D'AFFECTATION ===
 {allocations_header}
 {allocations_str}
 
-=== CELLULES ENCORE EN CONFLIT ===
+=== CELLULES EN CONFLIT APRES OPTIMISATION ===
 {conflicting_str}
 
-=== TACHES DEMANDEES (a enumerer avec des LETTRES : A), B), C)...) ===
-A) Resume la qualite de la solution BD-CeNN en comparant le COUT FINAL aux
-   baselines. Appuie-toi sur les AFFECTATIONS fournies ci-dessus pour
-   identifier les cellules ou BD-CeNN attribue un canal different des
-   baselines et qui expliquent les ecarts observes.
+=== TACHES D'AUDIT DEMANDEES (Enumerer par A), B), C), D), E), F)) ===
+A) Compare l'intensite du cout final J(x*) du BD-CeNN face aux trois baselines.
+   Analyse le vecteur d'allocation de canal pour expliquer les ecarts de performance.
+   Discute specifiquement de la repartition spectrale obtenue.
 
-B) Evalue la convergence en citant explicitement le nombre d'iterations
-   avant convergence.
+B) Evalue la dynamique interne du solveur en citant le nombre de sweeps (balayages)
+   necessaires pour converger vers la solution stable.
 
-C) Compare les PERFORMANCES DE CALCUL (TEMPS D'EXECUTION) :
-   - Cite le temps d'execution du BD-CeNN et celui de chaque baseline.
-   - Si une baseline est PLUS RAPIDE que BD-CeNN, dis-le franchement.
+C) Confronte le temps de calcul (t_exec) de chaque methode. Concede honnetement la primaute
+   chronometrique aux heuristiques gloutonnes si tel est le cas.
 
-D) Analyse la TOPOLOGIE DU RESEAU :
-   - Identifie les cellules les plus contraintes a l'aide du RESUME fourni.
-   - Explique comment ces contraintes locales influencent la difficulte du
-     probleme et la qualite de la solution obtenue.
-   - Si pertinent, cite explicitement certaines aretes critiques (poids 4)
-     et les cellules concernees.
+D) Evalue les contraintes topologiques du reseau geres par le solveur. Identifie les cellules
+   les plus saturees de voisinages et discute de la capacite du BD-CeNN a resoudre les
+   liens conflictuels de forte valeur (poids W_ij = 4).
 
-E) Dans le cas ou les resultats du BD-CeNN ne sont pas fameux, as-tu une
-   recommandation a faire en tant qu'assistant de l'ingenieur radio pour
-   ameliorer les resultats ? Si les resultats sont satisfaisants, tu peux
-   dire "pas de recommandation a faire vu les bons resultats obtenus".
+E) Formule des recommandations pour eviter les pieges des minima locaux (modification stochastique,
+   augmentation des restarts).
 
-F) Termine par un avis de confiance : attribue une note de confiance
-   sur une echelle a cinq niveaux (le niveau maximal etant le plus eleve),
-   puis justifie-la brievement. Ecris la note EN TOUTES LETTRES
-   (par exemple : "quatre sur cinq"), PAS en chiffres.
-
-Redige ton rapport de facon detaillee, longue et argumentee en francais,
-de maniere professionnelle et structuree.
-
-Rappels :
-- N'utilise JAMAIS de chiffres pour enumerer. Utilise A), B), C)...
-- Tous les chiffres cites doivent provenir EXCLUSIVEMENT des donnees ci-dessus.
-- Pour tout autre nombre, utilise des LETTRES (ex. "trois", "quatre sur cinq").
-- Ne cite PAS de "conflits CCI" ni de "conflits ACI" separement dans ce mode.
-  Utilise UNIQUEMENT le chiffre "{conflicts_label}" fourni ci-dessus.
+F) Donne une note de confiance en toutes lettres (de un a cinq) avec justification technique.
 """
     return prompt.strip()
 
 
 # -----------------------------------------------------------------------------
-# B. API INTERACTION ENGINE (FULL ERROR COVERAGE)
+# B. API INTERACTION ENGINE
 # -----------------------------------------------------------------------------
 
 def _call_with_timeout(model_to_try: str, prompt: str,
                        max_tokens: int, timeout_seconds: float):
-    """Executes model generation with strict timeout enforcement."""
     client = _get_client()
     if client is None:
-        return None, "SDK_ERROR", "Client Gemini non initialise"
+        return None, "SDK_ERROR", "Client non initialise"
 
     try:
         from google.genai import types
     except ImportError:
-        return None, "SDK_ERROR", "Package google-genai manquant"
+        return None, "SDK_ERROR", "Module google-genai absent"
 
     result = {"response": None, "error": None, "done": False}
 
@@ -645,7 +559,7 @@ def _call_with_timeout(model_to_try: str, prompt: str,
     worker.join(timeout=timeout_seconds)
 
     if not result["done"]:
-        return None, "TIMEOUT", f"Aucune reponse de '{model_to_try}' apres {timeout_seconds:.0f}s"
+        return None, "TIMEOUT", f"Le modele '{model_to_try}' n'a pas repondu."
 
     if result["error"] is not None:
         e = result["error"]
@@ -655,7 +569,6 @@ def _call_with_timeout(model_to_try: str, prompt: str,
 
 
 def _extract_text_from_response(response) -> str:
-    """Safely extracts text from a Gemini response."""
     if response is None:
         return ""
 
@@ -682,18 +595,13 @@ def _extract_text_from_response(response) -> str:
 
 def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
             inter_request_delay: float = INTER_REQUEST_DELAY) -> str:
-    """
-    Queries Gemini with comprehensive error handling and model rotation.
-    Waits briefly if background init is still running.
-    """
     ensure_init_started()
     status = _get_status()
 
     if status == LLMStatus.UNAVAILABLE:
         err = get_initialization_error()
-        return f"[ERREUR LLM] LLM non disponible. {err}"
+        return f"[ERREUR LLM] Assistant indisponible. {err}"
 
-    # Wait for background init if still running (max 30 seconds)
     if status in (LLMStatus.NOT_STARTED, LLMStatus.INITIALIZING):
         waited = 0.0
         while _get_status() == LLMStatus.INITIALIZING and waited < 30.0:
@@ -701,10 +609,7 @@ def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
             waited += 1.0
 
         if _get_status() != LLMStatus.AVAILABLE:
-            return (
-                "[ERREUR LLM] LLM en cours d'initialisation ou indisponible. "
-                "Veuillez patienter et reessayer."
-            )
+            return "[ERREUR LLM] Connexion en cours. Reessayez."
 
     if inter_request_delay > 0:
         time.sleep(inter_request_delay)
@@ -759,7 +664,6 @@ def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
                 time.sleep(wait)
             continue
 
-        # Response received
         extracted = _extract_text_from_response(response)
 
         if extracted:
@@ -767,21 +671,17 @@ def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
                 _state["last_successful_model"] = model_to_try
             return extracted
 
-        # Empty response
         empty_response_count += 1
         last_error = f"Reponse vide de '{model_to_try}'"
         tried_models.add(model_to_try)
 
         if empty_response_count >= 3:
-            return (
-                f"[ERREUR LLM] Le modele a renvoye {empty_response_count} reponses vides "
-                "consecutives. Simplifiez votre requete."
-            )
+            return "[ERREUR LLM] Echec reponses vides consecutives."
 
         if attempt < max_retries:
             time.sleep(2 + random.uniform(0, 2))
 
-    return f"[ERREUR LLM] Echec definitif apres {max_retries} tentatives. Detail : {last_error}"
+    return f"[ERREUR LLM] Echec total {max_retries} tentatives. Detail : {last_error}"
 
 
 # -----------------------------------------------------------------------------
@@ -830,13 +730,14 @@ def _collect_allowed_numbers(case_data: dict) -> set:
         add(n)
 
     m = case_data.get("metrics", {})
-    for key in ["cost_initial", "cost_final", "conflicts",
-                "time_seconds", "iterations", "used_channels"]:
+    # Whitelist des compteurs de conflits separes (Chantier A) et sweeps (Chantier D)
+    for key in ["cost_initial", "cost_final", "conflicts", "conflicts_cci",
+                "conflicts_aci", "time_seconds", "iterations", "used_channels"]:
         if key in m:
             add(m[key])
 
     for base_data in case_data.get("baselines", {}).values():
-        for k in ["cost", "conflicts", "time"]:
+        for k in ["cost", "conflicts_cci", "conflicts_aci", "conflicts_total", "time"]:
             if k in base_data:
                 add(base_data[k])
 
@@ -937,29 +838,26 @@ def regenerate_with_correction(case_data: dict, original_prompt: str,
         f"Cout final = {_fmt(m.get('cost_final'))} ; "
         f"{conflicts_label} = {_fmt(m.get('conflicts'))} ; "
         f"Temps = {_fmt(m.get('time_seconds'), 6)} s ; "
-        f"Iterations = {_fmt(m.get('iterations'))} ; "
+        f"Balayages (sweeps) = {_fmt(m.get('iterations'))} ; "
         f"Canaux utilises = {_fmt(m.get('used_channels'))}."
     )
 
     correction_prompt = f"""
-=== RECTIFICATION DEMANDEE (REPRISE INTEGRALE) ===
+=== DIRECTIVE DE CORRECTION SPECTRALE ===
 
-Nous te fournissons a nouveau la REQUETE ORIGINALE COMPLETE. Corrige ta reponse precedente.
+Tu as cite des valeurs numeriques erronees dans ta reponse precedente.
 
---- DEBUT DE LA REQUETE ORIGINALE ---
+--- PROMPT INITIAL ---
 {original_prompt}
---- FIN DE LA REQUETE ORIGINALE ---
+--- FIN PROMPT INITIAL ---
 
-Chiffres erronees detectes :
+Erreurs numeriques detectees :
 {faulty_str}
 
-Donnees certifiees :
+Donnees physiques valides :
 {allowed_summary}
 
-Consignes :
-A) Reresous les taches A) a F) integralement.
-B) Utilise des majuscules A), B)... pour la structure.
-C) Ecris les donnees de simulation en chiffres et epelle tout le reste.
+Corrige ta reponse en veillant au strict respect de la nomenclature.
 """
     return ask_llm(correction_prompt, inter_request_delay=INTER_REQUEST_DELAY)
 
@@ -1047,7 +945,7 @@ def generate_pdf_report(
         ["Cout final", _fmt(m.get("cost_final"))],
         [conflicts_label, _fmt(m.get("conflicts"))],
         ["Temps (s)", _fmt(m.get("time_seconds"), 6)],
-        ["Iterations", _fmt(m.get("iterations"))],
+        ["Balayages (sweeps)", _fmt(m.get("iterations"))],
         ["Canaux", _fmt(m.get("used_channels"))],
     ]
     sim_table = Table(sim_data, colWidths=[7*cm, 5*cm])

@@ -24,23 +24,20 @@ from dashboard.components import (
     kpi_row,
     empty_state,
     info_banner,
-    divider_with_label,
     render_scenario_summary,
-    render_error_box,
 )
 from dashboard.interactive_save import save_interactive_run
 
 
 def _run_full_experiment():
-    """Executes the full ExperimentRunner pipeline."""
     topology = sm.get("topology")
     if topology is None:
-        toast.error("Aucune topologie disponible. Generez-en une dans l'onglet Configuration.")
+        toast.error("Aucune topologie disponible.")
         return
 
     runner = sm.get("runner")
     if runner is None:
-        toast.error("Runner non initialise. Reinitialisez la session.")
+        toast.error("Orchestrateur de run absent.")
         return
 
     modes = []
@@ -50,12 +47,12 @@ def _run_full_experiment():
         modes.append("cci_aci")
 
     if not modes:
-        toast.warning("Activez au moins un mode d'interference dans l'onglet Configuration.")
+        toast.warning("Veuillez selectionner au moins un mode spectral.")
         return
 
     sm.set_value("experiment_running", True)
 
-    progress_bar = st.progress(0.0, text="Preparation...")
+    progress_bar = st.progress(0.0, text="Preparation du run...")
     status_placeholder = st.empty()
 
     def progress_callback(msg: str, ratio: float):
@@ -66,85 +63,72 @@ def _run_full_experiment():
             pass
 
     try:
+        # Exécution de l'orchestrateur (avec n_sweeps mis à jour)
         record = runner.run_single(
             topology,
             modes=modes,
             progress_callback=progress_callback,
         )
         sm.set_value("experiment_record", record)
-        progress_bar.progress(1.0, text="Termine")
+        progress_bar.progress(1.0, text="Run accompli")
         status_placeholder.success("Simulation terminee avec succes.")
 
-        # Auto-save to disk
+        # Sauvegarde automatique sur disque
         try:
             saved = save_interactive_run(record, save_figures=True)
             n_files = len(saved.get("json", [])) + len(saved.get("csv", [])) + len(saved.get("figures", []))
             if n_files > 0:
-                toast.success(f"Resultats sauvegardes : {n_files} fichiers dans outputs/interactive_runs/")
+                toast.success(f"Sauvegarde reussie : {n_files} fichiers ecrits dans outputs/")
         except Exception as e:
-            toast.warning(f"Sauvegarde partielle : {type(e).__name__}: {e}")
+            toast.warning(f"Sauvegarde partielle : {e}")
 
     except Exception as e:
         import traceback
         sm.set_value("last_error_message", str(e))
-        status_placeholder.error(f"Simulation echouee : {e}")
-        with st.expander("Traceback complet"):
+        status_placeholder.error(f"Echec critique : {e}")
+        with st.expander("Details techniques (traceback)"):
             st.code(traceback.format_exc(), language="python")
     finally:
         sm.set_value("experiment_running", False)
 
 
 def render():
-    """Main tab entrypoint."""
-    st.header("Execution BD-CeNN et trajectoire de convergence")
+    """Point d'entree de l'onglet."""
+    st.header("Convergence energetique et sweeps")
 
     topology = sm.get("topology")
     if topology is None:
         empty_state(
             icon_text="[!]",
-            title="Aucune topologie generee",
-            description=(
-                "Vous devez d'abord generer une topologie dans l'onglet "
-                "'Configuration' avant de lancer une simulation."
-            ),
+            title="Topologie absente",
+            description="Generez d'abord une topologie dans le premier onglet.",
         )
         return
 
     render_scenario_summary(topology)
-
     st.divider()
 
-    # -----------------------------------------------
-    # Execution panel
-    # -----------------------------------------------
-    section_title("Lancement de la simulation")
+    section_title("Parametrage et exécution du solveur")
 
-    st.caption(
-        "Execute le pipeline complet : BD-CeNN multistart + trois baselines "
-        "(Random, Greedy, DSATUR) sous les modes d'interference selectionnes. "
-        "Les resultats sont automatiquement sauvegardes dans "
-        "`outputs/interactive_runs/`."
-    )
-
-    exec_cols = st.columns([1, 1, 2])
+    exec_cols = st.columns([1.2, 1, 1.8])
     with exec_cols[0]:
         launch = st.button(
-            "Lancer la simulation",
+            "Lancer les solveurs",
             type="primary",
             use_container_width=True,
             disabled=sm.get("experiment_running", False),
             key="btn_launch_convergence",
         )
     with exec_cols[1]:
-        st.caption(f"**Restarts** : {sm.get('num_restarts')}")
-        st.caption(f"**Iter max** : {sm.get('max_iter')}")
+        st.caption(f"**Restarts multistart** : {sm.get('num_restarts')}")
+        st.caption(f"**Sweeps max (T_max)** : {sm.get('max_iter')}")
     with exec_cols[2]:
         modes_active = []
         if sm.get("run_mode_cci"):
             modes_active.append("CCI-only")
         if sm.get("run_mode_cci_aci"):
             modes_active.append("CCI+ACI")
-        st.caption(f"**Modes actifs** : {', '.join(modes_active) if modes_active else 'aucun'}")
+        st.caption(f"**Regimes evalues** : {', '.join(modes_active) if modes_active else 'aucun'}")
 
     if launch:
         _run_full_experiment()
@@ -152,100 +136,77 @@ def render():
 
     st.divider()
 
-    # -----------------------------------------------
-    # Results display
-    # -----------------------------------------------
     record = sm.get("experiment_record")
     if record is None:
         empty_state(
             icon_text="[>]",
-            title="Aucune simulation executee",
-            description=(
-                "Cliquez sur 'Lancer la simulation' ci-dessus pour executer les "
-                "solveurs et voir la trajectoire de convergence."
-            ),
+            title="En attente de simulation",
+            description="Lancez les solveurs pour analyser les dynamiques de convergence.",
         )
         return
 
     bd_results = record.solver_results.get("BD-CeNN", {})
     if not bd_results:
-        info_banner("BD-CeNN n'a produit aucun resultat.", kind="warning")
+        info_banner("Le solveur BD-CeNN n'a pas produit de resultats.", kind="warning")
         return
 
-    # -----------------------------------------------
-    # Per-mode KPIs
-    # -----------------------------------------------
-    section_title("Metriques BD-CeNN par mode")
+    # Présentation des KPIs détaillés (Chantier A & D)
+    section_title("Indicateurs de stabilisation BD-CeNN")
 
     for mode, result in bd_results.items():
-        st.markdown(f"**Mode : {MODE_LABELS[mode]}**")
+        st.markdown(f"**Regime d'evaluation : {MODE_LABELS[mode]}**")
         kpi_row([
-            {"label": "Cout final", "value": f"{result.cost:.4f}"},
-            {"label": "Conflits", "value": str(result.n_conflicts)},
-            {"label": "Temps (s)", "value": f"{result.wall_time_seconds:.3f}"},
-            {"label": "Iterations", "value": str(result.n_iterations)},
+            {"label": "Cout final J(x*)", "value": f"{result.cost:.4f}"},
+            {"label": "Conflits Co-canal C_CCI", "value": str(result.n_conflicts_cci)},
+            {"label": "Conflits Adjacents C_ACI", "value": str(result.n_conflicts_aci)},
+            {"label": "Sweeps effectues (n_sweeps)", "value": str(result.n_sweeps)},
         ])
 
-    # -----------------------------------------------
-    # Convergence trajectories
-    # -----------------------------------------------
     st.divider()
-    section_title("Trajectoires de convergence")
+
+    # Trajectoires en sweeps (Chantier D)
+    section_title("Trajectoires temporelles en sweeps")
 
     if len(bd_results) == 2:
-        st.markdown("**Superposition : CCI-only vs CCI+ACI**")
+        st.markdown("**Superposition de convergence : CCI-only vs CCI+ACI**")
         fig_dual = create_dual_convergence_plot(
             bd_cci=bd_results.get("cci"),
             bd_cci_aci=bd_results.get("cci_aci"),
         )
-        fig_dual.update_layout(transition_duration=400)
-        st.plotly_chart(
-            fig_dual,
-            use_container_width=True,
-            key=f"conv_dual_{record.experiment_id}",
-        )
+        st.plotly_chart(fig_dual, use_container_width=True, key=f"conv_dual_{record.experiment_id}")
 
-    st.markdown("**Vue par mode**")
+    st.markdown("**Courbes de convergence individuelles**")
     tabs_labels = [MODE_LABELS[m] for m in bd_results.keys()]
     conv_tabs = st.tabs(tabs_labels)
     for tab, (mode, result) in zip(conv_tabs, bd_results.items()):
         with tab:
             fig = create_convergence_plot(result, mode)
-            fig.update_layout(transition_duration=400)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"conv_{mode}_{record.experiment_id}",
-            )
+            st.plotly_chart(fig, use_container_width=True, key=f"conv_{mode}_{record.experiment_id}")
 
-            with st.expander(f"Historique brut ({MODE_LABELS[mode]})"):
+            with st.expander(f"Visualiser le detail de convergence ({MODE_LABELS[mode]})"):
                 import pandas as pd
                 curve = result.energy_curve_forward_filled()
                 df = pd.DataFrame({
-                    "iteration": list(range(len(curve))),
-                    "cost_best_so_far": curve,
+                    "Sweep Index": list(range(len(curve))),
+                    "Cout best-so-far": curve,
                 })
                 st.dataframe(df, use_container_width=True, height=250)
 
-    # -----------------------------------------------
-    # Delta ACI
-    # -----------------------------------------------
+    # Métrique Delta_ACI
     if record.delta_aci_percent is not None:
         st.divider()
-        section_title("Metrique Delta_ACI")
-
+        section_title("Métrique Delta_ACI")
         col1, col2 = st.columns([1, 2])
         with col1:
             st.metric(
                 "Delta_ACI (BD-CeNN)",
                 f"+{record.delta_aci_percent:.2f}%",
-                help="Augmentation relative du cout en passant de CCI-only a CCI+ACI.",
+                help="Surcoût relatif induit lors de l'évaluation sous modèle adjacent.",
             )
         with col2:
             info_banner(
-                "Un Delta_ACI eleve indique que la solution BD-CeNN optimisee "
-                "en mode CCI-only place beaucoup de cellules voisines sur des "
-                "canaux adjacents, ce qui devient penalisant sous le modele "
-                "physique CCI+ACI.",
+                "Le Delta_ACI mesure le saut energetique lorsque la solution physique "
+                "est soumise aux debordements spectraux du canal adjacent. Plus il est faible, "
+                "plus l'allocation est robuste.",
                 kind="info",
             )

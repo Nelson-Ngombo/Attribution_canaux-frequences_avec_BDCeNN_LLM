@@ -13,7 +13,6 @@ from dashboard.components import (
     empty_state,
     info_banner,
     mode_selector,
-    divider_with_label,
     render_error_box,
 )
 
@@ -33,7 +32,9 @@ def _build_case_data(record, mode: str) -> dict:
         if bres:
             baselines[name] = {
                 "cost": float(bres.cost),
-                "conflicts": int(bres.n_conflicts),
+                "conflicts_cci": int(bres.n_conflicts_cci),
+                "conflicts_aci": int(bres.n_conflicts_aci),
+                "conflicts_total": int(bres.n_conflicts_total),
                 "time": float(bres.wall_time_seconds),
             }
 
@@ -101,9 +102,11 @@ def _build_case_data(record, mode: str) -> dict:
         "metrics": {
             "cost_initial": float(cost_init),
             "cost_final": float(bd_result.cost),
-            "conflicts": int(bd_result.n_conflicts),
+            "conflicts": int(bd_result.n_conflicts_total),  # Total conflicts (Chantier A)
+            "conflicts_cci": int(bd_result.n_conflicts_cci),
+            "conflicts_aci": int(bd_result.n_conflicts_aci),
             "time_seconds": float(bd_result.wall_time_seconds),
-            "iterations": int(bd_result.best_iteration),
+            "iterations": int(bd_result.n_sweeps),  # sweeps mapped for LLM key
             "used_channels": int(bd_result.used_channels),
         },
         "baselines": baselines,
@@ -118,7 +121,6 @@ def _build_case_data(record, mode: str) -> dict:
 
 
 def _generate_llm_report(mode: str):
-    """Invokes the LLM and audits the result."""
     record = sm.get("experiment_record")
     if record is None:
         toast.error("Aucun resultat disponible.")
@@ -157,7 +159,6 @@ def _generate_llm_report(mode: str):
 
 
 def _render_audit_badge(audit_report):
-    """Renders a stylized certification badge."""
     if audit_report is None:
         info_banner("Aucun audit realise.", kind="info")
         return
@@ -215,7 +216,6 @@ def _render_audit_badge(audit_report):
 
 
 def _render_verification_table(audit_report):
-    """Displays the per-number verification table."""
     if audit_report is None or not audit_report.verifications:
         return
 
@@ -239,39 +239,34 @@ def _render_verification_table(audit_report):
 
 
 def render():
-    """Main tab entrypoint."""
-    st.header("Rapport LLM et audit independant")
+    """Point d'entree de l'onglet."""
+    st.header("Analyse qualitative et audit symbolique")
 
     record = sm.get("experiment_record")
     if record is None:
         empty_state(
             icon_text="[?]",
             title="Aucun resultat a analyser",
-            description=(
-                "Lancez d'abord une simulation dans l'onglet 'Convergence' pour "
-                "produire des metriques que le LLM pourra analyser."
-            ),
+            description="Exécutez d'abord les solveurs dans l'onglet 'Convergence' pour auditer les rèsultats.",
         )
         return
 
     st.caption(
-        "Le LLM produit une analyse qualitative en francais des resultats de "
-        "simulation. Un auditeur regex independant verifie ensuite chaque valeur "
-        "numerique citee dans la reponse contre les donnees certifiees."
+        "L'assistant LLM redige un rapport d'ingeneire base sur les resultats certifies. "
+        "Le module de controle regex valide ensuite de maniere rigoureuse la totalite des affirmations numeriques."
     )
 
-    # LLM availability check
+    # Vérification d'initialisation du LLM
     from llm_assistant import is_llm_available, get_active_model, get_initialization_error
     if not is_llm_available():
         info_banner(
-            "Le LLM n'est pas initialise. Le rapport ne pourra pas etre genere. "
-            f"Cause : {get_initialization_error() or 'inconnue'}",
+            "Le LLM n'est pas initialise. "
+            f"Details : {get_initialization_error() or 'inconnue'}",
             kind="warning",
         )
     else:
-        st.caption(f"Modele LLM actif : `{get_active_model()}`")
+        st.caption(f"Modele LLM connecte : `{get_active_model()}`")
 
-    # Mode selector
     available_modes = list(record.solver_results.get("BD-CeNN", {}).keys())
     if not available_modes:
         info_banner("Aucun resultat BD-CeNN disponible.", kind="warning")
@@ -280,13 +275,13 @@ def render():
     mode = mode_selector(
         session_key="llm_view_mode",
         available_modes=available_modes,
-        label="Mode d'interference a analyser",
+        label="Regime spectral a auditer",
     )
 
     col1, col2 = st.columns([1, 3])
     with col1:
         if st.button(
-            "Generer l'analyse LLM",
+            "Générer le rapport LLM",
             type="primary",
             use_container_width=True,
             disabled=(not is_llm_available()),
@@ -303,35 +298,31 @@ def render():
     if response is None:
         empty_state(
             icon_text="[>]",
-            title=f"Aucune analyse generee pour {MODE_LABELS[mode]}",
-            description=(
-                "Cliquez sur 'Generer l'analyse LLM' ci-dessus pour produire "
-                "un rapport qualitatif en francais."
-            ),
+            title=f"Aucune analyse effectuee ({MODE_LABELS[mode]})",
+            description="Cliquez sur 'Générer le rapport LLM' pour lancer le protocole neuro-symbolique.",
         )
         return
 
-    # Two-column layout
     col_left, col_right = st.columns([1.5, 1])
 
     with col_left:
-        section_title(f"Analyse LLM ({MODE_LABELS[mode]})")
+        section_title(f"Rapport technique ({MODE_LABELS[mode]})")
         if response.startswith("[ERREUR LLM]") or response.startswith("[LLM_ERROR]"):
             st.error(response)
         else:
             st.markdown(response)
 
     with col_right:
-        section_title("Certification de l'audit")
+        section_title("Verificateur automatique")
         _render_audit_badge(audit_report)
 
         if audit_report:
-            with st.expander("Verification detaillee des nombres"):
+            with st.expander("Voir le detail des verifications"):
                 _render_verification_table(audit_report)
 
-            with st.expander("Statistiques de l'audit"):
-                st.markdown(f"**Nombres extraits** : {audit_report.total_numbers}")
-                st.markdown(f"**Nombres conformes** : {audit_report.valid_count}")
-                st.markdown(f"**Divergences** : {audit_report.invented_count}")
-                st.markdown(f"**Tolerance** : {audit_report.tolerance * 100:.1f}%")
-                st.markdown(f"**Horodatage** : {audit_report.timestamp}")
+            with st.expander("Statistiques d'audit"):
+                st.markdown(f"**Nombres analyses** : {audit_report.total_numbers}")
+                st.markdown(f"**Assertions exactes** : {audit_report.valid_count}")
+                st.markdown(f"**Divergences (hallucinations)** : {audit_report.invented_count}")
+                st.markdown(f"**Tolerance appliquee** : {audit_report.tolerance * 100:.1f}%")
+                st.markdown(f"**Heure de l'audit** : {audit_report.timestamp}")

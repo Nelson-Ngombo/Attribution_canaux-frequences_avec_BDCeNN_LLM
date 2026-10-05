@@ -8,7 +8,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-
 import pandas as pd
 
 import config
@@ -16,14 +15,12 @@ from data_structures import ExperimentRecord
 
 
 def _base_dir() -> Path:
-    """Returns the root output directory for interactive runs."""
     base = Path(config.BASE_DIR) / "outputs" / "interactive_runs"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
 def _mode_dir(mode: str) -> Path:
-    """Returns the mode-specific subdirectory."""
     sub = "cochannel" if mode == "cci" else "adjacent"
     path = _base_dir() / sub
     for subfolder in ("csv", "json", "figures", "reports"):
@@ -39,22 +36,14 @@ def save_interactive_run(record: ExperimentRecord,
                           save_figures: bool = True,
                           extra_figures: Optional[list] = None) -> dict:
     """
-    Persists a complete interactive experiment run to disk.
-
-    Args:
-        record: ExperimentRecord returned by ExperimentRunner
-        save_figures: If True, generates and saves comparison figures
-        extra_figures: List of (name, plotly_figure) tuples to save as HTML
-
-    Returns:
-        Dict mapping "type" -> list of saved paths
+    Sauvegarde l'enregistrement d'un run interactif.
     """
     ts = _timestamp()
     experiment_id = record.experiment_id
     saved = {"json": [], "csv": [], "figures": []}
 
     try:
-        # --- Full JSON in both mode dirs (contains both modes info) ---
+        # 1. Sauvegarde du fichier JSON brut
         for mode in ["cci", "cci_aci"]:
             if mode in record.solver_results.get("BD-CeNN", {}):
                 mdir = _mode_dir(mode)
@@ -63,7 +52,7 @@ def save_interactive_run(record: ExperimentRecord,
                     json.dump(record.to_dict(), f, indent=2, ensure_ascii=False)
                 saved["json"].append(str(json_path))
 
-        # --- Per-mode CSV of metrics ---
+        # 2. Sauvegarde des métriques CSV (Chantiers A & D)
         for mode in ["cci", "cci_aci"]:
             if mode not in record.metrics.get("BD-CeNN", {}):
                 continue
@@ -75,10 +64,12 @@ def save_interactive_run(record: ExperimentRecord,
                         "solver": solver_name,
                         "interference_mode": "CCI-only" if mode == "cci" else "CCI+ACI",
                         "cost": mr.cost,
-                        "n_conflicts": mr.n_conflicts,
+                        "conflicts_cci": mr.n_conflicts_cci,
+                        "conflicts_aci": mr.n_conflicts_aci,
+                        "conflicts_total": mr.n_conflicts_total,
                         "used_channels": mr.used_channels,
                         "wall_time_seconds": mr.wall_time_seconds,
-                        "n_iterations": mr.n_iterations,
+                        "n_sweeps": mr.n_sweeps,
                     })
             if rows:
                 df = pd.DataFrame(rows)
@@ -87,13 +78,13 @@ def save_interactive_run(record: ExperimentRecord,
                 df.to_csv(csv_path, index=False, float_format="%.6f")
                 saved["csv"].append(str(csv_path))
 
-        # --- Convergence CSV (BD-CeNN) per mode ---
+        # 3. Sauvegarde de la trajectoire d'énergie en sweeps (Chantier D)
         for mode, result in record.solver_results.get("BD-CeNN", {}).items():
             curve = result.energy_curve_forward_filled()
             if not curve:
                 continue
             conv_df = pd.DataFrame({
-                "iteration": list(range(len(curve))),
+                "sweep": list(range(len(curve))),
                 "cost_best_so_far": curve,
             })
             mdir = _mode_dir(mode)
@@ -101,7 +92,7 @@ def save_interactive_run(record: ExperimentRecord,
             conv_df.to_csv(conv_path, index=False, float_format="%.6f")
             saved["csv"].append(str(conv_path))
 
-        # --- Assignment CSV per (solver, mode) ---
+        # 4. Sauvegarde des vecteurs d'affectation
         for solver_name, modes in record.solver_results.items():
             for mode, res in modes.items():
                 assign_df = pd.DataFrame({
@@ -114,7 +105,7 @@ def save_interactive_run(record: ExperimentRecord,
                 assign_df.to_csv(assign_path, index=False)
                 saved["csv"].append(str(assign_path))
 
-        # --- Figures (from chart_factory) ---
+        # 5. Enregistrement des courbes Plotly
         if save_figures:
             try:
                 from dashboard.chart_factory import (
@@ -123,7 +114,6 @@ def save_interactive_run(record: ExperimentRecord,
                     create_delta_aci_chart,
                 )
 
-                # Convergence per mode
                 for mode, result in record.solver_results.get("BD-CeNN", {}).items():
                     fig = create_convergence_plot(result, mode)
                     mdir = _mode_dir(mode)
@@ -131,8 +121,7 @@ def save_interactive_run(record: ExperimentRecord,
                     fig.write_html(str(fpath), include_plotlyjs="cdn")
                     saved["figures"].append(str(fpath))
 
-                # Comparisons (saved once in each mode folder for completeness)
-                for metric in ["cost", "n_conflicts", "wall_time_seconds"]:
+                for metric in ["cost", "conflicts_cci", "conflicts_aci", "conflicts_total", "wall_time_seconds"]:
                     fig = create_comparison_bar_chart(record, metric=metric)
                     for mode in record.solver_results.get("BD-CeNN", {}).keys():
                         mdir = _mode_dir(mode)
@@ -140,7 +129,6 @@ def save_interactive_run(record: ExperimentRecord,
                         fig.write_html(str(fpath), include_plotlyjs="cdn")
                         saved["figures"].append(str(fpath))
 
-                # Delta ACI
                 delta_fig = create_delta_aci_chart(record)
                 if delta_fig is not None:
                     for mode in record.solver_results.get("BD-CeNN", {}).keys():
@@ -151,7 +139,6 @@ def save_interactive_run(record: ExperimentRecord,
             except Exception:
                 pass
 
-        # --- Extra figures (e.g., graph renders) ---
         if extra_figures:
             for name, fig in extra_figures:
                 try:
@@ -172,7 +159,6 @@ def save_interactive_run(record: ExperimentRecord,
 
 
 def get_interactive_outputs_summary() -> dict:
-    """Returns a summary of all files in outputs/interactive_runs/."""
     base = _base_dir()
     summary = {"cochannel": {}, "adjacent": {}, "total_files": 0}
 
