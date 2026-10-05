@@ -413,6 +413,48 @@ def create_weight_matrix_heatmap(W: np.ndarray) -> go.Figure:
     return fig
 
 
+def create_channel_matrix_heatmap(M: np.ndarray) -> go.Figure:
+    """
+    Rend la carte thermique de la matrice spectrale M (interference entre canaux).
+
+    Parameters
+    ----------
+    M : ndarray, shape (K, K)
+        Matrice d'interference inter-canaux construite par
+        create_channel_interference_matrix.
+
+    Returns
+    -------
+    fig : go.Figure
+    """
+    K = M.shape[0]
+    fig = go.Figure(data=go.Heatmap(
+        z=M,
+        x=[f"Canal {j}" for j in range(K)],
+        y=[f"Canal {i}" for i in range(K)],
+        colorscale="Blues",
+        zmin=0.0,
+        zmax=1.0,
+        text=[[f"{M[i, j]:.2f}" for j in range(K)] for i in range(K)],
+        texttemplate="%{text}",
+        textfont={"size": 10},
+        hovertemplate="Canal i : %{y}<br>Canal j : %{x}<br>M_ij = %{z:.2f}<extra></extra>",
+        colorbar=dict(title="Attenuation"),
+    ))
+    fig.update_layout(
+        title=dict(
+            text="Matrice d'interference inter-canaux M<br>"
+                 "<sub>alpha = 0,5, cutoff = 2</sub>",
+            x=0.5, font=dict(size=13),
+        ),
+        xaxis_title="Canal j",
+        yaxis_title="Canal i",
+        height=500,
+        margin=dict(l=70, r=30, t=90, b=60),
+        yaxis=dict(autorange="reversed"),
+        transition_duration=300,
+    )
+    return fig
 # ============================================================================
 # 6. EXPORT DE DATAFRAME FLATTENED (Chantiers A + D)
 # ============================================================================

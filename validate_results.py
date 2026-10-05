@@ -84,6 +84,7 @@ def classify_csv_files(csv_dir: Path) -> dict:
         "allocations": [],
         "raw": [],
         "trajectory": [],
+        "llm_reports": [],  # [FIX-E10] CSV du verificateur LLM, non affiche dans le PDF d'audit
         "other": []
     }
 
@@ -100,7 +101,16 @@ def classify_csv_files(csv_dir: Path) -> dict:
             classified["raw"].append(csv_path)
         elif "trajectory" in fname:
             classified["trajectory"].append(csv_path)
+        # [FIX-E10] Le CSV llm_fidelity_evaluation.csv NE DOIT PLUS etre
+        # inclus dans le rapport d'audit validate_results.py. Ce rapport
+        # valide uniquement les metriques du solveur. Le tableau de fidelite
+        # LLM figure dans le rapport PDF de chaque cas, produit par
+        # llm_assistant.generate_pdf_report.
         elif "llm_fidelity" in fname:
+            classified["llm_reports"].append(csv_path)
+
+        # [FIX-E10] CSV dedie aux metriques du solveur pour E10
+        elif "solver_metrics" in fname:
             classified["metrics"].append(csv_path)
         else:
             classified["other"].append(csv_path)
@@ -3477,8 +3487,75 @@ def validate_experiment(experiment_id: str, modes: list = None):
                         "V10", f"Canaux utilises max = {int(max_used)} ({fname})", True
                     ))
 
+                # =====================================================
+                # [FIX-E10] Invariant specifique E10 : coherence de la
+                # decomposition C_tot = C_CCI + C_ACI pour le CSV
+                # solver_metrics_e10.csv. Ce CSV contient 20 lignes
+                # (une par cas) au lieu d'une agregation, donc la
+                # verification ligne a ligne est directe.
+                # =====================================================
+                if "solver_metrics" in fname:
+                    if all(c in df.columns for c in
+                           ["conflicts_cci", "conflicts_aci", "conflicts_total"]):
+                        v_e10_ok = True
+                        for idx, row in df.iterrows():
+                            expected = int(row["conflicts_cci"]) + int(row["conflicts_aci"])
+                            if int(row["conflicts_total"]) != expected:
+                                v_e10_ok = False
+                                anomalies.append(
+                                    f"{fname} ligne {idx}: [V10-E10] "
+                                    f"C_tot ({row['conflicts_total']}) != "
+                                    f"C_CCI + C_ACI ({expected})"
+                                )
+                        verifications.append(VerificationResult(
+                            "V10-E10",
+                            f"Coherence C_tot = C_CCI + C_ACI pour E10 ({fname})",
+                            v_e10_ok,
+                        ))
+
+                    # [FIX-E10] Invariant supplementaire : sweeps >= 0
+                    if "sweeps" in df.columns:
+                        v_sweeps_ok = (df["sweeps"].dropna() >= 0).all()
+                        verifications.append(VerificationResult(
+                            "V10-SWEEPS",
+                            f"Sweeps >= 0 ({fname})",
+                            v_sweeps_ok,
+                        ))
+
             except Exception as e:
                 anomalies.append(f"Erreur d'analyse sur {csv_path.name}: {e}")
+
+                                # [FIX-E10] Invariant specifique E10 : coherence de la
+                # decomposition C_tot = C_CCI + C_ACI pour le CSV solver_metrics_e10.
+                # Ce CSV contient 20 lignes (une par cas) au lieu d'une
+                # agregation, donc la verification ligne a ligne est directe.
+                if "solver_metrics" in fname:
+                    if all(c in df.columns for c in
+                           ["conflicts_cci", "conflicts_aci", "conflicts_total"]):
+                        v_e10_ok = True
+                        for idx, row in df.iterrows():
+                            expected = int(row["conflicts_cci"]) + int(row["conflicts_aci"])
+                            if int(row["conflicts_total"]) != expected:
+                                v_e10_ok = False
+                                anomalies.append(
+                                    f"{fname} ligne {idx}: [V10-E10] "
+                                    f"C_tot ({row['conflicts_total']}) != "
+                                    f"C_CCI + C_ACI ({expected})"
+                                )
+                        verifications.append(VerificationResult(
+                            "V10-E10",
+                            f"Coherence C_tot = C_CCI + C_ACI pour E10 ({fname})",
+                            v_e10_ok,
+                        ))
+
+                    # [FIX-E10] Invariant supplementaire : sweeps >= 0
+                    if "sweeps" in df.columns:
+                        v_sweeps_ok = (df["sweeps"].dropna() >= 0).all()
+                        verifications.append(VerificationResult(
+                            "V10-SWEEPS",
+                            f"Sweeps >= 0 ({fname})",
+                            v_sweeps_ok,
+                        ))
 
         # -------------------------------------------------------------------
         # C. TRAITEMENT DES FICHIERS D'ALLOCATIONS (cell_channels.csv)

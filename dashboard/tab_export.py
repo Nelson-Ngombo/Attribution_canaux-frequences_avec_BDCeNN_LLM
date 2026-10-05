@@ -158,7 +158,7 @@ def _build_case_data(record, mode: str) -> dict:
 
     conflict_edges = graph.get_conflict_edges_cci(bd_result.assignment)
     if mode == "cci_aci":
-        conflict_edges += graph.get_conflict_edges_adjacent(bd_result.assignment)
+        conflict_edges += graph.get_conflict_edges_aci(bd_result.assignment)
     conflicting_cells = sorted(set(c for edge in conflict_edges for c in edge))
 
     allocations = {}
@@ -218,7 +218,7 @@ def _build_case_data(record, mode: str) -> dict:
             "conflicts_cci": int(bd_result.n_conflicts_cci),
             "conflicts_aci": int(bd_result.n_conflicts_aci),
             "time_seconds": float(bd_result.wall_time_seconds),
-            "iterations": int(bd_result.n_sweeps),
+            "sweeps": int(bd_result.n_sweeps),
             "used_channels": int(bd_result.used_channels),
         },
         "baselines": baselines,

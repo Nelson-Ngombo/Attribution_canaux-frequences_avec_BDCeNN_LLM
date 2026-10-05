@@ -69,10 +69,11 @@ class ResponseVerifier:
         for n in range(1, 6):
             add(n)
 
-        # Metriques de simulation (Chantier A + D)
+        # [FIX-LLM-SWEEPS] "iterations" remplace par "sweeps", ajout de "num_restarts"
         m = case_data.get("metrics", {})
         for key in ["cost_initial", "cost_final", "conflicts", "conflicts_cci",
-                    "conflicts_aci", "time_seconds", "iterations", "used_channels"]:
+                    "conflicts_aci", "time_seconds", "sweeps", "used_channels",
+                    "num_restarts"]:
             if key in m:
                 add(m[key])
 
@@ -127,12 +128,20 @@ class ResponseVerifier:
         return allowed
 
     def _matches_any_allowed(self, val: float, allowed: Set[float]) -> tuple:
+        # [FIX-LLM-TOL] Ajout d'une tolerance absolue en plus de la tolerance
+        # relative, pour eviter les faux positifs sur les petites valeurs et
+        # les faux negatifs sur les valeurs arrondies.
+        abs_tol = 0.01
         for a in allowed:
-            if a == 0 and val == 0:
-                return True, 0.0
-            if a != 0 and abs(val - a) / abs(a) <= self.tolerance:
+            if val == a:
                 return True, a
-            if abs(val - a) < 1e-9:
+            if a == 0:
+                if abs(val) <= abs_tol:
+                    return True, 0.0
+                continue
+            if abs(val - a) / abs(a) <= self.tolerance:
+                return True, a
+            if abs(val - a) <= abs_tol:
                 return True, a
         return False, 0.0
 

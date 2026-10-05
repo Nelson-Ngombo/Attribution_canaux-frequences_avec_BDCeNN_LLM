@@ -177,12 +177,10 @@ def render():
                 show_labels=show_labels,
                 title=title,
             )
-            fig.update_layout(
-                autosize=True,
-                width=None,
-                height=650,
-                transition_duration=400,
-            )
+            # [FIX] L'appel redondant fig.update_layout(...) a ete retire.
+            # Il ecrasait les ajustements de domaine et de legende definis
+            # dans render_topology_plotly(), et re-injectait des valeurs
+            # par defaut qui reduisaient la zone de trace.
             stable_key = f"graph_plot_{topology.scenario_name}_{topology.seed}"
             st.plotly_chart(
                 fig,
@@ -211,7 +209,7 @@ def render():
     if assignment is not None:
         st.divider()
         conflict_edges = graph.get_conflict_edges_cci(assignment)
-        adj_edges = graph.get_conflict_edges_adjacent(assignment) if mode == "cci_aci" else []
+        adj_edges = graph.get_conflict_edges_aci(assignment) if mode == "cci_aci" else []
 
         with st.expander(
             f"Consulter la liste detaillee des liaisons conflictuelles ({len(conflict_edges)} CCI"
@@ -221,13 +219,21 @@ def render():
             if conflict_edges:
                 st.markdown("**Aretes en conflit co-canal strict (C_CCI) :**")
                 for (i, j) in conflict_edges[:50]:
-                    st.text(f"  Cellule {i} <-> Cellule {j} | canal commun {int(assignment[i])} | poids W_ij={graph.W[i, j]:.1d}")
+                    st.text(
+                        f"  Cellule {i} <-> Cellule {j} | "
+                        f"canal commun {int(assignment[i])} | "
+                        f"poids W_ij={int(graph.W[i, j])}"
+                    )
                 if len(conflict_edges) > 50:
                     st.caption(f"... et {len(conflict_edges) - 50} autres arêtes.")
 
             if adj_edges and mode == "cci_aci":
                 st.markdown("**Aretes en conflit adjacent strict (C_ACI) :**")
                 for (i, j) in adj_edges[:50]:
-                    st.text(f"  Cellule {i} <-> Cellule {j} | canaux voisins {int(assignment[i])}/{int(assignment[j])} | poids W_ij={graph.W[i, j]:.1d}")
+                    st.text(
+                        f"  Cellule {i} <-> Cellule {j} | "
+                        f"canaux voisins {int(assignment[i])}/{int(assignment[j])} | "
+                        f"poids W_ij={int(graph.W[i, j])}"
+                    )
                 if len(adj_edges) > 50:
                     st.caption(f"... et {len(adj_edges) - 50} autres arêtes.")

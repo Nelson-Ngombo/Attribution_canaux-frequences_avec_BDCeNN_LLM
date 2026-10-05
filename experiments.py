@@ -2082,6 +2082,12 @@ def run_experiment_E10(verbose=False):
 
         results_for_model = []
 
+        # [FIX-E10] Accumulateur dedie aux metriques du solveur, separe
+        # des metriques de fidelite LLM. Ce CSV alimente l'audit
+        # validate_results.py, qui ne doit verifier que les donnees
+        # numeriques produites par le solveur et non celles du LLM.
+        solver_metrics_rows = []
+
         for case in cases_def:
             print(f"[AUDIT] Running LLM analysis on case {case['case_id']} under model {model_name}...")
 
@@ -2273,6 +2279,10 @@ def run_experiment_E10(verbose=False):
 
             model_label = "CCI-only" if model_name == "cochannel" else "CCI+ACI"
 
+            # [FIX-E10] Renommage "iterations" -> "sweeps" et ajout de
+            # "num_restarts" pour exposer le budget de restarts au LLM.
+            # Le vocabulaire est ainsi aligne sur la nomenclature figee
+            # du memoire (sweep, restart).
             case_data = {
                 "case_id": case["case_id"],
                 "scenario": case["scenario"],
@@ -2286,8 +2296,9 @@ def run_experiment_E10(verbose=False):
                     "conflicts_cci": int(n_cci_f),
                     "conflicts_aci": int(n_aci_f),
                     "time_seconds": float(time_bd),
-                    "iterations": int(best_sweep),
+                    "sweeps": int(best_sweep),
                     "used_channels": int(used_channels),
+                    "num_restarts": int(num_restarts),
                 },
                 "baselines": baselines,
                 "conflicting_cells": conflicting_cells,
@@ -2299,6 +2310,27 @@ def run_experiment_E10(verbose=False):
                 "topology_meta": topology_meta,
             }
 
+            # [FIX-E10] Accumulation d'une ligne de metriques du solveur
+            # pour alimenter le CSV dedie a l'audit validate_results.py.
+            # Ces metriques sont independantes de la fidelite LLM.
+            solver_metrics_rows.append({
+                "case_id":         case["case_id"],
+                "scenario":        case["scenario"],
+                "N":               int(N),
+                "K":               int(K),
+                "seed":            int(seed),
+                "model_label":     model_label,
+                "num_restarts":    int(num_restarts),
+                "cost_initial":    float(cost_init),
+                "cost_final":      float(cost_final),
+                "conflicts_cci":   int(n_cci_f),
+                "conflicts_aci":   int(n_aci_f),
+                "conflicts_total": int(n_total_f),
+                "time_seconds":    float(time_bd),
+                "sweeps":          int(best_sweep),
+                "used_channels":   int(used_channels),
+            })
+
             try:
                 audit_result = audit_case(case_data, max_correction_attempts=2, model_folder=model_name)
                 results_for_model.append(audit_result)
@@ -2308,6 +2340,18 @@ def run_experiment_E10(verbose=False):
 
         all_results[model_name] = results_for_model
 
+        # [FIX-E10] Export du CSV dedie aux metriques du solveur.
+        # Ce fichier est lu par validate_results.py pour l'audit E10.
+        if solver_metrics_rows:
+            df_solver = pd.DataFrame(solver_metrics_rows)
+            df_solver.to_csv(
+                str(model_csv_dir / "solver_metrics_e10.csv"),
+                index=False,
+                float_format="%.6f",
+            )
+            print(f"[SUCCESS] CSV E10/{folder}/solver_metrics_e10.csv saved.")
+
+        # Export du CSV de fidelite LLM (inchange dans sa structure).
         rows = []
         for r in results_for_model:
             status = r.get("status", "OK")

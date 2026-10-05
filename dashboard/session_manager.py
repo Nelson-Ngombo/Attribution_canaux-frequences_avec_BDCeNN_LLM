@@ -42,7 +42,7 @@ _DEFAULT_STATE = {
 
     # ---------- BD-CeNN hyperparameters ----------
     "num_restarts": config.NUM_RESTARTS,
-    "max_iter": config.MAX_ITER_BD,
+    "max_iter": config.MAX_SWEEPS_BD,
 
     # ---------- Interference mode toggles ----------
     "run_mode_cci": True,
@@ -66,6 +66,8 @@ _DEFAULT_STATE = {
     "llm_response_cci_aci": None,
     "audit_report_cci": None,
     "audit_report_cci_aci": None,
+    "audit_struct_cci": None,
+    "audit_struct_cci_aci": None,
     "llm_view_mode": "cci",
     "llm_case_data_cci": None,
     "llm_case_data_cci_aci": None,
@@ -129,7 +131,7 @@ def initialize_state() -> None:
         try:
             st.session_state["runner"] = ExperimentRunner(
                 num_restarts=st.session_state.get("num_restarts", config.NUM_RESTARTS),
-                max_iter=st.session_state.get("max_iter", config.MAX_ITER_BD),
+                max_iter=st.session_state.get("max_iter", config.MAX_SWEEPS_BD),
             )
         except Exception as e:
             st.session_state["last_error_message"] = f"Runner init failed: {e}"
@@ -152,6 +154,8 @@ def reset_experiment_state() -> None:
         "llm_response_cci_aci",
         "audit_report_cci",
         "audit_report_cci_aci",
+        "audit_struct_cci",
+        "audit_struct_cci_aci",
         "llm_case_data_cci",
         "llm_case_data_cci_aci",
         "last_error_message",
@@ -195,7 +199,7 @@ def refresh_runner() -> None:
     try:
         st.session_state["runner"] = ExperimentRunner(
             num_restarts=st.session_state.get("num_restarts", config.NUM_RESTARTS),
-            max_iter=st.session_state.get("max_iter", config.MAX_ITER_BD),
+            max_iter=st.session_state.get("max_iter", config.MAX_SWEEPS_BD),
         )
     except Exception as e:
         st.session_state["last_error_message"] = f"Runner refresh failed: {e}"

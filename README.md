@@ -48,6 +48,7 @@ BD-CeNN_LLM/
 |-- llm_assistant.py                 # Interface Google Gemini + prompts francais
 |-- verifier.py                      # Auditeur regex independant
 |-- export_manager.py                # Exports CSV/JSON/ZIP
+|-- validate_results.py              # valider les metriques obtenues par les methodes
 |-- visualize_scenarios.py           # Visualisation statique
 |-- experiments.py                   # Campagnes E1-E10
 |-- dashboard/                       # Interface Streamlit (7 onglets)
@@ -69,9 +70,27 @@ BD-CeNN_LLM/
 |   |-- tab_llm_report.py            # Onglet 5
 |   |-- tab_experiments.py           # Onglet 6 (campagnes)
 |   |-- tab_export.py                # Onglet 7
-|-- data_structures/                 # Dataclasses
+|-- data_structures/                 # Dataclasses (contrats inter-modules)
+|   |-- __init__.py                  # Exports centralises
+|   |-- topology.py                  # NetworkTopology
+|   |-- solver_result.py             # SolverResult
+|   |-- experiment_record.py         # ExperimentRecord, MetricsRecord
+|   |-- llm_exchange.py              # LLMQuery, LLMResponse
+|   |-- audit_report.py              # AuditReport, AuditVerification
+|
 |-- scenarios/                       # Registre S1-S7
+|   |-- __init__.py                  # Exports du package
+|   |-- presets.json                 # Definition JSON des scenarios
+|   |-- scenario_registry.py         # Chargement et lookup
+|
 |-- tests/                           # Suite pytest
+|   |-- __init__.py                  # Marqueur de package
+|   |-- test_baselines.py            # Tests Random / Greedy / DSATUR
+|   |-- test_bdcenn_solver.py        # Tests mono-run et multistart
+|   |-- test_data_generator.py       # Tests generation de topologies
+|   |-- test_graph_model.py          # Tests facade InterferenceGraph
+|   |-- test_metrics.py              # Tests metriques cout et conflits
+|   |-- test_verifier.py             # Tests verificateur regex
 |-- outputs/                         # Sorties interactives (auto)
 |-- results/                         # Sorties batch (E1-E10)
 |-- requirements.txt

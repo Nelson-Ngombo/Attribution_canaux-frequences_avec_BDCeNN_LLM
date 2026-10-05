@@ -17,7 +17,10 @@ from scenarios import list_scenarios, get_scenario, get_scenario_description
 from experiment_runner import build_topology
 from dashboard import session_manager as sm
 from dashboard import toast
-from dashboard.chart_factory import create_weight_matrix_heatmap
+from dashboard.chart_factory import (
+    create_weight_matrix_heatmap,
+    create_channel_matrix_heatmap,
+)
 from dashboard.components import (
     section_title,
     kpi_row,
@@ -184,6 +187,35 @@ def _render_custom_params():
     sm.set_value("custom_threshold", threshold)
     sm.set_value("custom_seed", int(seed))
 
+def _apply_nl_to_custom_callback(translated: dict):
+    """
+    Callback execute avant le rerun, donc avant que les widgets soient
+    declares. Permet de synchroniser proprement slider_N, slider_area, etc.
+    sans lever StreamlitAPIException.
+    """
+    # Valeurs metier (source de verite pour _generate_topology_action)
+    # [FIX] Arrondir N et area aux multiples de leur step respectif.
+    n_aligned = int(round(translated["N"] / 5.0) * 5)
+    n_aligned = max(5, min(200, n_aligned))
+
+    area_aligned = int(round(translated["area"] / 10.0) * 10)
+    area_aligned = max(50, min(500, area_aligned))
+
+    # Valeurs metier
+    sm.set_value("custom_N", n_aligned)
+    sm.set_value("custom_K", translated["K"])
+    sm.set_value("custom_area", area_aligned)
+    sm.set_value("custom_threshold", translated["threshold"])
+
+    # Synchronisation des widgets (avec valeurs alignees sur le step)
+    sm.set_value("slider_N", n_aligned)
+    sm.set_value("slider_K", translated["K"])
+    sm.set_value("slider_area", area_aligned)
+    sm.set_value("slider_thr", translated["threshold"])
+
+    # Synchronisation du toggle et du flag metier
+    sm.set_value("toggle_custom", True)
+    sm.set_value("use_custom_params", True)
 
 def _render_nl_translation():
     """Natural language description translation via LLM."""
@@ -261,19 +293,14 @@ def _render_nl_translation():
             "avant de generer la topologie."
         )
 
-        if st.button(
+        st.button(
             "Appliquer aux parametres personnalises",
             type="secondary",
             use_container_width=True,
             key="btn_apply_nl",
-        ):
-            sm.set_value("custom_N", translated["N"])
-            sm.set_value("custom_K", translated["K"])
-            sm.set_value("custom_area", translated["area"])
-            sm.set_value("custom_threshold", translated["threshold"])
-            sm.set_value("use_custom_params", True)
-            toast.success("Parametres appliques. Verifiez les sliders puis generez la topologie.")
-            st.rerun()
+            on_click=_apply_nl_to_custom_callback,
+            args=(translated,),
+        )
 
         if translated.get("raw_response"):
             with st.expander("Reponse brute du LLM"):
@@ -451,6 +478,22 @@ def render():
                     fig,
                     use_container_width=True,
                     key=f"heatmap_{topology.scenario_name}_{topology.seed}",
+                )
+
+            with st.expander("Matrice d'interference inter-canaux M", expanded=False):
+                from metrics import create_channel_interference_matrix
+
+                M = create_channel_interference_matrix(topology.K, decay=0.5, cutoff=2)
+                fig_M = create_channel_matrix_heatmap(M)
+                st.plotly_chart(
+                    fig_M,
+                    use_container_width=True,
+                    key=f"heatmap_M_{topology.scenario_name}_{topology.seed}_{topology.K}",
+                )
+                st.caption(
+                    f"Cette matrice est construite pour K = {topology.K} canaux. "
+                    "Elle quantifie l'attenuation spectrale entre deux canaux "
+                    "distants de |k - l| positions."
                 )
 
             st.markdown("---")

@@ -302,11 +302,19 @@ def _fmt(value, ndigits=2):
     return str(value)
 
 
-def _conflicts_label(model_label: str) -> str:
+def _conflicts_summary_text(m: dict, model_label: str) -> str:
+    """
+    [FIX-LLM-CCI-ACI] Retourne un texte synthetique des conflits adapte au regime.
+    En mode adjacent, expose C_CCI, C_ACI et C_tot separement.
+    En mode co-canal, n'expose que C_CCI (C_ACI nul par construction).
+    """
     if model_label == "CCI+ACI":
-        return "Conflits totaux (CCI+ACI)"
-    return "Conflits co-canal (CCI)"
-
+        return (
+            f"C_CCI = {int(m.get('conflicts_cci', 0))}, "
+            f"C_ACI = {int(m.get('conflicts_aci', 0))}, "
+            f"C_tot = {int(m.get('conflicts', 0))}"
+        )
+    return f"C_CCI = {int(m.get('conflicts_cci', 0))}"
 
 # -----------------------------------------------------------------------------
 # A. SYSTEM DIRECTIVES AND PROMPT SCHEMAS (Chantiers A + D)
@@ -338,7 +346,7 @@ alertes, respecte les consignes de redaction suivantes :
 
   REGLE 2 - COMPTEURS LITTERAIRES : EN TOUTES LETTRES.
   Epelle en toutes lettres toutes les autres valeurs d'ordre de grandeur :
-  "trois algorithmes de reference", "deux regimes d'interference", "cinq sweeps consecutifs".
+  "trois algorithmes de reference", "deux regimes d'interference", "six criteres d'evaluation".
 """
 
 
@@ -478,8 +486,9 @@ def build_prompt(case_data: dict) -> str:
 - Cout initial de l'energie J_0 : {_fmt(m.get('cost_initial'))}
 - Cout final J(x*) : {_fmt(m.get('cost_final'))}
 - Temps d'execution du solveur t_exec : {_fmt(m.get('time_seconds'), 6)} s
-- Nombre de balayages (sweeps) effectues : {_fmt(m.get('iterations'))}
+- Nombre de balayages (sweeps) effectues : {_fmt(m.get('sweeps'))}
 - Nombre de canaux utilises : {_fmt(m.get('used_channels'))}
+- Nombre de restarts du solveur : {_fmt(m.get('num_restarts'))}
 
 === ANALYSE COMPARATIVE (BASELINES) ===
 {baseline_str}
@@ -730,9 +739,11 @@ def _collect_allowed_numbers(case_data: dict) -> set:
         add(n)
 
     m = case_data.get("metrics", {})
-    # Whitelist des compteurs de conflits separes (Chantier A) et sweeps (Chantier D)
+    # [FIX-LLM-SWEEPS] Whitelist mise a jour : "iterations" remplace par
+    # "sweeps", et ajout de "num_restarts" pour E10.
     for key in ["cost_initial", "cost_final", "conflicts", "conflicts_cci",
-                "conflicts_aci", "time_seconds", "iterations", "used_channels"]:
+                "conflicts_aci", "time_seconds", "sweeps", "used_channels",
+                "num_restarts"]:
         if key in m:
             add(m[key])
 
@@ -818,6 +829,163 @@ def verify_numbers(llm_response: str, case_data: dict, tolerance: float = 0.01) 
         "accuracy_rate": accuracy,
     }
 
+# -----------------------------------------------------------------------------
+# C-bis. VERIFICATEUR STRUCTURE (scenario, methode, metrique, valeur)
+# -----------------------------------------------------------------------------
+# Le superviseur a demande de depasser la simple whitelist numerique pour
+# verifier l'association complete (methode, metrique, valeur), afin de
+# detecter les cas ou le LLM attribue a une methode un chiffre qui
+# appartient en realite a une autre.
+
+STRUCTURED_CLAIM_PATTERNS = [
+    # "le coût du BD-CeNN vaut 19,30"
+    (re.compile(
+        r"(?:co[ûu]t|J\(x\)|[ée]nergie)\s+(?:du|de\s+la\s+m[ée]thode|de)\s+"
+        r"(BD-CeNN|Greedy|DSATUR|Random)\s+"
+        r"(?:vaut|est|atteint|s'[ée]l[èe]ve\s+[àa]|s'[ée]tablit\s+[àa])\s+"
+        r"(-?\d+(?:[.,]\d+)?)",
+        re.IGNORECASE),
+     "cost"),
+
+    # "C_CCI du BD-CeNN vaut 24,7"
+    (re.compile(
+        r"(C_CCI|C_ACI|C_tot|C_\{CCI\}|C_\{ACI\}|C_\{tot\})\s+"
+        r"(?:du|de)\s+(BD-CeNN|Greedy|DSATUR|Random)\s+"
+        r"(?:vaut|est|atteint|s'[ée]l[èe]ve\s+[àa])\s+"
+        r"(-?\d+(?:[.,]\d+)?)",
+        re.IGNORECASE),
+     "conflict_metric"),
+
+    # "temps d'exécution du BD-CeNN atteint 90,88"
+    (re.compile(
+        r"temps\s+d['\u2019]ex[ée]cution\s+(?:du|de)\s+"
+        r"(BD-CeNN|Greedy|DSATUR|Random)\s+"
+        r"(?:atteint|vaut|est)\s+"
+        r"(-?\d+(?:[.,]\d+)?)",
+        re.IGNORECASE),
+     "time"),
+]
+
+
+def _numbers_match(val: float, ref: float,
+                   rel_tol: float = 0.01, abs_tol: float = 0.01) -> bool:
+    """Comparaison tolerante : relative ET absolue."""
+    if val == ref:
+        return True
+    if ref == 0:
+        return abs(val) <= abs_tol
+    return (abs(val - ref) / abs(ref) <= rel_tol) or (abs(val - ref) <= abs_tol)
+
+
+def _build_structured_facts(case_data: dict) -> list:
+    """Construit la base de faits certifies (methode, metrique, valeur)."""
+    facts = []
+    scenario = case_data.get("scenario", "")
+
+    m = case_data.get("metrics", {})
+    bd_metrics = [
+        ("cost_initial", "cost_initial"),
+        ("cost_final",   "cost_final"),
+        ("C_CCI",        "conflicts_cci"),
+        ("C_ACI",        "conflicts_aci"),
+        ("C_tot",        "conflicts"),
+        ("time",         "time_seconds"),
+        ("sweeps",       "sweeps"),
+        ("used_channels", "used_channels"),
+    ]
+    for metric_label, key in bd_metrics:
+        if key in m:
+            facts.append({
+                "scenario": scenario,
+                "method":   "BD-CeNN",
+                "metric":   metric_label,
+                "value":    float(m[key]),
+            })
+
+    for base_name, base_data in case_data.get("baselines", {}).items():
+        for metric_label, key in [
+            ("cost",  "cost"),
+            ("C_CCI", "conflicts_cci"),
+            ("C_ACI", "conflicts_aci"),
+            ("C_tot", "conflicts_total"),
+        ]:
+            if key in base_data:
+                facts.append({
+                    "scenario": scenario,
+                    "method":   base_name,
+                    "metric":   metric_label,
+                    "value":    float(base_data[key]),
+                })
+
+    return facts
+
+
+def _extract_structured_claims(text: str) -> list:
+    """Extrait les revendications (methode, metrique, valeur) du texte LLM."""
+    claims = []
+    for pattern, kind in STRUCTURED_CLAIM_PATTERNS:
+        for match in pattern.finditer(text):
+            groups = match.groups()
+            try:
+                value = float(groups[-1].replace(",", "."))
+            except ValueError:
+                continue
+
+            if kind == "cost":
+                method = groups[0]
+                metric = "cost"
+            elif kind == "time":
+                method = groups[0]
+                metric = "time"
+            elif kind == "conflict_metric":
+                raw = groups[0].upper().replace("\\", "").replace("{", "").replace("}", "")
+                method = groups[1]
+                if raw == "C_CCI":
+                    metric = "C_CCI"
+                elif raw == "C_ACI":
+                    metric = "C_ACI"
+                else:
+                    metric = "C_tot"
+            else:
+                continue
+
+            claims.append({
+                "method": method,
+                "metric": metric,
+                "value":  value,
+                "raw":    match.group(0),
+            })
+    return claims
+
+
+def verify_structured_claims(text: str, case_data: dict,
+                              rel_tol: float = 0.01,
+                              abs_tol: float = 0.01) -> dict:
+    """
+    Verifie les associations (scenario, methode, metrique, valeur).
+    Retourne un rapport distinct de la verification numerique pure.
+    """
+    facts  = _build_structured_facts(case_data)
+    claims = _extract_structured_claims(text)
+
+    valid, invalid = [], []
+    for claim in claims:
+        matched = False
+        for fact in facts:
+            if (fact["method"] == claim["method"]
+                and fact["metric"] == claim["metric"]
+                and _numbers_match(claim["value"], fact["value"], rel_tol, abs_tol)):
+                matched = True
+                break
+        (valid if matched else invalid).append(claim)
+
+    return {
+        "valid_claims":         valid,
+        "invalid_claims":       invalid,
+        "has_structured_error": len(invalid) > 0,
+        "total_claims":         len(claims),
+        "accuracy_rate_struct": (len(valid) / len(claims) * 100.0) if claims else 100.0,
+    }
 
 def regenerate_with_correction(case_data: dict, original_prompt: str,
                                 llm_response: str, verification: dict) -> str:
@@ -831,14 +999,14 @@ def regenerate_with_correction(case_data: dict, original_prompt: str,
 
     m = case_data.get("metrics", {})
     model_label = case_data.get("model_label", "CCI-only")
-    conflicts_label = _conflicts_label(model_label)
 
+    # [FIX-LLM-CCI-ACI] Decomposition explicite en mode adjacent
     allowed_summary = (
         f"Cout initial = {_fmt(m.get('cost_initial'))} ; "
         f"Cout final = {_fmt(m.get('cost_final'))} ; "
-        f"{conflicts_label} = {_fmt(m.get('conflicts'))} ; "
+        f"{_conflicts_summary_text(m, model_label)} ; "
         f"Temps = {_fmt(m.get('time_seconds'), 6)} s ; "
-        f"Balayages (sweeps) = {_fmt(m.get('iterations'))} ; "
+        f"Balayages (sweeps) = {_fmt(m.get('sweeps'))} ; "
         f"Canaux utilises = {_fmt(m.get('used_channels'))}."
     )
 
@@ -871,6 +1039,14 @@ def generate_pdf_report(
     verification_initial: dict, corrected_response: str,
     verification_final: dict, output_path: Path, model_name: str = None,
 ) -> None:
+    """
+    [FIX-REPORT] Rapport PDF d'audit LLM enrichi :
+      Section 1 : Donnees de simulation
+      Section 2 : Prompt de simulation (integral)
+      Section 3 : Rapport Assistant LLM (reponse brute)
+      Section 4 : Audit numerique du verificateur LLM
+      Section 5 : Rapport Assistant LLM corrige (si applicable)
+    """
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -896,6 +1072,12 @@ def generate_pdf_report(
         "BodyCustom", parent=styles["BodyText"],
         fontSize=9.5, leading=13, alignment=TA_LEFT
     )
+    # [FIX-REPORT] Style monospace pour le prompt integral
+    style_mono = ParagraphStyle(
+        "MonoCustom", parent=styles["BodyText"],
+        fontName="Courier", fontSize=7.5, leading=9.5,
+        alignment=TA_LEFT, textColor=colors.HexColor("#1e293b")
+    )
 
     doc = SimpleDocTemplate(
         str(output_path), pagesize=A4,
@@ -905,7 +1087,6 @@ def generate_pdf_report(
 
     story = []
     model_label = case_data.get("model_label", "CCI-only")
-    conflicts_label = _conflicts_label(model_label)
 
     story.append(Paragraph(
         f"Rapport d'audit LLM - Attribution de canaux ({model_label})", style_title
@@ -937,17 +1118,38 @@ def generate_pdf_report(
     story.append(Paragraph(badge, style_body))
     story.append(Spacer(1, 0.4*cm))
 
+    # =========================================================================
+    # SECTION 1 : Donnees de simulation
+    # =========================================================================
     story.append(Paragraph("1. Donnees de simulation", style_h1))
     m = case_data.get("metrics", {})
-    sim_data = [
-        ["Metrique", "Valeur"],
-        ["Cout initial", _fmt(m.get("cost_initial"))],
-        ["Cout final", _fmt(m.get("cost_final"))],
-        [conflicts_label, _fmt(m.get("conflicts"))],
-        ["Temps (s)", _fmt(m.get("time_seconds"), 6)],
-        ["Balayages (sweeps)", _fmt(m.get("iterations"))],
-        ["Canaux", _fmt(m.get("used_channels"))],
-    ]
+
+    # [FIX-LLM-CCI-ACI] Tableau adapte au regime : en adjacent, les trois
+    # composantes C_CCI, C_ACI, C_tot sont affichees separement.
+    if model_label == "CCI+ACI":
+        sim_data = [
+            ["Metrique", "Valeur"],
+            ["Cout initial", _fmt(m.get("cost_initial"))],
+            ["Cout final", _fmt(m.get("cost_final"))],
+            ["Conflits C_CCI", _fmt(m.get("conflicts_cci"))],
+            ["Conflits C_ACI", _fmt(m.get("conflicts_aci"))],
+            ["Conflits C_tot", _fmt(m.get("conflicts"))],
+            ["Temps (s)", _fmt(m.get("time_seconds"), 6)],
+            ["Balayages (sweeps)", _fmt(m.get("sweeps"))],
+            ["Canaux utilises", _fmt(m.get("used_channels"))],
+            ["Restarts", _fmt(m.get("num_restarts"))],
+        ]
+    else:
+        sim_data = [
+            ["Metrique", "Valeur"],
+            ["Cout initial", _fmt(m.get("cost_initial"))],
+            ["Cout final", _fmt(m.get("cost_final"))],
+            ["Conflits C_CCI", _fmt(m.get("conflicts_cci"))],
+            ["Temps (s)", _fmt(m.get("time_seconds"), 6)],
+            ["Balayages (sweeps)", _fmt(m.get("sweeps"))],
+            ["Canaux utilises", _fmt(m.get("used_channels"))],
+            ["Restarts", _fmt(m.get("num_restarts"))],
+        ]
     sim_table = Table(sim_data, colWidths=[7*cm, 5*cm])
     sim_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d6d")),
@@ -958,9 +1160,116 @@ def generate_pdf_report(
     story.append(sim_table)
     story.append(Spacer(1, 0.4*cm))
 
-    story.append(Paragraph("2. Reponse brute", style_h1))
-    raw_esc = raw_response.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # =========================================================================
+    # SECTION 2 : Prompt de simulation (integral)
+    # =========================================================================
+    # [FIX-REPORT] Le prompt envoye au LLM est reproduit dans le rapport
+    # pour garantir la tracabilite complete de la requete.
+    story.append(Paragraph("2. Prompt de simulation", style_h1))
+    story.append(Spacer(1, 0.15*cm))
+    prompt_esc = (prompt.replace("&", "&amp;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;"))
+    story.append(Paragraph(prompt_esc.replace("\n", "<br/>"), style_mono))
+    story.append(Spacer(1, 0.4*cm))
+
+    # =========================================================================
+    # SECTION 3 : Rapport Assistant LLM
+    # =========================================================================
+    # [FIX-REPORT] Renommage de "Reponse brute" en "Rapport Assistant LLM"
+    # pour refleter la nature qualitative du contenu produit par le modele.
+    story.append(Paragraph("3. Rapport Assistant LLM", style_h1))
+    raw_esc = (raw_response.replace("&", "&amp;")
+                          .replace("<", "&lt;")
+                          .replace(">", "&gt;"))
     story.append(Paragraph(raw_esc.replace("\n", "<br/>"), style_body))
+    story.append(Spacer(1, 0.4*cm))
+
+    # =========================================================================
+    # SECTION 4 : Audit numerique du verificateur LLM
+    # =========================================================================
+    # [FIX-REPORT] Tableau recapitulatif du travail de verification.
+    # Affiche les nombres extraits, valides et inventes, avec les taux
+    # d'exactitude avant et apres correction.
+    story.append(Paragraph("4. Audit numerique du verificateur LLM", style_h1))
+    story.append(Spacer(1, 0.15*cm))
+
+    def _fmt_num_list(pairs, max_show=8):
+        """Formate une liste de (valeur, representation brute)."""
+        if not pairs:
+            return "aucune"
+        shown = pairs[:max_show]
+        txt = ", ".join(f"{raw}" for _, raw in shown)
+        if len(pairs) > max_show:
+            txt += f" ... (+{len(pairs) - max_show})"
+        return txt
+
+    audit_data = [
+        ["Indicateur", "Avant correction", "Apres correction"],
+        [
+            "Nombre total de valeurs extraites",
+            str(len(verification_initial["all_numbers"])),
+            str(len(verification_final["all_numbers"])),
+        ],
+        [
+            "Valeurs conformes",
+            str(len(verification_initial["valid_numbers"])),
+            str(len(verification_final["valid_numbers"])),
+        ],
+        [
+            "Valeurs inventees (hallucinations)",
+            str(len(verification_initial["invented_numbers"])),
+            str(len(verification_final["invented_numbers"])),
+        ],
+        [
+            "Taux d'exactitude",
+            f"{verification_initial['accuracy_rate']:.1f}%",
+            f"{verification_final['accuracy_rate']:.1f}%",
+        ],
+        [
+            "Statut",
+            "NON CERTIFIE" if verification_initial["has_hallucination"] else "CERTIFIE",
+            "NON CERTIFIE" if verification_final["has_hallucination"] else "CERTIFIE",
+        ],
+    ]
+    audit_table = Table(audit_data, colWidths=[7*cm, 4.5*cm, 4.5*cm])
+    audit_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d6d")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+    ]))
+    story.append(audit_table)
+    story.append(Spacer(1, 0.3*cm))
+
+    # Detail des valeurs inventees (avant correction)
+    if verification_initial["invented_numbers"]:
+        detail_txt = (
+            "<b>Valeurs inventees detectees (avant correction) :</b> "
+            + _fmt_num_list(verification_initial["invented_numbers"])
+        )
+        story.append(Paragraph(detail_txt, style_body))
+        story.append(Spacer(1, 0.2*cm))
+
+    # Nombre de tentatives de correction
+    story.append(Paragraph(
+        f"<b>Nombre de tentatives de correction :</b> "
+        f"{case_data.get('correction_attempts', 0)}",
+        style_body
+    ))
+    story.append(Spacer(1, 0.4*cm))
+
+    # =========================================================================
+    # SECTION 5 : Rapport Assistant LLM corrige (si applicable)
+    # =========================================================================
+    if corrected_response and corrected_response != raw_response:
+        story.append(Paragraph("5. Rapport Assistant LLM corrige", style_h1))
+        corr_esc = (corrected_response.replace("&", "&amp;")
+                                     .replace("<", "&lt;")
+                                     .replace(">", "&gt;"))
+        story.append(Paragraph(corr_esc.replace("\n", "<br/>"), style_body))
 
     doc.build(story)
 
@@ -1002,10 +1311,14 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
 
     with open(raw_dir / f"{case_id}_raw_response.txt", "w", encoding="utf-8") as f:
         f.write(raw_response)
-
     verification_initial = verify_numbers(raw_response, case_data)
+
+    # [FIX-LLM-STRUCT] Verification structuree en complement
+    verification_struct_initial = verify_structured_claims(raw_response, case_data)
+
     corrected_response = raw_response
     verification_final = verification_initial
+    verification_struct_final = verification_struct_initial
     correction_attempts = 0
 
     while verification_final["has_hallucination"] and correction_attempts < max_correction_attempts:
@@ -1017,12 +1330,19 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
             corrected_response = raw_response
             break
         verification_final = verify_numbers(corrected_response, case_data)
+        verification_struct_final = verify_structured_claims(corrected_response, case_data)
         with open(raw_dir / f"{case_id}_corrected_v{correction_attempts}.txt", "w", encoding="utf-8") as f:
             f.write(corrected_response)
 
     pdf_path = reports_dir / f"rapport_{case_id}_{case_data.get('scenario')}.pdf"
+
+    # [FIX-REPORT] Enrichissement du case_data avec le compteur de tentatives
+    # pour que generate_pdf_report puisse l'afficher.
+    case_data_with_attempts = dict(case_data)
+    case_data_with_attempts["correction_attempts"] = correction_attempts
+
     generate_pdf_report(
-        case_data=case_data, prompt=prompt,
+        case_data=case_data_with_attempts, prompt=prompt,
         raw_response=raw_response, verification_initial=verification_initial,
         corrected_response=corrected_response, verification_final=verification_final,
         output_path=pdf_path, model_name=get_active_model(),
@@ -1036,6 +1356,8 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
         "raw_response": raw_response, "corrected_response": corrected_response,
         "verification_initial": verification_initial,
         "verification_final": verification_final,
+        "verification_struct_initial": verification_struct_initial,
+        "verification_struct_final": verification_struct_final,
         "correction_attempts": correction_attempts,
         "pdf_path": str(pdf_path), "status": "OK",
     }

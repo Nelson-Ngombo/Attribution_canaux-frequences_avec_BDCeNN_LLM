@@ -43,10 +43,10 @@ def _build_case_data(record, mode: str) -> dict:
         cost_init = graph.compute_cost(bd_result.initial_assignment, mode)
     else:
         cost_init = 0.0
-
+ 
     conflict_edges = graph.get_conflict_edges_cci(bd_result.assignment)
     if mode == "cci_aci":
-        conflict_edges += graph.get_conflict_edges_adjacent(bd_result.assignment)
+        conflict_edges += graph.get_conflict_edges_aci(bd_result.assignment)
     conflicting_cells = sorted(set(c for edge in conflict_edges for c in edge))
 
     allocations = {}
@@ -106,7 +106,7 @@ def _build_case_data(record, mode: str) -> dict:
             "conflicts_cci": int(bd_result.n_conflicts_cci),
             "conflicts_aci": int(bd_result.n_conflicts_aci),
             "time_seconds": float(bd_result.wall_time_seconds),
-            "iterations": int(bd_result.n_sweeps),  # sweeps mapped for LLM key
+            "sweeps": int(bd_result.n_sweeps),  # sweeps mapped for LLM key
             "used_channels": int(bd_result.used_channels),
         },
         "baselines": baselines,
@@ -145,6 +145,14 @@ def _generate_llm_report(mode: str):
         verifier = sm.get("verifier")
         audit = verifier.audit(response, case_data)
         sm.set_value(f"audit_report_{mode}", audit)
+
+        # Audit structurel complementaire (chantier superviseur section 13)
+        try:
+            from llm_assistant import verify_structured_claims
+            audit_struct = verify_structured_claims(response, case_data)
+            sm.set_value(f"audit_struct_{mode}", audit_struct)
+        except Exception:
+            sm.set_value(f"audit_struct_{mode}", None)
 
         if audit.status == "CERTIFIED":
             toast.success(f"Rapport genere et certifie ({MODE_LABELS[mode]})")
@@ -326,3 +334,15 @@ def render():
                 st.markdown(f"**Divergences (hallucinations)** : {audit_report.invented_count}")
                 st.markdown(f"**Tolerance appliquee** : {audit_report.tolerance * 100:.1f}%")
                 st.markdown(f"**Heure de l'audit** : {audit_report.timestamp}")
+        audit_struct = sm.get(f"audit_struct_{mode}")
+        if audit_struct is not None and audit_struct.get("total_claims", 0) > 0:
+            with st.expander("Verification structurelle (methode, metrique, valeur)"):
+                st.markdown(f"**Revendications extraites** : {audit_struct['total_claims']}")
+                st.markdown(f"**Valides** : {len(audit_struct['valid_claims'])}")
+                st.markdown(f"**Invalides** : {len(audit_struct['invalid_claims'])}")
+            if audit_struct["invalid_claims"]:
+                for claim in audit_struct["invalid_claims"]:
+                    st.warning(
+                        f"Association invalide : {claim['method']} / "
+                        f"{claim['metric']} / {claim['value']}"
+                    )
