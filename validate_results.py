@@ -3030,6 +3030,288 @@ def _e9_standalone_metric_groups(mode: str):
             ("cost_ratio",      "CostRatio",   1),
         ]
 
+# ============================================================================
+# [FIX-E1-TABLES] Tables standalone de l'experience E1 (scenario S1)
+# ============================================================================
+# Deux PDFs A4 portrait par regime, au format booktabs du memoire :
+#   table_e1_cell_channels_{mode}.pdf  : canal attribue a chaque cellule
+#   table_e1_global_metrics_{mode}.pdf : J(x), C_CCI, C_ACI, C_tot, K_used
+# La numerotation "Table X" reste geree par LaTeX.
+
+# (colonne de cell_channels.csv, libelle affiche)
+_E1_ALLOCATION_COLUMNS = [
+    ("Random", "Random"),
+    ("Greedy", "Greedy"),
+    ("DSATUR", "DSATUR"),
+    ("BD-CeNN_initial", "Initial"),
+    ("BD-CeNN_final", "Final"),
+]
+
+# (valeur de la colonne Method de method_metrics.csv, libelle de ligne)
+_E1_METHOD_ROWS = [
+    ("Random", "Random"),
+    ("Greedy", "Greedy"),
+    ("DSATUR", "DSATUR"),
+    ("BD-CeNN_initial", "BD-CeNN init"),
+    ("BD-CeNN_final", "BD-CeNN fin"),
+]
+
+# Epaisseurs equivalentes a \toprule / \bottomrule et \midrule / \cmidrule
+_E1_RULE_HEAVY = 0.9
+_E1_RULE_LIGHT = 0.5
+
+# Facteur d'agrandissement global : polices, interlignes, marges internes et
+# largeurs de colonnes. 1.35 donne un tableau d'environ 17 cm sur A4 portrait.
+_E1_SCALE = 1.35
+
+
+def _e1_regime_label(mode: str) -> str:
+    if mode == "adjacent":
+        return "co-canal + canal adjacent (CCI+ACI)"
+    return "co-canal (CCI-only)"
+
+
+def _e1_styles() -> dict:
+    """Styles Times proches du rendu Computer Modern du memoire."""
+    styles = getSampleStyleSheet()
+
+    def _style(name, font, size=10, align=TA_CENTER, leading=12.5):
+        return ParagraphStyle(name, parent=styles["Normal"], fontName=font,
+                              fontSize=size * _E1_SCALE,
+                              leading=leading * _E1_SCALE, alignment=align)
+
+    return {
+        "caption": _style("E1Caption", "Times-Roman", 10.5, TA_CENTER, 13),
+        "header": _style("E1Header", "Times-Roman"),
+        "header_bold": _style("E1HeaderBold", "Times-Bold"),
+        "header_left": _style("E1HeaderLeft", "Times-Roman", align=TA_LEFT),
+        "cell": _style("E1Cell", "Times-Roman"),
+        "cell_left": _style("E1CellLeft", "Times-Roman", align=TA_LEFT),
+        "note": _style("E1Note", "Times-Italic", 8, TA_LEFT, 11),
+    }
+
+
+def _e1_booktabs_commands(n_header_rows: int) -> list:
+    """Filets horizontaux seuls, sans grille (convention booktabs)."""
+    last_hdr = n_header_rows - 1
+    return [
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEABOVE", (0, 0), (-1, 0), _E1_RULE_HEAVY, colors.black),
+        ("LINEBELOW", (0, last_hdr), (-1, last_hdr), _E1_RULE_LIGHT, colors.black),
+        ("LINEBELOW", (0, -1), (-1, -1), _E1_RULE_HEAVY, colors.black),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5 * _E1_SCALE),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5 * _E1_SCALE),
+        ("TOPPADDING", (0, n_header_rows), (-1, n_header_rows), 5 * _E1_SCALE),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 5 * _E1_SCALE),
+    ]
+
+
+def _e1_framed_story(caption_txt, tbl, note_txt, width, st) -> list:
+    """Legende et note contraintes a la largeur du tableau."""
+    def _boxed(paragraph):
+        box = Table([[paragraph]], colWidths=[width])
+        box.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                 ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+        return box
+
+    return [
+        _boxed(Paragraph(caption_txt, st["caption"])),
+        Spacer(1, 0.2 * cm),
+        tbl,
+        Spacer(1, 0.25 * cm),
+        _boxed(Paragraph(note_txt, st["note"])),
+    ]
+
+
+def _e1_build_document(story, output_path: Path) -> None:
+    doc = SimpleDocTemplate(
+        str(output_path), pagesize=A4,
+        leftMargin=1.0 * cm, rightMargin=1.0 * cm,
+        topMargin=1.0 * cm, bottomMargin=0.8 * cm,
+    )
+    doc.build(story)
+
+
+def _build_e1_cell_channels_pdf(mode: str, df_cells: pd.DataFrame,
+                                output_path: Path) -> bool:
+    """
+    [FIX-E1-TABLES] Table cellule x methode : en-tete a deux niveaux avec
+    BD-CeNN subdivise en Initial / Final (cmidrule sous le groupe).
+    """
+    if not REPORTLAB_AVAILABLE or df_cells.empty:
+        return False
+    required = ["Cell"] + [col for col, _ in _E1_ALLOCATION_COLUMNS]
+    missing = [col for col in required if col not in df_cells.columns]
+    if missing:
+        print(f"[WARNING] E1/{mode} cell_channels.csv : colonnes absentes {missing}")
+        return False
+
+    st = _e1_styles()
+    hdr = st["header_bold"]
+    df_cells = df_cells.sort_values("Cell").reset_index(drop=True)
+    n_baselines = 3
+
+    row_top = [Paragraph("<b>Cellule</b>", hdr)]
+    row_top += [Paragraph(f"<b>{lbl}</b>", hdr)
+                for _, lbl in _E1_ALLOCATION_COLUMNS[:n_baselines]]
+    row_top += [Paragraph("<b>BD-CeNN</b>", hdr), ""]
+    row_sub = [""] * (1 + n_baselines)
+    row_sub += [Paragraph(f"<b>{lbl}</b>", hdr)
+                for _, lbl in _E1_ALLOCATION_COLUMNS[n_baselines:]]
+
+    table_data = [row_top, row_sub]
+    for _, row in df_cells.iterrows():
+        values = [int(row["Cell"])] + [int(row[col]) for col, _ in _E1_ALLOCATION_COLUMNS]
+        table_data.append([Paragraph(str(v), st["cell"]) for v in values])
+
+    col_widths = ([2.2 * _E1_SCALE * cm] * (1 + n_baselines)
+                  + [1.9 * _E1_SCALE * cm] * 2)
+    tbl = Table(table_data, colWidths=col_widths, repeatRows=2)
+
+    cmds = _e1_booktabs_commands(n_header_rows=2)
+    for k in range(1 + n_baselines):
+        cmds.append(("SPAN", (k, 0), (k, 1)))
+    bd_first = 1 + n_baselines
+    cmds.append(("SPAN", (bd_first, 0), (bd_first + 1, 0)))
+    cmds.append(("LINEBELOW", (bd_first, 0), (bd_first + 1, 0),
+                 _E1_RULE_LIGHT, colors.black))
+    tbl.setStyle(TableStyle(cmds))
+
+    seed = int(df_cells["seed"].iloc[0]) if "seed" in df_cells.columns else None
+    seed_txt = f", seed = {seed}" if seed is not None else ""
+    caption_txt = (
+        f"Attribution des canaux par méthode pour chaque cellule, régime "
+        f"{_e1_regime_label(mode)}, scénario S1 (N = {len(df_cells)}{seed_txt})"
+    )
+    note_txt = (
+        "<i>Note.</i> Canaux indexés de 0 à K - 1. BD-CeNN Initial = état de départ "
+        "de la dynamique enregistré par le solveur ; BD-CeNN Final = allocation "
+        "retenue après convergence du multistart."
+        + _traceability_note("E1", mode)
+    )
+
+    _e1_build_document(
+        _e1_framed_story(caption_txt, tbl, note_txt, sum(col_widths), st),
+        output_path,
+    )
+    return True
+
+
+def _build_e1_global_metrics_pdf(mode: str, df_metrics: pd.DataFrame,
+                                 output_path: Path) -> bool:
+    """
+    [FIX-E1-TABLES] Table des metriques globales par methode. Les colonnes
+    C_ACI et C_tot sont conservees en CCI-only (valeurs nulles par
+    construction) pour garder une structure identique entre les deux regimes.
+    """
+    if not REPORTLAB_AVAILABLE or df_metrics.empty:
+        return False
+    required = ["Method", "Cout", "conflicts_cci", "conflicts_aci",
+                "conflicts_total", "used_channels"]
+    missing = [col for col in required if col not in df_metrics.columns]
+    if missing:
+        print(f"[WARNING] E1/{mode} method_metrics.csv : colonnes absentes {missing}")
+        return False
+
+    st = _e1_styles()
+    hdr = st["header"]
+    header = [
+        Paragraph("Méthode", st["header_left"]),
+        Paragraph("<i>J</i>(<i>x</i>)", hdr),
+        Paragraph("<i>C</i><sub>CCI</sub>", hdr),
+        Paragraph("<i>C</i><sub>ACI</sub>", hdr),
+        Paragraph("<i>C</i><sub>tot</sub>", hdr),
+        Paragraph("<i>K</i><sub>used</sub>", hdr),
+    ]
+
+    table_data = [header]
+    by_method = df_metrics.set_index("Method")
+    for key, label in _E1_METHOD_ROWS:
+        if key not in by_method.index:
+            continue
+        r = by_method.loc[key]
+        cost_txt = f"{float(r['Cout']):.2f}".replace(".", ",")
+        counters = [int(r["conflicts_cci"]), int(r["conflicts_aci"]),
+                    int(r["conflicts_total"]), int(r["used_channels"])]
+        table_data.append(
+            [Paragraph(label, st["cell_left"]), Paragraph(cost_txt, st["cell"])]
+            + [Paragraph(str(v), st["cell"]) for v in counters]
+        )
+    if len(table_data) == 1:
+        return False
+
+    col_widths = [3.0 * _E1_SCALE * cm] + [1.6 * _E1_SCALE * cm] * 5
+    tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+    tbl.setStyle(TableStyle(_e1_booktabs_commands(n_header_rows=1)))
+
+    K = int(df_metrics["K"].iloc[0]) if "K" in df_metrics.columns else None
+    seed = int(df_metrics["seed"].iloc[0]) if "seed" in df_metrics.columns else None
+    params = ", ".join(p for p in (
+        f"K = {K}" if K is not None else "",
+        f"seed = {seed}" if seed is not None else "",
+    ) if p)
+    caption_txt = (
+        f"Métriques globales en régime {_e1_regime_label(mode)}, scénario S1"
+        + (f" ({params})" if params else "") + "."
+    )
+
+    note_parts = ["<i>Note.</i>", _NOTE_C_CCI]
+    if mode == "adjacent":
+        note_parts.append(
+            "C<sub>ACI</sub> = conflits adjacents, "
+            "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
+        )
+    else:
+        note_parts.append(
+            "En régime CCI-only, C<sub>ACI</sub> = 0 par construction et "
+            "C<sub>tot</sub> = C<sub>CCI</sub>."
+        )
+    note_parts.append("K<sub>used</sub> = nombre de canaux distincts utilisés.")
+    note_txt = " ".join(note_parts) + _traceability_note("E1", mode)
+
+    _e1_build_document(
+        _e1_framed_story(caption_txt, tbl, note_txt, sum(col_widths), st),
+        output_path,
+    )
+    return True
+
+
+def _generate_e1_standalone_tables(mode: str):
+    """
+    [FIX-E1-TABLES] Genere les 2 PDFs standalone de E1 sous un regime, dans
+    results/validation/E1/{mode}/tables/.
+    """
+    if not REPORTLAB_AVAILABLE:
+        print("[WARNING] ReportLab indisponible : tables E1 standalone ignorees.")
+        return
+
+    csv_dir = config.CSV_DIR / "E1" / mode
+    out_dir = config.VALIDATION_DIR / "E1" / mode / "tables"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    jobs = [
+        ("cell_channels.csv", f"table_e1_cell_channels_{mode}.pdf",
+         _build_e1_cell_channels_pdf),
+        ("method_metrics.csv", f"table_e1_global_metrics_{mode}.pdf",
+         _build_e1_global_metrics_pdf),
+    ]
+    n_ok = 0
+    for csv_name, pdf_name, builder in jobs:
+        csv_path = csv_dir / csv_name
+        if not csv_path.exists():
+            print(f"[INFO] Pas de {csv_name} pour E1/{mode} : table ignoree.")
+            continue
+        try:
+            if builder(mode, pd.read_csv(csv_path), out_dir / pdf_name):
+                n_ok += 1
+                print(f"[SUCCESS] Table E1 standalone : {pdf_name}")
+        except Exception as e:
+            print(f"[ERROR] Echec generation {pdf_name} : {e}")
+
+    print(f"[INFO] E1/{mode} : {n_ok}/2 tables standalone generees dans {out_dir}")
+
+
 def build_pdf_report(
     experiment_id: str,
     mode: str,
@@ -3932,7 +4214,11 @@ def validate_experiment(experiment_id: str, modes: list = None):
         # [FIX-E2-TABLES] Generation des 8 tables standalone pour E2
         # (utilisees via \includepdf dans le memoire LaTeX pour eviter
         # toute hallucination LLM sur les valeurs numeriques).
-        if experiment_id == "E2":
+        # [FIX-E1-TABLES] Allocation par cellule et metriques globales (A4 portrait)
+        if experiment_id == "E1":
+            _generate_e1_standalone_tables(mode)
+
+        elif experiment_id == "E2":
             _generate_e2_standalone_tables(mode)
 
         # [FIX-E3-TABLES] Generation des 2 tables standalone pour E3
