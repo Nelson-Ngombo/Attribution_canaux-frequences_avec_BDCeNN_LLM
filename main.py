@@ -60,7 +60,8 @@ def _run_dashboard():
     # ---------- Sidebar ----------
     with st.sidebar:
         # Title at the very top (no extra spacing above)
-        st.markdown("### BD-CeNN + LLM")
+        # Titre hors style h3 : aucune marge héritée au-dessus
+        st.markdown('<div class="sidebar-brand">BD-CeNN + LLM</div>', unsafe_allow_html=True)
         st.markdown(
             "<p style='margin-top:-0.3rem;'>Framework neuro-symbolique pour "
             "l'attribution de canaux radio sous contraintes d'interference.</p>",
@@ -85,43 +86,41 @@ def _run_dashboard():
                 else:
                     st.error(msg)
 
-        # LLM status card (dynamic, auto-refresh while initializing)
+        # Carte LLM et paramètres : sondage isolé dans un fragment, sans réexécution globale
         try:
             from llm_assistant import (
-                get_llm_status_label, is_llm_available,
-                is_llm_initializing, get_initialization_error,
-                get_active_model,
+                is_llm_available, get_initialization_error,
+                get_active_model, get_llm_inference_params,
             )
 
-            if is_llm_available():
-                model_short = get_active_model().replace("models/", "")
-                render_sidebar_status_card("Assistant LLM", model_short, kind="ok")
-            elif is_llm_initializing():
-                render_sidebar_status_card("Assistant LLM", "Initialisation...", kind="init")
-                st.caption(
-                    "Recherche d'un modele disponible en arriere-plan. "
-                    "L'application reste utilisable pour toutes les fonctions non-LLM."
-                )
-                import time
-                time.sleep(2)
-                st.rerun()
-            else:
-                render_sidebar_status_card("Assistant LLM", "Non disponible", kind="err")
-                err = get_initialization_error()
-                if err:
+            llm_pending = not is_llm_available() and not get_initialization_error()
+
+            @st.fragment(run_every=2.0 if llm_pending else None)
+            def _render_llm_sidebar_block():
+                if is_llm_available():
+                    model_short = get_active_model().replace("models/", "")
+                    render_sidebar_status_card("Assistant LLM", model_short, kind="ok")
+                elif not get_initialization_error():
+                    render_sidebar_status_card("Assistant LLM", "Initialisation...", kind="init")
+                    st.caption(
+                        "Connexion au modele en arriere-plan. "
+                        "L'application reste utilisable pour toutes les fonctions non-LLM."
+                    )
+                else:
+                    render_sidebar_status_card("Assistant LLM", "Non disponible", kind="err")
                     with st.expander("Detail de l'erreur"):
-                        st.caption(err)
+                        st.caption(get_initialization_error())
+
+                st.markdown("### Parametres LLM")
+                render_sidebar_llm_params(get_llm_inference_params())
+
+                # Fin de l'initialisation : une seule réexécution globale arrête le sondage
+                if llm_pending and (is_llm_available() or get_initialization_error()):
+                    st.rerun()
+
+            _render_llm_sidebar_block()
         except Exception as e:
             render_sidebar_status_card("Assistant LLM", f"Erreur ({type(e).__name__})", kind="err")
-
-        # Modèle exact et paramètres d'inférence (recommandation C)
-        try:
-            from llm_assistant import get_llm_inference_params
-
-            st.markdown("### Parametres LLM")
-            render_sidebar_llm_params(get_llm_inference_params())
-        except Exception as e:
-            st.caption(f"Parametres LLM indisponibles ({type(e).__name__})")
 
         st.markdown("### Modeles d'interference")
         st.caption(

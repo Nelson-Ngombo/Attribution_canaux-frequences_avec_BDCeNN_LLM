@@ -37,20 +37,16 @@ load_dotenv(BASE_DIR / ".env")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip().strip('"').strip("'")
 
-# Suite de modèles prioritaires et de secours
+# Modèle unique recommandé par l'encadreur : aucune substitution, ni en dashboard ni en E10
 GOOGLE_MODEL_PREFERRED = "models/gemini-3.6-flash"
-GOOGLE_MODEL_FALLBACKS = [
-    "models/gemini-3.7-flash",
-    "models/gemini-3.8-flash",
-    "models/gemini-2.5-flash",
-    "models/gemini-2.5-pro",
-    "models/gemini-flash-latest",
-    "models/gemini-flash-lite-latest",
-]
+GOOGLE_MODEL_FALLBACKS = []
 
 INTER_REQUEST_DELAY = 3.0
 LLM_TIMEOUT_SECONDS = 45
 PROBE_TIMEOUT_SECONDS = 20
+# Sonde répétée : un 429 ou 503 passager ne doit pas déclarer le modèle indisponible
+PROBE_ATTEMPTS = 3
+PROBE_RETRY_DELAY_SECONDS = 4.0
 
 # Paramètres d'inférence gelés pour la campagne scientifique (recommandation E10)
 LLM_TEMPERATURE = 0.0
@@ -58,11 +54,11 @@ LLM_TOP_P = 1.0
 LLM_TOP_K = 1
 LLM_MAX_OUTPUT_TOKENS = 8000
 LLM_SEED = 2026
-# E10 interroge un modèle unique ; la rotation reste réservée au dashboard
+# Dashboard et E10 interrogent le même modèle unique, sans rotation
 LLM_CAMPAIGN_FIXED_MODEL = True
 LLM_CAMPAIGN_MODEL = GOOGLE_MODEL_PREFERRED
 # Version de la directive, archivée hors prompt pour ne pas polluer la whitelist
-ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.1"
+ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.2"
 
 from config import LLM_LOGS_DIR, FIGURES_DIR, CSV_DIR
 
@@ -209,7 +205,13 @@ def _background_init():
         _set_progress(f"Vérification {i}/{len(candidates)} : {display_name}")
 
         try:
-            if _probe_single_model(client, model_name, types):
+            probe_ok = False
+            for probe_attempt in range(PROBE_ATTEMPTS):
+                if _probe_single_model(client, model_name, types):
+                    probe_ok = True
+                    break
+                time.sleep(PROBE_RETRY_DELAY_SECONDS * (probe_attempt + 1))
+            if probe_ok:
                 with _state_lock:
                     _state["last_successful_model"] = model_name
                 _set_status(LLMStatus.AVAILABLE, model=model_name)
@@ -371,27 +373,39 @@ Tu es un ingenieur radio senior. Ton role est d'analyser et d'auditer
 les resultats de l'optimisation BD-CeNN appliquee a l'attribution de canaux.
 
 RÈGLES DE CONDUITE MATHEMATIQUE :
-1. Tu ne dois sous aucun pretexte modifier, inventer ou deviner un chiffre.
-2. Tout chiffre cite doit etre verifies et correspondre exactement aux donnees fournies.
-3. Si une variable n'est pas explicitee dans le bloc de donnees, declare-la comme non disponible.
-4. Rédige un rapport technique froid, scientifique et depouille de tout qualificatif trompeur.
+- Tu ne dois sous aucun pretexte modifier, inventer ou deviner un chiffre.
+- Tout chiffre cite reprend exactement une valeur du bloc de donnees, avec la meme
+  precision et la meme unite (temps en ms, quatre decimales, recopies tels quels).
+- N'effectue aucun calcul derive (difference, ratio, pourcentage, moyenne, ecart) :
+  un tel chiffre est absent des donnees. Exprime les comparaisons en mots
+  ("plus faible", "nettement plus rapide").
+- Si une variable n'est pas explicitee dans le bloc de donnees, declare-la non disponible.
+- Ne cite jamais l'identifiant du run.
+- Redige un rapport technique sobre, sans qualificatif emphatique ni formule creuse
+  ("il convient de", "il est important de noter", "en conclusion").
 
-=== NOMENCLATURE DE L'ENUMERATION ===
-- Structure ton argumentation uniquement avec des lettres majuscules :
-  A), B), C), D), E), F).
-- N'emploie jamais de listes numerotees (1., 2...) qui fausseraient le parsing automatique.
+=== FORMAT DE SORTIE (OBLIGATOIRE) ===
+- Exactement six rubriques, dans l'ordre A), B), C), D), E), F), chacune commencant
+  en debut de ligne par sa lettre suivie d'une parenthese fermante.
+- N'emploie jamais de listes numerotees qui fausseraient le parsing automatique.
+- Entre quatre-vingts et cent cinquante mots par rubrique ; la reponse complete reste
+  sous neuf cents mots et se termine toujours par la rubrique F.
+- Ne recopie ni la liste des aretes, ni les vecteurs d'affectation, ni les positions ;
+  cite au plus cinq cellules a titre d'exemple.
 
-=== COMPORTEMENT AVEC LES COMPTEURS ENTIERS (TRES IMPORTANT) ===
-Un parseur regex externe audite tous les chiffres de ta reponse. Pour eviter de fausses
-alertes, respecte les consignes de redaction suivantes :
+=== ECRITURE DES NOMBRES (TRES IMPORTANT) ===
+Un parseur regex externe audite tous les chiffres de ta reponse.
 
-  REGLE 1 - DONNEES EXPERIMENTALES : EN CHIFFRES.
-  Rapporte en chiffres uniquement les valeurs issues des donnees de simulation :
-  coûts J(x), nombres de conflits, temps d'execution, nombres de balayages (sweeps).
+  REGLE 1 - TOUTE VALEUR ISSUE DES DONNEES : EN CHIFFRES.
+  Couts J(x), conflits C_CCI, C_ACI et C_tot, temps d'execution, sweeps, restarts,
+  canaux utilises, numeros de cellules, nombres de voisins, forces cumulees et poids W_ij
+  s'ecrivent en chiffres, exactement comme dans les donnees. Exemple : "C_CCI = <valeur>",
+  jamais la valeur ecrite en lettres.
 
-  REGLE 2 - COMPTEURS LITTERAIRES : EN TOUTES LETTRES.
-  Epelle en toutes lettres toutes les autres valeurs d'ordre de grandeur :
-  "trois algorithmes de reference", "deux regimes d'interference", "six criteres d'evaluation".
+  REGLE 2 - COMPTEURS DE DISCOURS : EN TOUTES LETTRES.
+  Seuls les denombrements absents des donnees s'ecrivent en lettres :
+  "trois algorithmes de reference", "deux regimes d'interference", "six rubriques".
+  La regle 1 prime toujours sur la regle 2.
 """
 
 
@@ -775,9 +789,10 @@ def _collect_allowed_numbers(case_data: dict) -> set:
         if key in case_data:
             add(case_data[key])
 
+    # Fragments numériques de l'identifiant alphanumérique du run
     cid = str(case_data.get("case_id", "")).replace("#", "")
-    if cid.isdigit():
-        add(int(cid))
+    for num_str in re.findall(r"\d+", cid):
+        add(int(num_str))
 
     for num_str in re.findall(r"\d+", str(case_data.get("scenario", ""))):
         try:
@@ -1223,7 +1238,8 @@ Erreurs numeriques detectees :
 Donnees physiques valides :
 {allowed_summary}
 
-Corrige ta reponse en veillant au strict respect de la nomenclature.
+Redige a nouveau la reponse complete, rubriques A) a F), en remplacant chaque valeur
+erronee par la valeur exacte des donnees ou par une formulation qualitative.
 """
     return ask_llm(correction_prompt, inter_request_delay=INTER_REQUEST_DELAY,
                    allow_fallback=not LLM_CAMPAIGN_FIXED_MODEL)

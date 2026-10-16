@@ -234,12 +234,13 @@ section[data-testid="stSidebar"] .stButton > button:hover {
 .sidebar-status-card {
     background: #334155;
     border-radius: 10px;
-    padding: 0.9rem 1rem;
+    padding: 0.75rem 0.9rem;
     margin-bottom: 0.7rem;
     border-left: 4px solid #64748b;
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 0.6rem;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
 }
 .sidebar-status-card.status-ok {
@@ -258,28 +259,39 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     border-left-color: #3b82f6;
     background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
 }
-.sidebar-status-label {
-    font-size: 0.85rem;
+/* Libellé et valeur sur une seule ligne, centrés verticalement */
+section[data-testid="stSidebar"] .sidebar-status-label {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-size: 0.74rem !important;
     color: #cbd5e1 !important;
-    font-weight: 500;
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.05em;
+    line-height: 1.2;
 }
-.sidebar-status-value {
-    font-size: 0.95rem;
+section[data-testid="stSidebar"] .sidebar-status-value {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+    font-size: 0.8rem !important;
     color: white !important;
     font-weight: 600;
-    text-align: right;
-    max-width: 60%;
-    word-wrap: break-word;
+    line-height: 1.2;
 }
 .sidebar-status-icon {
     display: inline-block;
-    width: 10px;
-    height: 10px;
+    flex-shrink: 0;
+    width: 9px;
+    height: 9px;
     border-radius: 50%;
-    margin-right: 0.5rem;
-    vertical-align: middle;
+    margin-right: 0.45rem;
 }
 .sidebar-status-icon.dot-ok { background: #22c55e; box-shadow: 0 0 8px rgba(34, 197, 94, 0.6); }
 .sidebar-status-icon.dot-warn { background: #f59e0b; box-shadow: 0 0 8px rgba(245, 158, 11, 0.6); }
@@ -565,6 +577,68 @@ section[data-testid="stSidebar"] .sidebar-footer-version {
 section[data-testid="stSidebar"] .sidebar-footer-version .llm-icon {
     color: #93c5fd !important;
 }
+
+/* ============ Réexécutions fluides : aucun voile sur les éléments en attente ============ */
+[data-stale="true"],
+.stale-element,
+[data-testid="stElementContainer"][data-stale="true"] {
+    opacity: 1 !important;
+    filter: none !important;
+    transition: none !important;
+}
+
+/* Barre de progression indéterminée, visible uniquement pendant l'exécution du script */
+.stApp::before {
+    content: "";
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 32vw;
+    height: 3px;
+    z-index: 1000000;
+    border-radius: 0 3px 3px 0;
+    background: linear-gradient(90deg, rgba(74, 158, 255, 0) 0%, #4a9eff 45%, #22c55e 100%);
+    opacity: 0;
+    transform: translateX(-100%);
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+}
+.stApp:has([data-testid="stStatusWidget"])::before {
+    opacity: 1;
+    animation: bdcenn-run-progress 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+@keyframes bdcenn-run-progress {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(320%); }
+}
+
+/* ============ En-tête de barre latérale : bouton de repli en surimpression ============ */
+section[data-testid="stSidebar"] [data-testid="stSidebarHeader"] {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    height: auto;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    z-index: 5;
+}
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+    padding-top: 0.9rem !important;
+}
+section[data-testid="stSidebar"] .sidebar-brand {
+    font-size: 1.15rem !important;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    color: #f8fafc !important;
+    padding-right: 2.2rem;
+    margin: 0 0 0.2rem 0;
+}
+
+/* Déclencheur masqué du remontage du graphe, cliqué par script */
+.st-key-graph_tab_refresh {
+    display: none !important;
+}
 </style>
 """
 
@@ -576,22 +650,60 @@ def apply_theme():
 
 def install_plotly_resize_fix():
     """
-    Une figure Plotly tracée dans un onglet masqué prend la largeur par défaut
-    (700 px). Un événement resize émis à chaque changement d'onglet force Plotly
-    (config responsive) à se recaler sur la largeur réelle du conteneur.
+    Une figure Plotly tracée dans un onglet masqué garde une largeur nulle.
+    Au clic sur l'onglet du graphe, un script injecté dans la page parente
+    actionne un bouton masqué qui redessine la figure à sa largeur visible.
     """
     components.html(
         """
         <script>
-        const parentDoc = window.parent.document;
-        if (!parentDoc.__bdcennTabResize) {
-            parentDoc.__bdcennTabResize = true;
-            parentDoc.addEventListener("click", (event) => {
-                if (event.target.closest('button[role="tab"]')) {
-                    [50, 250, 600].forEach((delay) => setTimeout(
-                        () => window.parent.dispatchEvent(new Event("resize")), delay));
-                }
-            }, true);
+        const parentWin = window.parent;
+        if (!parentWin.__bdcennGraphTabHook) {
+            parentWin.__bdcennGraphTabHook = true;
+            // Script exécuté dans le contexte parent : survit au remplacement de cet iframe
+            const hook = parentWin.document.createElement("script");
+            hook.textContent = `
+                document.addEventListener("click", (event) => {
+                    const tab = event.target.closest('button[role="tab"]');
+                    if (!tab || !tab.innerText.trim().startsWith("Graphe")) return;
+                    setTimeout(() => {
+                        const trigger = document.querySelector(".st-key-graph_tab_refresh button");
+                        if (trigger) trigger.click();
+                    }, 80);
+                }, true);
+            `;
+            parentWin.document.head.appendChild(hook);
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+    """
+    Une figure Plotly tracée dans un onglet masqué garde une largeur nulle.
+    Au clic sur l'onglet du graphe, un script injecté dans la page parente
+    actionne un bouton masqué qui redessine la figure à sa largeur visible.
+    """
+    components.html(
+        """
+        <script>
+        const parentWin = window.parent;
+        if (!parentWin.__bdcennGraphTabHook) {
+            parentWin.__bdcennGraphTabHook = true;
+            // Script exécuté dans le contexte parent : survit au remplacement de cet iframe
+            const hook = parentWin.document.createElement("script");
+            hook.textContent = `
+                document.addEventListener("click", (event) => {
+                    const tab = event.target.closest('button[role="tab"]');
+                    if (!tab || !tab.innerText.trim().startsWith("Graphe")) return;
+                    setTimeout(() => {
+                        const trigger = document.querySelector(".st-key-graph_tab_refresh button");
+                        if (trigger) trigger.click();
+                    }, 80);
+                }, true);
+            `;
+            parentWin.document.head.appendChild(hook);
         }
         </script>
         """,
@@ -643,7 +755,7 @@ def render_sidebar_llm_params(params: dict):
         for icon, label, value in tiles
     )
     campaign_note = (
-        f'<div class="llm-note">Campagne E10 : modèle fixe '
+        f'<div class="llm-note">Modèle unique (dashboard et E10) : '
         f'{params.get("campaign_model", params["model"])}</div>'
         if params.get("fixed_model_for_campaign") else ""
     )
@@ -731,6 +843,6 @@ def render_sidebar_status_card(label: str, value: str, kind: str = "info"):
         <div class="sidebar-status-label">
             <span class="sidebar-status-icon {dot_class}"></span>{label}
         </div>
-        <div class="sidebar-status-value">{value}</div>
+        <div class="sidebar-status-value" title="{value}">{value}</div>
     </div>
     """, unsafe_allow_html=True)

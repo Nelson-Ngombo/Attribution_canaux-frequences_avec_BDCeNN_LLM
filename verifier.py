@@ -54,9 +54,10 @@ class ResponseVerifier:
                 add(case_data[key])
 
         # Identifiant unique de run
+        # Fragments numériques de l'identifiant alphanumérique (ex. DASHBOARD_5c5534d8)
         cid = str(case_data.get("case_id", "")).replace("#", "")
-        if cid.isdigit():
-            add(int(cid))
+        for num_str in re.findall(r"\d+", cid):
+            add(int(num_str))
 
         # Digits du nom de scenario
         for num_str in re.findall(r"\d+", str(case_data.get("scenario", ""))):
@@ -85,8 +86,9 @@ class ResponseVerifier:
             for k in ["cost", "conflicts_cci", "conflicts_aci", "conflicts_total", "time"]:
                 if k in base_data:
                     add(base_data[k])
-        if "time" in base_data:
-            add(float(base_data["time"]) * 1e3)
+            # Conversion en ms appliquée à chaque baseline, pas seulement à la dernière
+            if "time" in base_data:
+                add(float(base_data["time"]) * 1e3)
 
         # Cellules en conflit direct
         for c in case_data.get("conflicting_cells", []):
