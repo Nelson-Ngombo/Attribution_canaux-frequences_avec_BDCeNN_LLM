@@ -8,12 +8,14 @@ and formal statistical confidence intervals.
 import warnings
 import numpy as np
 
+import config
+
 
 # ============================================================================
 # 1. MATRICE SPECTRALE M (interférence inter-canaux)
 # ============================================================================
 
-def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
+def create_channel_interference_matrix(K, decay=config.ALPHA, cutoff=config.CUTOFF):
     """
     Construit la matrice spectrale M de taille K x K.
 
@@ -126,7 +128,7 @@ def count_conflicts_cci(x, W):
     return n_cci
 
 
-def count_conflicts_aci(x, W, cutoff=2):
+def count_conflicts_aci(x, W, cutoff=config.CUTOFF):
     """
     Compte les conflits de canal adjacent stricts (Eq. 5).
 
@@ -160,7 +162,7 @@ def count_conflicts_aci(x, W, cutoff=2):
     return n_aci
 
 
-def count_conflicts_total(x, W, cutoff=2):
+def count_conflicts_total(x, W, cutoff=config.CUTOFF):
     """
     Compte le nombre total de conflits (Eq. 6).
 
@@ -218,7 +220,7 @@ def compute_metrics_cci(x, W):
     }
 
 
-def compute_metrics_cci_aci(x, W, M, cutoff=2):
+def compute_metrics_cci_aci(x, W, M, cutoff=config.CUTOFF):
     """
     Calcule l'ensemble des métriques sous le régime CCI+ACI.
 
@@ -335,7 +337,7 @@ def count_adjacent_conflicts(x, W, M=None, threshold=0.0):
         DeprecationWarning,
         stacklevel=2,
     )
-    return count_conflicts_total(x, W, cutoff=2)
+    return count_conflicts_total(x, W, cutoff=config.CUTOFF)
 
 
 def compute_metrics_cochannel(x, W):

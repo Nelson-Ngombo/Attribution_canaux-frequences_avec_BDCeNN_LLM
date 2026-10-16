@@ -36,7 +36,8 @@ from matplotlib.patches import Patch
 
 import config
 from baselines import greedy_allocation, dsatur_allocation, random_allocation
-from bdcenn_solver import bdcenn_allocation
+from bdcenn_solver import bdcenn_allocation, bdcenn_restart_trace
+from data_generator import apply_measurement_noise, apply_dynamic_modification
 from metrics import (
     create_channel_interference_matrix,
     compute_cost_cci,
@@ -45,7 +46,7 @@ from metrics import (
     count_conflicts_aci,
     count_conflicts_total
 )
-from llm_assistant import audit_case
+from llm_assistant import audit_case, get_llm_inference_params
 
 # --- Database Scenario Initialization ---
 try:
@@ -108,7 +109,7 @@ def _new_figure(figsize):
 
 def _compute_all_conflicts(x, W, M=None):
     n_cci = count_conflicts_cci(x, W)
-    n_aci = count_conflicts_aci(x, W, cutoff=2) if M is not None else 0
+    n_aci = count_conflicts_aci(x, W, cutoff=config.CUTOFF) if M is not None else 0
     return n_cci, n_aci, n_cci + n_aci
 
 
@@ -116,6 +117,93 @@ def _compute_cost(x, W, M=None):
     if M is not None:
         return compute_cost_cci_aci(x, W, M)
     return compute_cost_cci(x, W)
+
+
+def _assignment_json(x):
+    """Allocation sérialisée en liste JSON d'entiers (colonne « assignment »)."""
+    return json.dumps([int(c) for c in x])
+
+
+def _display_weight(value):
+    """Poids entier conservé tel quel ; poids bruité (E10 S6) arrondi à 1e-2."""
+    value = float(value)
+    return int(value) if value.is_integer() else round(value, 2)
+
+
+def _w_provenance(scenario, N, K, seed, source="stored", threshold=None,
+                  area=None, perturbation_kind="none", perturbation_level=0.0):
+    """
+    Colonnes permettant au validateur de reconstruire W sans relire aucun coût :
+    source de la topologie, paramètres géométriques et perturbation appliquée.
+    """
+    return {
+        "scenario": scenario,
+        "N": int(N),
+        "K": int(K),
+        "seed": int(seed),
+        "w_source": source,
+        "threshold": threshold,
+        "area": area,
+        "perturbation_kind": perturbation_kind,
+        "perturbation_level": float(perturbation_level),
+        "perturbation_seed": (config.perturbation_seed(seed, perturbation_level)
+                              if perturbation_kind != "none" else np.nan),
+    }
+
+
+def _best_prefix(trace, budget):
+    """
+    Meilleur élément des `budget` premiers essais (égalité stricte, comme
+    bdcenn_allocation) et temps cumulé de ces essais.
+    """
+    best = trace[0]
+    for item in trace[1:budget]:
+        if item["cost"] < best["cost"]:
+            best = item
+    return best, float(sum(item["time"] for item in trace[:budget]))
+
+
+def _annotate_metadata(df, scenario, mode_name, llm_model=None):
+    """Colonnes de traçabilité ajoutées à chaque ligne brute (recommandation C)."""
+    df = df.copy()
+    if "scenario" not in df.columns:
+        df["scenario"] = scenario
+    if "seed" in df.columns and "algorithm_seed" not in df.columns:
+        df["algorithm_seed"] = df["seed"].map(config.algorithm_seed)
+    if "num_restarts" not in df.columns:
+        df["num_restarts"] = float(config.NUM_RESTARTS)
+        # Les baselines n'ont pas de restart : valeur explicitement absente
+        method_col = next((c for c in ("method", "Method") if c in df.columns), None)
+        if method_col is not None:
+            is_bdcenn = df[method_col].astype(str).str.startswith("BD-CeNN")
+            df.loc[~is_bdcenn, "num_restarts"] = np.nan
+    df["patience_sweeps"] = config.PATIENCE_SWEEPS
+    df["max_sweeps"] = config.MAX_SWEEPS_BD
+    df["interference_mode"] = config.INTERFERENCE_MODE_LABELS[mode_name]
+    df["code_version"] = config.CODE_VERSION
+    df["llm_model"] = llm_model or config.NO_LLM_LABEL
+    return df
+
+
+def _write_run_metadata(model_csv_dir, experiment_id, scenario, mode_name,
+                        llm_model=None, **extra):
+    """Fichier run_metadata.json, lu par le PDF d'audit et les tables du mémoire."""
+    fields = {
+        "topology_seeds": f"{config.TOPOLOGY_SEEDS[0]}-{config.TOPOLOGY_SEEDS[-1]}",
+        "algorithm_seed_rule": f"a(s) = {config.ALGORITHM_SEED_OFFSET} + s",
+        "seed_column": "seed = topology_seed",
+    }
+    fields.update(extra)
+    metadata = config.build_run_metadata(
+        scenario=scenario,
+        interference_mode=mode_name,
+        llm_model=llm_model,
+        experiment_id=experiment_id,
+        **fields,
+    )
+    with open(model_csv_dir / "run_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    return metadata
 
 
 def _validate_if_available(experiment_id: str, modes: list = None):
@@ -277,7 +365,8 @@ def run_experiment_E1(verbose=False):
         os.makedirs(model_fig_dir, exist_ok=True)
         os.makedirs(model_csv_dir, exist_ok=True)
 
-        np.random.seed(seed)
+        # seed : graine de topologie (S1, instance 1) ; aléa algorithmique séparé
+        np.random.seed(config.algorithm_seed(seed))
         x_rand = random_allocation(N, K)
         x_greedy = greedy_allocation(N, K, W, M=M)
         x_dsatur = dsatur_allocation(N, K, W, M=M)
@@ -286,8 +375,8 @@ def run_experiment_E1(verbose=False):
             N, K, W, M=M,
             num_restarts=config.NUM_RESTARTS,
             max_sweeps=config.MAX_SWEEPS_BD,
-            random_order=True,
-            seed=seed,
+            random_order=config.RANDOM_ORDER,
+            seed=config.algorithm_seed(seed),
             verbose=False
         )
         x_bd_initial = history_bd[0][2]
@@ -303,7 +392,8 @@ def run_experiment_E1(verbose=False):
                 "conflicts_cci": c_cci,
                 "conflicts_aci": c_aci,
                 "conflicts_total": c_tot,
-                "used_channels": len(set(x_arr))
+                "used_channels": len(set(x_arr)),
+                "assignment": _assignment_json(x_arr),
             }
 
         save_colored_graph("Random", x_rand, e1_fig_dir, folder, suffix)
@@ -334,11 +424,15 @@ def run_experiment_E1(verbose=False):
                 "conflicts_aci": v["conflicts_aci"],
                 "conflicts_total": v["conflicts_total"],
                 "used_channels": v["used_channels"],
-                "seed": seed
+                "seed": seed,
+                "assignment": v["assignment"],
+                **_w_provenance(scenario_name, N, K, seed),
             }
             for name, v in results.items()
         ])
+        df_metrics = _annotate_metadata(df_metrics, scenario_name, folder)
         df_metrics.to_csv(str(model_csv_dir / "method_metrics.csv"), index=False)
+        _write_run_metadata(model_csv_dir, "E1", scenario_name, folder, topology_seeds=str(seed))
         print(f"[SUCCESS] CSV E1/{folder}/method_metrics.csv saved.")
 
     _validate_if_available("E1")
@@ -441,26 +535,32 @@ def run_experiment_E2(verbose=False):
                             W[j, i] = w
 
                     for method_name, method_func in methods.items():
-                        start_time = time.perf_counter()
+                        # Graine algorithmique appariée ; l'initialisation du
+                        # générateur est exclue de la mesure de temps.
+                        algo_seed = config.algorithm_seed(seed)
                         if method_name == "Random":
-                            np.random.seed(seed)
+                            np.random.seed(algo_seed)
+                            start_time = time.perf_counter()
                             x = method_func(N, K)
                             n_sweeps = np.nan
                         elif method_name == "Greedy":
-                            np.random.seed(seed)
+                            np.random.seed(algo_seed)
+                            start_time = time.perf_counter()
                             order = np.random.permutation(N).tolist()
                             x = method_func(N, K, W, order=order, M=M)
                             n_sweeps = np.nan
                         elif method_name == "DSATUR":
+                            start_time = time.perf_counter()
                             x = method_func(N, K, W, M=M)
                             n_sweeps = np.nan
                         else:
+                            start_time = time.perf_counter()
                             x, _, _, _, _, best_sweep = method_func(
                                 N, K, W, M=M,
                                 num_restarts=config.NUM_RESTARTS,
                                 max_sweeps=config.MAX_SWEEPS_BD,
-                                random_order=True,
-                                seed=seed,
+                                random_order=config.RANDOM_ORDER,
+                                seed=algo_seed,
                                 verbose=False
                             )
                             n_sweeps = best_sweep
@@ -483,11 +583,15 @@ def run_experiment_E2(verbose=False):
                             "conflicts_total": c_tot,
                             "used_channels": len(set(x)),
                             "time": elapsed,
-                            "n_sweeps": n_sweeps
+                            "n_sweeps": n_sweeps,
+                            "assignment": _assignment_json(x),
+                            **_w_provenance(sc_name, N, K, seed, source="positions",
+                                            threshold=th),
                         })
 
-        df_raw = pd.DataFrame(raw_data)
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), "S2/S3", model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
+        _write_run_metadata(model_csv_dir, "E2", "S2/S3", model_name)
         print(f"[SUCCESS] CSV E2/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["N", "K", "density_label", "threshold", "method"]).agg({
@@ -511,8 +615,10 @@ def run_experiment_E2(verbose=False):
             'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
         ]
 
+        # Durées conservées en secondes pleine précision ; conversion en ms au PDF
         for col in summary.columns[5:]:
-            summary[col] = summary[col].round(1)
+            if not col.startswith("time_"):
+                summary[col] = summary[col].round(1)
 
         # n_sweeps est exclu pour preserver NaN sur les baselines
         for col in summary.columns:
@@ -527,7 +633,7 @@ def run_experiment_E2(verbose=False):
             ('cost', 'Mean Global Cost J(x)'),
             ('conflicts_total', 'Mean Conflicted Links'),
             ('used_channels', 'Mean Channels Used'),
-            ('time', 'Execution Runtime (seconds)')
+            ('time', "Temps d'exécution (ms)")
         ]
 
         subplots_config = [
@@ -579,8 +685,10 @@ def run_experiment_E2(verbose=False):
                 for i, method in enumerate(methods.keys()):
                     if method not in pivot_mean.columns:
                         continue
-                    means = pivot_mean[method].fillna(0).values
-                    stds = pivot_std[method].fillna(0).values
+                    # Durées en secondes dans le CSV, tracées en ms
+                    scale = 1e3 if metric_col == 'time' else 1.0
+                    means = pivot_mean[method].fillna(0).values * scale
+                    stds = pivot_std[method].fillna(0).values * scale
                     offset = (i - 1.5) * width
                     ax.bar(x + offset, means, width, yerr=stds,
                            capsize=3, label=method,
@@ -670,10 +778,10 @@ def run_experiment_E3(verbose=False):
 
                 for method_name, method_func in methods.items():
                     if method_name == "Random":
-                        np.random.seed(seed)
+                        np.random.seed(config.algorithm_seed(seed))
                         x = method_func(N, K)
                     elif method_name == "Greedy":
-                        np.random.seed(seed)
+                        np.random.seed(config.algorithm_seed(seed))
                         order = np.random.permutation(N).tolist()
                         x = method_func(N, K, W, order=order, M=M)
                     elif method_name == "DSATUR":
@@ -683,8 +791,8 @@ def run_experiment_E3(verbose=False):
                             N, K, W, M=M,
                             num_restarts=config.NUM_RESTARTS,
                             max_sweeps=config.MAX_SWEEPS_BD,
-                            random_order=True,
-                            seed=seed,
+                            random_order=config.RANDOM_ORDER,
+                            seed=config.algorithm_seed(seed),
                             verbose=False
                         )
 
@@ -699,11 +807,15 @@ def run_experiment_E3(verbose=False):
                         "conflicts_cci": c_cci,
                         "conflicts_aci": c_aci,
                         "conflicts_total": c_tot,
-                        "used_channels": len(set(x))
+                        "used_channels": len(set(x)),
+                        "assignment": _assignment_json(x),
+                        # W de S4 indépendante de K : seule M dépend du K de la ligne
+                        **_w_provenance(scenario_name, N, K, seed),
                     })
 
-        df_raw = pd.DataFrame(raw_data)
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), scenario_name, model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
+        _write_run_metadata(model_csv_dir, "E3", scenario_name, model_name)
         print(f"[SUCCESS] CSV E3/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["K", "method"]).agg({
@@ -863,26 +975,32 @@ def run_experiment_E4(verbose=False):
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
                 for method_name, method_func in methods.items():
-                    start_time = time.perf_counter()
+                    # Graine algorithmique appariée ; l'initialisation du
+                    # générateur est exclue de la mesure de temps.
+                    algo_seed = config.algorithm_seed(seed)
                     if method_name == "Random":
-                        np.random.seed(seed)
+                        np.random.seed(algo_seed)
+                        start_time = time.perf_counter()
                         x = method_func(N, K)
                         n_sweeps = np.nan
                     elif method_name == "Greedy":
-                        np.random.seed(seed)
+                        np.random.seed(algo_seed)
+                        start_time = time.perf_counter()
                         order = np.random.permutation(N).tolist()
                         x = method_func(N, K, W, order=order, M=M)
                         n_sweeps = np.nan
                     elif method_name == "DSATUR":
+                        start_time = time.perf_counter()
                         x = method_func(N, K, W, M=M)
                         n_sweeps = np.nan
                     else:
+                        start_time = time.perf_counter()
                         x, _, _, _, _, best_sweep = method_func(
                             N, K, W, M=M,
                             num_restarts=config.NUM_RESTARTS,
                             max_sweeps=config.MAX_SWEEPS_BD,
-                            random_order=True,
-                            seed=seed,
+                            random_order=config.RANDOM_ORDER,
+                            seed=algo_seed,
                             verbose=False
                         )
                         n_sweeps = best_sweep
@@ -902,11 +1020,15 @@ def run_experiment_E4(verbose=False):
                         "conflicts_total": c_tot,
                         "used_channels": len(set(x)),
                         "time": elapsed,
-                        "n_sweeps": n_sweeps
+                        "n_sweeps": n_sweeps,
+                        "assignment": _assignment_json(x),
+                        **_w_provenance(scenario_name, N, K, seed, source="positions",
+                                        threshold=th),
                     })
 
-        df_raw = pd.DataFrame(raw_data)
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), scenario_name, model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
+        _write_run_metadata(model_csv_dir, "E4", scenario_name, model_name)
         print(f"[SUCCESS] CSV E4/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["density_label", "threshold", "method"]).agg({
@@ -935,7 +1057,9 @@ def run_experiment_E4(verbose=False):
         ]
 
         for col in summary.columns[3:]:
-            summary[col] = summary[col].round(1)
+            # Durées conservées en secondes pleine précision ; conversion en µs au PDF
+            if not col.startswith("time_"):
+                summary[col] = summary[col].round(1)
             if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
                 summary[col] = summary[col].fillna(0).round(0).astype(int)
 
@@ -1020,6 +1144,7 @@ def run_experiment_E5(verbose=False):
         scenario_sweeps = {}
         scenario_cost_initial = {}
         scenario_cost_final = {}
+        raw_rows = []
 
         for scenario_name in scenarios_to_run:
             instances = all_instances.get(scenario_name, {})
@@ -1048,10 +1173,23 @@ def run_experiment_E5(verbose=False):
                     N, K, W, M=M,
                     num_restarts=config.NUM_RESTARTS,
                     max_sweeps=horizon,
-                    random_order=True,
-                    seed=seed,
+                    random_order=config.RANDOM_ORDER,
+                    seed=config.algorithm_seed(seed),
                     verbose=False
                 )
+
+                # Une ligne brute par (scénario, seed) : base du recalcul indépendant
+                n_cci_f, n_aci_f, n_tot_f = _compute_all_conflicts(x_final, W, M)
+                raw_rows.append({
+                    "seed": seed,
+                    "cost_final": _compute_cost(x_final, W, M),
+                    "conflicts_cci": n_cci_f,
+                    "conflicts_aci": n_aci_f,
+                    "conflicts_total": n_tot_f,
+                    "n_sweeps": best_sweep,
+                    "assignment": _assignment_json(x_final),
+                    **_w_provenance(scenario_name, N, K, seed),
+                })
 
                 raw_trajectory = [entry[1] for entry in history]
                 actual_length = len(raw_trajectory)
@@ -1168,6 +1306,10 @@ def run_experiment_E5(verbose=False):
                           }).to_csv(str(model_csv_dir / f"trajectory_{scenario_name}.csv"),
                                     index=False, float_format="%.6f")
 
+        pd.DataFrame(raw_rows).pipe(_annotate_metadata, "S2/S3", model_name).to_csv(
+            str(model_csv_dir / "raw_metrics.csv"), index=False)
+        _write_run_metadata(model_csv_dir, "E5", "S2/S3", model_name)
+
     _validate_if_available("E5")
     print("[SUCCESS] Experiment E5 completed.")
 
@@ -1180,7 +1322,7 @@ def run_experiment_E6(verbose=False):
     K = 8
     area = 300
     threshold = 50
-    N_values = [20, 30, 50, 100, 200]
+    N_values = [8, 30, 50, 100, 200]
     seeds = list(range(1, config.NUM_RUNS + 1))
 
     e6_fig_dir = config.FIGURES_DIR / "E6"
@@ -1214,8 +1356,8 @@ def run_experiment_E6(verbose=False):
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
             for seed in seeds:
-                np.random.seed(seed)
-                positions = np.random.rand(N, 2) * area
+                # Graine de topologie sur générateur local (positions inchangées)
+                positions = np.random.RandomState(seed).rand(N, 2) * area
                 W = np.zeros((N, N))
                 for i in range(N):
                     for j in range(i+1, N):
@@ -1233,26 +1375,32 @@ def run_experiment_E6(verbose=False):
                 sum_weights = np.sum(W)
 
                 for method_name, method_func in methods.items():
-                    start_time = time.perf_counter()
+                    # Graine algorithmique appariée ; l'initialisation du
+                    # générateur est exclue de la mesure de temps.
+                    algo_seed = config.algorithm_seed(seed)
                     if method_name == "Random":
-                        np.random.seed(seed)
+                        np.random.seed(algo_seed)
+                        start_time = time.perf_counter()
                         x = method_func(N, K)
                         n_sweeps = np.nan
                     elif method_name == "Greedy":
-                        np.random.seed(seed)
+                        np.random.seed(algo_seed)
+                        start_time = time.perf_counter()
                         order = np.random.permutation(N).tolist()
                         x = method_func(N, K, W, order=order, M=M)
                         n_sweeps = np.nan
                     elif method_name == "DSATUR":
+                        start_time = time.perf_counter()
                         x = method_func(N, K, W, M=M)
                         n_sweeps = np.nan
                     else:
+                        start_time = time.perf_counter()
                         x, _, _, _, _, best_sweep = method_func(
                             N, K, W, M=M,
                             num_restarts=config.NUM_RESTARTS,
                             max_sweeps=config.MAX_SWEEPS_BD,
-                            random_order=True,
-                            seed=seed,
+                            random_order=config.RANDOM_ORDER,
+                            seed=algo_seed,
                             verbose=False
                         )
                         n_sweeps = best_sweep
@@ -1273,11 +1421,17 @@ def run_experiment_E6(verbose=False):
                         "conflicts_total": c_tot,
                         "used_channels": len(set(x)),
                         "time": elapsed,
-                        "n_sweeps": n_sweeps
+                        "n_sweeps": n_sweeps,
+                        "assignment": _assignment_json(x),
+                        # Topologie générée à la volée : (area, threshold) suffisent au validateur
+                        **_w_provenance("E6", N, K, seed, source="generated",
+                                        threshold=threshold, area=area),
                     })
 
-        df_raw = pd.DataFrame(raw_data)
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), "E6 (généré)", model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
+        _write_run_metadata(model_csv_dir, "E6", "E6 (généré, area=300, threshold=50)",
+                            model_name)
         print(f"[SUCCESS] CSV E6/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["N", "method"]).agg({
@@ -1308,8 +1462,10 @@ def run_experiment_E6(verbose=False):
             'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
         ]
 
+        # Durées conservées en secondes pleine précision ; conversion en µs au PDF
         for col in summary.columns[2:]:
-            summary[col] = summary[col].round(1)
+            if not col.startswith("time_"):
+                summary[col] = summary[col].round(1)
 
         for col in summary.columns:
             if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
@@ -1320,7 +1476,7 @@ def run_experiment_E6(verbose=False):
 
         metrics_to_plot = [
             ('cost_mean', 'cost_std', 'Cout global moyen J(x)'),
-            ('time_mean', 'time_std', "Temps d'execution moyen (s)"),
+            ('time_mean', 'time_std', "Temps d'execution moyen (ms)"),
             ('n_sweeps_mean', 'n_sweeps_std', "Sweeps moyens (BD-CeNN)")
         ]
 
@@ -1340,9 +1496,12 @@ def run_experiment_E6(verbose=False):
                             linewidth=2, markersize=8)
                 ax.set_title(f"E6 - Complexite dynamique - {ylabel} (BD-CeNN)")
             else:
+                # Durées en secondes dans le CSV, tracées en ms
+                scale = 1e3 if metric_col == 'time_mean' else 1.0
                 for method in methods.keys():
                     sub = summary[summary['method'] == method].set_index('N').reindex(N_values).reset_index()
-                    ax.errorbar(sub['N'].values, sub[metric_col].values, yerr=sub[std_col].values,
+                    ax.errorbar(sub['N'].values, sub[metric_col].values * scale,
+                                yerr=sub[std_col].values * scale,
                                 fmt=method_markers[method]+'-', capsize=5,
                                 color=method_colors[method], label=method,
                                 linewidth=2, markersize=8)
@@ -1436,22 +1595,8 @@ def run_experiment_E7(verbose=False):
             inst = instances.get(str(seed))
             if inst is None:
                 continue
-            positions = np.array(inst["positions"])
-            W_clean = np.zeros((N, N))
-            for i in range(N):
-                for j in range(i+1, N):
-                    dist = np.linalg.norm(positions[i] - positions[j])
-                    threshold = 35
-                    if dist < threshold * 0.4:
-                        w = 4
-                    elif dist < threshold * 0.65:
-                        w = 2
-                    elif dist < threshold:
-                        w = 1
-                    else:
-                        w = 0
-                    W_clean[i, j] = w
-                    W_clean[j, i] = w
+            # Matrice de référence lue telle quelle : la topologie n'est pas régénérée
+            W_clean = np.array(inst["W"], dtype=float)
             ref_W[seed] = W_clean
 
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
@@ -1460,42 +1605,44 @@ def run_experiment_E7(verbose=False):
                 N, K, W_clean, M=M,
                 num_restarts=config.NUM_RESTARTS,
                 max_sweeps=config.MAX_SWEEPS_BD,
-                random_order=True,
-                seed=seed,
+                random_order=config.RANDOM_ORDER,
+                seed=config.algorithm_seed(seed),
                 verbose=False
             )
             ref_x[seed] = x_ref
             ref_cost[seed] = _compute_cost(x_ref, W_clean, M)
 
+        upper = np.triu_indices(N, k=1)
         for b_noise, noise_label in zip(noise_levels, noise_labels):
             for seed in seeds:
                 W_clean = ref_W[seed]
-                np.random.seed(seed + int(b_noise * 10000))
-                W_noisy = W_clean.copy()
-                mask = W_clean > 0
-                noise_factor = np.random.uniform(-b_noise, b_noise, size=W_clean.shape)
-                W_noisy[mask] = W_clean[mask] * (1 + noise_factor[mask])
-                W_noisy = np.round(W_noisy)
-                W_noisy[W_noisy < 0] = 0
-                for i in range(N):
-                    for j in range(i+1, N):
-                        W_noisy[j, i] = W_noisy[i, j]
-                np.fill_diagonal(W_noisy, 0)
+                # W_bruit = max(0, W_ref + bruit), continu et symétrique (sans arrondi)
+                W_noisy = apply_measurement_noise(
+                    W_clean, b_noise, config.perturbation_seed(seed, b_noise)
+                )
 
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
-                seed_noisy = seed + int(b_noise * 1000) + 100
+                # Graine algorithmique identique à la référence (nombres
+                # aléatoires communs) : seule la perturbation de W diffère.
+                seed_noisy = config.algorithm_seed(seed)
 
                 x_noisy, _, _, _, _, _ = method_func(
                     N, K, W_noisy, M=M,
                     num_restarts=config.NUM_RESTARTS,
                     max_sweeps=config.MAX_SWEEPS_BD,
-                    random_order=True,
+                    random_order=config.RANDOM_ORDER,
                     seed=seed_noisy,
                     verbose=False
                 )
-                cost_noisy = _compute_cost(x_noisy, W_noisy, M)
+                # Réévaluation sur W_ref, seule matrice « réelle » : J(x_bruit, W_ref)
+                cost_noisy = _compute_cost(x_noisy, W_clean, M)
+                cost_noisy_on_w_noisy = _compute_cost(x_noisy, W_noisy, M)
 
-                cost_relatif = ((cost_noisy - ref_cost[seed]) / ref_cost[seed]) * 100 if ref_cost[seed] > 0 else 0.0
+                # Delta_Bruit indéfini si J(x_ref, W_ref) = 0 : NaN explicite, jamais 0
+                if ref_cost[seed] > 0:
+                    cost_relatif = (cost_noisy - ref_cost[seed]) / ref_cost[seed] * 100
+                else:
+                    cost_relatif = np.nan
                 changes = np.sum(x_noisy != ref_x[seed])
                 change_rate = (changes / N) * 100
 
@@ -1504,12 +1651,20 @@ def run_experiment_E7(verbose=False):
                     "seed": seed,
                     "cost_ref": ref_cost[seed],
                     "cost_noisy": cost_noisy,
+                    "cost_noisy_on_w_noisy": cost_noisy_on_w_noisy,
                     "cost_relatif": cost_relatif,
-                    "change_rate": change_rate
+                    "change_rate": change_rate,
+                    # Preuve que le bruit agit réellement sur W
+                    "perturbed_edges": int(np.sum(W_noisy[upper] != W_clean[upper])),
+                    "assignment_ref": _assignment_json(ref_x[seed]),
+                    "assignment_noisy": _assignment_json(x_noisy),
+                    **_w_provenance("S6", N, K, seed, perturbation_kind="noise",
+                                    perturbation_level=b_noise),
                 })
 
-        df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.6f')
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), "S6", model_name)
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.9f')
+        _write_run_metadata(model_csv_dir, "E7", "S6", model_name)
         print(f"[SUCCESS] CSV E7/{folder}/raw_metrics.csv saved.")
 
         # [FIX-E7] Ordre des statistiques aligne sur la convention du memoire :
@@ -1525,6 +1680,11 @@ def run_experiment_E7(verbose=False):
                            'change_min', 'change_max']
         for col in summary.columns[1:]:
             summary[col] = summary[col].round(1)
+        # Delta_Bruit non défini (J_ref = 0) : décompte explicite, exclu des moyennes
+        summary["n_delta_undefined"] = (
+            df_raw.groupby("noise_level")["cost_relatif"]
+            .apply(lambda s: int(s.isna().sum())).values
+        )
 
         summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.1f')
         print(f"[SUCCESS] CSV E7/{folder}/summary_metrics.csv saved.")
@@ -1537,7 +1697,7 @@ def run_experiment_E7(verbose=False):
         cost_means = [0] + summary['cost_rel_mean'].tolist()
         cost_stds = [0] + summary['cost_rel_std'].tolist()
         change_means = [0] + summary['change_mean'].tolist()
-        change_stds = [0] + summary['change_std'].tolist()   # <-- CORRECTION ICI
+        change_stds = [0] + summary['change_std'].tolist()
 
         ax.errorbar(noise_vals, cost_means, yerr=cost_stds, fmt='o-', capsize=6,
                     color='red', label='Degradation relative du cout (%)',
@@ -1611,21 +1771,8 @@ def run_experiment_E8(verbose=False):
             inst = instances.get(str(seed))
             if inst is None:
                 continue
-            positions = np.array(inst["positions"])
-            W_orig = np.zeros((N, N))
-            for i in range(N):
-                for j in range(i+1, N):
-                    dist = np.linalg.norm(positions[i] - positions[j])
-                    if dist < threshold * 0.4:
-                        w = 4
-                    elif dist < threshold * 0.65:
-                        w = 2
-                    elif dist < threshold:
-                        w = 1
-                    else:
-                        w = 0
-                    W_orig[i, j] = w
-                    W_orig[j, i] = w
+            # Matrice de référence lue telle quelle : la topologie n'est pas régénérée
+            W_orig = np.array(inst["W"], dtype=float)
             ref_W[seed] = W_orig
 
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
@@ -1634,8 +1781,8 @@ def run_experiment_E8(verbose=False):
                 N, K, W_orig, M=M,
                 num_restarts=config.NUM_RESTARTS,
                 max_sweeps=config.MAX_SWEEPS_BD,
-                random_order=True,
-                seed=seed,
+                random_order=config.RANDOM_ORDER,
+                seed=config.algorithm_seed(seed),
                 verbose=False
             )
             ref_x[seed] = x_init
@@ -1643,70 +1790,70 @@ def run_experiment_E8(verbose=False):
         for b_mod, mod_label in zip(mod_levels, mod_labels):
             for seed in seeds:
                 W_orig = ref_W[seed]
-                np.random.seed(seed + int(b_mod * 10000) + 200)
-                W_dyn = W_orig.copy()
-                edges = [(i, j) for i in range(N) for j in range(i+1, N) if W_orig[i, j] > 0]
-                if len(edges) == 0:
-                    continue
-                num_mod = int(len(edges) * b_mod)
-                indices = np.random.choice(len(edges), num_mod, replace=False)
-                for idx in indices:
-                    i, j = edges[idx]
-                    if np.random.random() > 0.5:
-                        W_dyn[i, j] = 0
-                        W_dyn[j, i] = 0
-                    else:
-                        current = W_dyn[i, j]
-                        delta = np.random.choice([-1, 1]) if current > 1 else 1
-                        new_w = max(1, min(4, current + delta))
-                        W_dyn[i, j] = new_w
-                        W_dyn[j, i] = new_w
-                for i in range(N):
-                    for j in range(i+1, N):
-                        W_dyn[j, i] = W_dyn[i, j]
-                np.fill_diagonal(W_dyn, 0)
+                W_dyn = apply_dynamic_modification(
+                    W_orig, b_mod, config.perturbation_seed(seed, b_mod)
+                )
 
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
+                x_prev = ref_x[seed]
 
+                # Warm Start : un unique restart qui part exactement de x_prev
+                warm_seed = config.algorithm_seed(seed)
                 start = time.perf_counter()
-                x_warm, _, _, _, _, _ = method_func(
+                x_warm, history_warm, _, _, _, _ = method_func(
                     N, K, W_dyn, M=M,
                     num_restarts=1,
                     max_sweeps=config.MAX_SWEEPS_BD,
-                    random_order=True,
-                    seed=seed + int(b_mod * 1000) + 300,
+                    random_order=config.RANDOM_ORDER,
+                    seed=warm_seed,
+                    initial_assignment=x_prev,
                     verbose=False
                 )
                 time_warm = time.perf_counter() - start
+                warm_from_prev = bool(np.array_equal(history_warm[0][2], x_prev))
 
+                # Cold Start : multistart complet depuis des initialisations aléatoires
+                cold_seed = config.algorithm_seed(seed) + int(b_mod * 1000) + 400
                 start = time.perf_counter()
                 x_cold, _, _, _, _, _ = method_func(
                     N, K, W_dyn, M=M,
                     num_restarts=config.NUM_RESTARTS,
                     max_sweeps=config.MAX_SWEEPS_BD,
-                    random_order=True,
-                    seed=seed + int(b_mod * 1000) + 400,
+                    random_order=config.RANDOM_ORDER,
+                    seed=cold_seed,
                     verbose=False
                 )
                 time_cold = time.perf_counter() - start
 
-                changes_warm = np.sum(x_warm != ref_x[seed])
-                changes_cold = np.sum(x_cold != ref_x[seed])
+                changes_warm = int(np.sum(x_warm != x_prev))
+                changes_cold = int(np.sum(x_cold != x_prev))
 
                 cost_warm = _compute_cost(x_warm, W_dyn, M)
                 cost_cold = _compute_cost(x_cold, W_dyn, M)
 
+                provenance = _w_provenance("S7", N, K, seed, perturbation_kind="dynamic",
+                                           perturbation_level=b_mod)
                 raw_data.append({
                     "mod_level": b_mod * 100, "seed": seed, "mode": "warm",
-                    "time": time_warm, "changes": changes_warm, "cost": cost_warm
+                    "time": time_warm, "changes": changes_warm, "cost": cost_warm,
+                    "reassign_rate": changes_warm / N * 100,
+                    "num_restarts": 1, "algorithm_seed": warm_seed,
+                    "warm_from_prev": warm_from_prev,
+                    "assignment": _assignment_json(x_warm), **provenance,
                 })
                 raw_data.append({
                     "mod_level": b_mod * 100, "seed": seed, "mode": "cold",
-                    "time": time_cold, "changes": changes_cold, "cost": cost_cold
+                    "time": time_cold, "changes": changes_cold, "cost": cost_cold,
+                    "reassign_rate": changes_cold / N * 100,
+                    "num_restarts": config.NUM_RESTARTS, "algorithm_seed": cold_seed,
+                    "warm_from_prev": False,
+                    "assignment": _assignment_json(x_cold), **provenance,
                 })
 
-        df_raw = pd.DataFrame(raw_data)
-        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.6f')
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), "S7", model_name)
+        # Résolution nanoseconde : pleine précision conservée avant l'affichage en ms
+        df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.9f')
+        _write_run_metadata(model_csv_dir, "E8", "S7", model_name)
         print(f"[SUCCESS] CSV E8/{folder}/raw_metrics.csv saved.")
 
         # [FIX-E8] Ordre des statistiques aligne sur la convention du memoire :
@@ -1714,17 +1861,22 @@ def run_experiment_E8(verbose=False):
         summary = df_raw.groupby(["mod_level", "mode"]).agg({
             "time": ["mean", "std", "median", "min", "max"],
             "changes": ["mean", "std", "median", "min", "max"],
-            "cost": ["mean", "std", "median", "min", "max"]
+            "cost": ["mean", "std", "median", "min", "max"],
+            "reassign_rate": ["mean", "std", "median", "min", "max"]
         }).reset_index()
         summary.columns = ['mod_level', 'mode',
                            'time_mean', 'time_std', 'time_median', 'time_min', 'time_max',
                            'changes_mean', 'changes_std', 'changes_median', 'changes_min', 'changes_max',
-                           'cost_mean', 'cost_std', 'cost_median', 'cost_min', 'cost_max']
+                           'cost_mean', 'cost_std', 'cost_median', 'cost_min', 'cost_max',
+                           'reassign_rate_mean', 'reassign_rate_std', 'reassign_rate_median',
+                           'reassign_rate_min', 'reassign_rate_max']
         for col in summary.columns:
             if col not in ['mod_level', 'mode']:
-                summary[col] = summary[col].round(1) if ('changes' in col or 'cost' in col) else summary[col].round(6)
+                summary[col] = (summary[col].round(1)
+                                if ('changes' in col or 'cost' in col or 'reassign' in col)
+                                else summary[col].round(9))
 
-        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.6f')
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.9f')
         print(f"[SUCCESS] CSV E8/{folder}/summary_metrics.csv saved.")
 
         # [FIX-LAYOUT] Figure() au lieu de plt.figure().
@@ -1829,56 +1981,70 @@ def run_experiment_E9(verbose=False):
                     W[j, i] = w
             topologies[seed] = W
 
+        initializations = {}
         for seed, W in topologies.items():
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
+            algo_seed = config.algorithm_seed(seed)
+            provenance = _w_provenance("S3", N, K, seed, source="positions",
+                                       threshold=threshold)
 
+            # Passe unique de max(values) restarts : liste fixe d'initialisations,
+            # dont les budgets R = 1, 5, 10, 20 sont des préfixes (essais imbriqués).
+            trace = bdcenn_restart_trace(
+                N, K, W, M=M,
+                num_restarts=max(values),
+                max_sweeps=config.MAX_SWEEPS_BD,
+                random_order=config.RANDOM_ORDER,
+                seed=algo_seed,
+            )
+            initializations[str(seed)] = [
+                [int(c) for c in item["initial_assignment"]] for item in trace
+            ]
             for num_restarts in values:
-                start = time.perf_counter()
-                x_bd, _, _, n_cci, n_aci, _ = method_bd(
-                    N, K, W, M=M,
-                    num_restarts=num_restarts,
-                    max_sweeps=config.MAX_SWEEPS_BD,
-                    random_order=True,
-                    seed=seed + num_restarts * 1000,
-                    verbose=False
-                )
-                elapsed = time.perf_counter() - start
-                cost = _compute_cost(x_bd, W, M)
-
+                best, elapsed = _best_prefix(trace, num_restarts)
+                n_cci, n_aci, n_tot = _compute_all_conflicts(best["assignment"], W, M)
                 raw_data.append({
                     "seed": seed, "method": "BD-CeNN", "value": num_restarts,
-                    "cost": cost, "conflicts_cci": n_cci, "conflicts_aci": n_aci,
-                    "conflicts_total": n_cci + n_aci, "time": elapsed
+                    "cost": best["cost"], "conflicts_cci": n_cci, "conflicts_aci": n_aci,
+                    "conflicts_total": n_tot,
+                    # Temps cumulé des R premiers restarts de la passe unique
+                    "time": elapsed,
+                    "num_restarts": num_restarts, "algorithm_seed": algo_seed,
+                    "assignment": _assignment_json(best["assignment"]),
+                    **provenance,
                 })
 
+            # Greedy : passe unique de max(values) ordres, budgets imbriqués par préfixe
+            greedy_trace = []
+            for order_idx in range(max(values)):
+                # Générateur local : même permutation que np.random.seed(...) global
+                order_rng = np.random.RandomState(algo_seed + order_idx * 100)
+                order = order_rng.permutation(N).tolist()
+                start = time.perf_counter()
+                x_g = method_greedy(N, K, W, order=order, M=M)
+                build_time = time.perf_counter() - start
+                greedy_trace.append({"assignment": x_g, "cost": _compute_cost(x_g, W, M),
+                                     "time": build_time})
             for num_orders in values:
-                best_cost = float('inf')
-                best_conf_cci, best_conf_aci = 0, 0
-                best_time = 0.0
-                start_total = time.perf_counter()
-                for order_idx in range(num_orders):
-                    np.random.seed(seed + order_idx * 100 + num_orders * 1000)
-                    order = np.random.permutation(N).tolist()
-                    start = time.perf_counter()
-                    x_g = method_greedy(N, K, W, order=order, M=M)
-                    best_time += (time.perf_counter() - start)
-                    cost_g = _compute_cost(x_g, W, M)
-                    c_cci, c_aci, _ = _compute_all_conflicts(x_g, W, M)
-                    if cost_g < best_cost:
-                        best_cost = cost_g
-                        best_conf_cci = c_cci
-                        best_conf_aci = c_aci
-
+                best, elapsed = _best_prefix(greedy_trace, num_orders)
+                c_cci, c_aci, c_tot = _compute_all_conflicts(best["assignment"], W, M)
                 raw_data.append({
                     "seed": seed, "method": "Greedy", "value": num_orders,
-                    "cost": best_cost, "conflicts_cci": best_conf_cci,
-                    "conflicts_aci": best_conf_aci,
-                    "conflicts_total": best_conf_cci + best_conf_aci,
-                    "time": time.perf_counter() - start_total
+                    "cost": best["cost"], "conflicts_cci": c_cci,
+                    "conflicts_aci": c_aci, "conflicts_total": c_tot,
+                    # Somme des temps de construction gloutonne, hors recalcul des métriques
+                    "time": elapsed,
+                    "num_restarts": np.nan, "algorithm_seed": algo_seed,
+                    "assignment": _assignment_json(best["assignment"]),
+                    **provenance,
                 })
 
-        df_raw = pd.DataFrame(raw_data)
+        df_raw = _annotate_metadata(pd.DataFrame(raw_data), "S3", model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
+        with open(model_csv_dir / "restart_initializations.json", "w", encoding="utf-8") as f:
+            json.dump(initializations, f)
+        _write_run_metadata(model_csv_dir, "E9", "S3", model_name,
+                            restart_budgets=values)
         print(f"[SUCCESS] CSV E9/{folder}/raw_metrics.csv saved.")
 
         # [FIX-E9-AMELIORATION] Aggregation complete incluant median/min/max
@@ -1904,7 +2070,7 @@ def run_experiment_E9(verbose=False):
         ]
         for col in summary.columns:
             if col not in ['value', 'method']:
-                summary[col] = summary[col].round(1) if ('cost' in col or 'conflicts' in col) else summary[col].round(6)
+                summary[col] = summary[col].round(1) if ('cost' in col or 'conflicts' in col) else summary[col].round(9)
 
         # [FIX-E9-AMELIORATION] Calcul du Gain(R) et du CostRatio(R)
         # pour chaque methode, par rapport a R=1 (baseline).
@@ -1932,7 +2098,7 @@ def run_experiment_E9(verbose=False):
         summary["gain_pct"] = gains
         summary["cost_ratio"] = ratios
 
-        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.6f')
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.9f')
         print(f"[SUCCESS] CSV E9/{folder}/summary_metrics.csv saved.")
 
         # [FIX-E9-AMELIORATION] Export dedie des metriques de compromis
@@ -1942,7 +2108,7 @@ def run_experiment_E9(verbose=False):
         ]].copy()
         trade_off.to_csv(
             str(model_csv_dir / "trade_off_metrics.csv"),
-            index=False, float_format="%.4f"
+            index=False, float_format="%.9f"
         )
         print(f"[SUCCESS] CSV E9/{folder}/trade_off_metrics.csv saved.")
 
@@ -2102,11 +2268,13 @@ def run_experiment_E10(verbose=False):
                 continue
 
             inst = None
+            # Provenance de W, réutilisée par le validateur indépendant
+            w_source, gen_area, gen_threshold = "stored", None, None
             if str(seed) not in instances:
-                np.random.seed(seed)
                 area = 300
                 threshold = 50
-                positions = np.random.rand(N, 2) * area
+                w_source, gen_area, gen_threshold = "generated", area, threshold
+                positions = np.random.RandomState(seed).rand(N, 2) * area
                 W = np.zeros((N, N))
                 for i in range(N):
                     for j in range(i+1, N):
@@ -2127,10 +2295,10 @@ def run_experiment_E10(verbose=False):
                 W = np.array(inst["W"])
 
             if W.shape[0] != N:
-                np.random.seed(seed)
                 area = 300 if N > 50 else 200
                 threshold = 50
-                positions = np.random.rand(N, 2) * area
+                w_source, gen_area, gen_threshold = "generated", area, threshold
+                positions = np.random.RandomState(seed).rand(N, 2) * area
                 W = np.zeros((N, N))
                 for i in range(N):
                     for j in range(i+1, N):
@@ -2148,6 +2316,9 @@ def run_experiment_E10(verbose=False):
 
             bruit_level = 0.0
             mod_level = 0.0
+            perturbation_kind = "none"
+            # Perturbations strictement identiques à E7 (S6) et E8 (S7) pour la
+            # même graine : mêmes fonctions, mêmes graines de perturbation.
             if sc_name == "S6":
                 if "5%" in case["context"]:
                     bruit_level = 0.05
@@ -2155,38 +2326,19 @@ def run_experiment_E10(verbose=False):
                     bruit_level = 0.10
                 elif "20%" in case["context"]:
                     bruit_level = 0.20
-                np.random.seed(seed + int(bruit_level * 10000))
-                mask = W > 0
-                noise_factor = np.random.uniform(-bruit_level, bruit_level, size=W.shape)
-                W = W * (1 + noise_factor * mask)
-                W = np.round(W)
-                W[W < 0] = 0
-                for i in range(N):
-                    for j in range(i+1, N):
-                        W[j, i] = W[i, j]
-                np.fill_diagonal(W, 0)
+                W = apply_measurement_noise(
+                    W, bruit_level, config.perturbation_seed(seed, bruit_level)
+                )
+                perturbation_kind = "noise"
             elif sc_name == "S7":
-                if "5%" in case["context"]:
-                    mod_level = 0.05
-                elif "10%" in case["context"]:
-                    mod_level = 0.10
-                elif "20%" in case["context"]:
-                    mod_level = 0.20
-                np.random.seed(seed + int(mod_level * 10000) + 200)
-                edges = [(i, j) for i in range(N) for j in range(i+1, N) if W[i, j] > 0]
-                if edges:
-                    num_mod = int(len(edges) * mod_level)
-                    indices = np.random.choice(len(edges), min(num_mod, len(edges)), replace=False)
-                    for idx in indices:
-                        i, j = edges[idx]
-                        if np.random.random() > 0.5:
-                            W[i, j] = 0
-                            W[j, i] = 0
-                        else:
-                            current = W[i, j]
-                            new_w = max(1, min(4, current + np.random.choice([-1, 1]) * min(current, 1)))
-                            W[i, j] = new_w
-                            W[j, i] = new_w
+                # Les contextes #17 à #19 ne contiennent aucun pourcentage : sans
+                # cette table, mod_level restait nul et W n'était jamais modifiée.
+                mod_level = {"#17": 0.05, "#18": 0.10, "#19": 0.20}.get(case["case_id"], 0.0)
+                W = apply_dynamic_modification(
+                    W, mod_level, config.perturbation_seed(seed, mod_level)
+                )
+                perturbation_kind = "dynamic"
+            perturbation_level = bruit_level if sc_name == "S6" else mod_level
 
             M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
             num_restarts = 1 if case["case_id"] == "#20" else config.NUM_RESTARTS
@@ -2196,8 +2348,8 @@ def run_experiment_E10(verbose=False):
                 N, K, W, M=M,
                 num_restarts=num_restarts,
                 max_sweeps=config.MAX_SWEEPS_BD,
-                random_order=True,
-                seed=seed,
+                random_order=config.RANDOM_ORDER,
+                seed=config.algorithm_seed(seed),
                 verbose=False,
             )
             time_bd = time.perf_counter() - start_t
@@ -2212,15 +2364,27 @@ def run_experiment_E10(verbose=False):
             n_cci_f, n_aci_f, n_total_f = _compute_all_conflicts(x_bd, W, M)
             used_channels = len(set(x_bd))
 
-            np.random.seed(seed)
+            algo_seed = config.algorithm_seed(seed)
+            # Temps réels des baselines, initialisation du générateur exclue
+            np.random.seed(algo_seed)
+            t_start = time.perf_counter()
             x_rand = random_allocation(N, K)
-            np.random.seed(seed)
+            t_rand = time.perf_counter() - t_start
+
+            np.random.seed(algo_seed)
+            t_start = time.perf_counter()
             order_greedy = np.random.permutation(N).tolist()
             x_greedy = greedy_allocation(N, K, W, order=order_greedy, M=M)
+            t_greedy = time.perf_counter() - t_start
+
+            t_start = time.perf_counter()
             x_dsatur = dsatur_allocation(N, K, W, M=M)
+            t_dsatur = time.perf_counter() - t_start
 
             baselines = {}
-            for name, x_b, t_b in [("Random", x_rand, 0.0), ("Greedy", x_greedy, 0.0), ("DSATUR", x_dsatur, 0.0)]:
+            for name, x_b, t_b in [("Random", x_rand, t_rand),
+                                   ("Greedy", x_greedy, t_greedy),
+                                   ("DSATUR", x_dsatur, t_dsatur)]:
                 c = _compute_cost(x_b, W, M)
                 c_cci_b, c_aci_b, _ = _compute_all_conflicts(x_b, W, M)
                 baselines[name] = {
@@ -2256,13 +2420,14 @@ def run_experiment_E10(verbose=False):
             for i in range(N):
                 for j in range(i+1, N):
                     if W[i, j] > 0:
-                        topology_edges_all.append((int(i), int(j), int(W[i, j])))
+                        # int() tronquait les poids bruités (4,15 devenait 4)
+                        topology_edges_all.append((int(i), int(j), _display_weight(W[i, j])))
             topology_edges_all.sort(key=lambda e: -e[2])
             total_edges = len(topology_edges_all)
             topology_edges = topology_edges_all[:80]
 
             cell_degree = np.zeros(N, dtype=int)
-            cell_strength = np.zeros(N, dtype=int)
+            cell_strength = np.zeros(N, dtype=float)
             for (i, j, w) in topology_edges_all:
                 cell_degree[i] += 1
                 cell_degree[j] += 1
@@ -2272,7 +2437,8 @@ def run_experiment_E10(verbose=False):
             top_cells_idx = np.argsort(-cell_strength)[:10]
             cell_summary = [{"cell": int(idx),
                              "degree": int(cell_degree[idx]),
-                             "strength": int(cell_strength[idx])} for idx in top_cells_idx]
+                             "strength": _display_weight(cell_strength[idx])}
+                            for idx in top_cells_idx]
 
             threshold_value = float(inst["threshold"]) if (inst is not None and "threshold" in inst) else 0.0
             topology_meta = {"seed": int(seed), "threshold": threshold_value, "N": int(N), "K": int(K)}
@@ -2308,6 +2474,14 @@ def run_experiment_E10(verbose=False):
                 "total_edges": int(total_edges),
                 "cell_summary": cell_summary,
                 "topology_meta": topology_meta,
+                # Hors prompt : métadonnées pour l'en-tête du rapport PDF
+                "algorithm_seed": int(config.algorithm_seed(seed)),
+                "run_metadata": config.build_run_metadata(
+                    scenario=case["scenario"], topology_seed=seed,
+                    interference_mode=model_name, num_restarts=num_restarts,
+                    perturbation_kind=perturbation_kind,
+                    perturbation_level=perturbation_level,
+                ),
             }
 
             # [FIX-E10] Accumulation d'une ligne de metriques du solveur
@@ -2329,6 +2503,12 @@ def run_experiment_E10(verbose=False):
                 "time_seconds":    float(time_bd),
                 "sweeps":          int(best_sweep),
                 "used_channels":   int(used_channels),
+                "algorithm_seed":  int(config.algorithm_seed(seed)),
+                "assignment":      _assignment_json(x_bd),
+                **_w_provenance(sc_name, N, K, seed, source=w_source,
+                                threshold=gen_threshold, area=gen_area,
+                                perturbation_kind=perturbation_kind,
+                                perturbation_level=perturbation_level),
             })
 
             try:
@@ -2342,13 +2522,17 @@ def run_experiment_E10(verbose=False):
 
         # [FIX-E10] Export du CSV dedie aux metriques du solveur.
         # Ce fichier est lu par validate_results.py pour l'audit E10.
+        llm_params = get_llm_inference_params()
         if solver_metrics_rows:
-            df_solver = pd.DataFrame(solver_metrics_rows)
+            df_solver = _annotate_metadata(pd.DataFrame(solver_metrics_rows), "S1-S7",
+                                           model_name, llm_model=llm_params["model"])
             df_solver.to_csv(
                 str(model_csv_dir / "solver_metrics_e10.csv"),
                 index=False,
-                float_format="%.6f",
+                float_format="%.9f",
             )
+            _write_run_metadata(model_csv_dir, "E10", "S1-S7", model_name,
+                                llm_model=llm_params["model"], llm_inference=llm_params)
             print(f"[SUCCESS] CSV E10/{folder}/solver_metrics_e10.csv saved.")
 
         # Export du CSV de fidelite LLM (inchange dans sa structure).
@@ -2387,6 +2571,26 @@ def run_experiment_E10(verbose=False):
                     "Initial Accuracy Rate": r["verification_initial"]["accuracy_rate"],
                     "Final Accuracy Rate": r["verification_final"]["accuracy_rate"],
                 })
+        # Deux statuts distincts par cas (audit numérique, audit sémantique) et
+        # paramètres d'inférence exacts (recommandations C et E10)
+        for row, r in zip(rows, results_for_model):
+            numeric = r.get("numeric_final", {})
+            semantic = r.get("semantic_final", {})
+            params = r.get("llm_params", {})
+            row.update({
+                "Numeric Status": numeric.get("status", "N/A"),
+                "Quadruplets Checked": numeric.get("checked_quadruplets", "N/A"),
+                "Quadruplets Invalid": numeric.get("invalid_quadruplets", "N/A"),
+                "Semantic Status": semantic.get("status", "N/A"),
+                "Semantic Score": semantic.get("score", np.nan),
+                "LLM Model": params.get("model", "N/A"),
+                "Temperature": params.get("temperature", np.nan),
+                "Top-p": params.get("top_p", np.nan),
+                "Top-k": params.get("top_k", np.nan),
+                "Max Output Tokens": params.get("max_output_tokens", np.nan),
+                "Directive Version": params.get("directive_version", "N/A"),
+                "Code Version": config.CODE_VERSION,
+            })
         df_eval = pd.DataFrame(rows)
         df_eval.to_csv(str(model_csv_dir / "llm_fidelity_evaluation.csv"), index=False, float_format="%.2f")
         print(f"[SUCCESS] CSV E10/{folder}/llm_fidelity_evaluation.csv saved.")

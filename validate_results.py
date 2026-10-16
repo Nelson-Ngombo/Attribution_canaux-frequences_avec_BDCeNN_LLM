@@ -183,7 +183,7 @@ def _split_wide_dataframe(df: pd.DataFrame, max_cols: int = 11) -> list:
 # ============================================================================
 
 def recompute_and_compare(df_data: pd.DataFrame, mode: str, K: int,
-                           W_dict: dict, cutoff: int = 2) -> list:
+                           W_dict: dict, cutoff: int = config.CUTOFF) -> list:
     """
     Execute le recalcul de chaque vecteur d'allocation et compare les couts.
     """
@@ -265,8 +265,198 @@ def recompute_and_compare(df_data: pd.DataFrame, mode: str, K: int,
 
 
 # ============================================================================
+# 3-bis. RECALCUL INDÉPENDANT EXHAUSTIF (recommandation P0)
+# ============================================================================
+# Chaque ligne officielle est recalculée depuis W (reconstruite à partir de sa
+# provenance), M et l'allocation brute. Aucun coût enregistré n'est réutilisé.
+
+_OFFICIAL_RAW_FILES = ("raw_metrics.csv", "method_metrics.csv", "solver_metrics_e10.csv")
+_COST_COLUMNS = ("cost", "Cout", "cost_final")
+_COST_REL_TOL = 1e-6
+
+# (colonne d'allocation, colonne de coût, variante de W, contrôle des compteurs)
+_DEFAULT_RECOMPUTE_SPEC = [("assignment", None, "perturbed", True)]
+_RECOMPUTE_SPECS = {
+    "E7": [
+        ("assignment_ref", "cost_ref", "base", False),
+        ("assignment_noisy", "cost_noisy", "base", False),
+        ("assignment_noisy", "cost_noisy_on_w_noisy", "perturbed", False),
+    ],
+}
+
+_scenario_cache = {}
+
+
+def _load_scenarios() -> dict:
+    if "data" not in _scenario_cache:
+        with open(config.SCENARIOS_FILE, "r", encoding="utf-8") as f:
+            _scenario_cache["data"] = json.load(f)
+    return _scenario_cache["data"]
+
+
+def _rebuild_weight_matrix(row, perturbed: bool) -> np.ndarray:
+    """W reconstruite depuis les colonnes de provenance d'une ligne brute."""
+    from data_generator import (build_weight_matrix, apply_measurement_noise,
+                                apply_dynamic_modification)
+
+    source = row["w_source"]
+    seed = int(row["seed"])
+    N = int(row["N"])
+    if source == "stored":
+        W = np.array(_load_scenarios()[row["scenario"]][str(seed)]["W"], dtype=float)
+    elif source == "positions":
+        positions = np.array(_load_scenarios()[row["scenario"]][str(seed)]["positions"])
+        W = build_weight_matrix(positions, float(row["threshold"]))
+    elif source == "generated":
+        positions = np.random.RandomState(seed).rand(N, 2) * float(row["area"])
+        W = build_weight_matrix(positions, float(row["threshold"]))
+    else:
+        raise ValueError(f"source de W inconnue : {source!r}")
+
+    if W.shape != (N, N):
+        raise ValueError(f"W de forme {W.shape} incompatible avec N = {N}")
+
+    kind = row.get("perturbation_kind", "none")
+    if perturbed and kind == "noise":
+        W = apply_measurement_noise(W, float(row["perturbation_level"]),
+                                    int(row["perturbation_seed"]))
+    elif perturbed and kind == "dynamic":
+        W = apply_dynamic_modification(W, float(row["perturbation_level"]),
+                                       int(row["perturbation_seed"]))
+    return W
+
+
+def independent_recompute(experiment_id: str, mode: str, csv_dir: Path) -> dict:
+    """
+    Recalcule J(x), C_CCI et C_ACI pour 100 % des lignes des CSV bruts
+    officiels et signale tout écart (V21) ou toute ligne non recalculable (V20).
+    """
+    anomalies = []
+    n_rows = 0
+    n_covered = 0
+    n_verified = 0
+    specs = _RECOMPUTE_SPECS.get(experiment_id, _DEFAULT_RECOMPUTE_SPEC)
+
+    for csv_path in sorted(csv_dir.glob("*.csv")):
+        if csv_path.name not in _OFFICIAL_RAW_FILES:
+            continue
+        df = pd.read_csv(csv_path)
+        for idx, row in df.iterrows():
+            n_rows += 1
+            row_ok = True
+            row_covered = True
+            for assign_col, cost_col, w_variant, check_counts in specs:
+                tag = f"{csv_path.name} ligne {idx}"
+                if assign_col not in df.columns or pd.isna(row.get(assign_col)):
+                    anomalies.append(f"{tag}: [V20] allocation '{assign_col}' absente")
+                    row_ok = row_covered = False
+                    continue
+                try:
+                    x = np.array(json.loads(row[assign_col]), dtype=int)
+                    W = _rebuild_weight_matrix(row, perturbed=(w_variant == "perturbed"))
+                except Exception as exc:
+                    anomalies.append(f"{tag}: [V20] reconstruction impossible ({exc})")
+                    row_ok = row_covered = False
+                    continue
+
+                M = (create_channel_interference_matrix(int(row["K"]))
+                     if mode == "adjacent" else None)
+                cost_rec = (compute_cost_cci_aci(x, W, M) if M is not None
+                            else compute_cost_cci(x, W))
+                column = cost_col or next((c for c in _COST_COLUMNS if c in df.columns), None)
+                if column is None or pd.isna(row.get(column)):
+                    anomalies.append(f"{tag}: [V20] coût enregistré absent")
+                    row_ok = row_covered = False
+                elif abs(cost_rec - float(row[column])) > _COST_REL_TOL * max(1.0, abs(cost_rec)):
+                    anomalies.append(
+                        f"{tag}: [V21] {column} enregistré {float(row[column]):.6f} "
+                        f"!= recalculé {cost_rec:.6f}")
+                    row_ok = False
+
+                if check_counts:
+                    n_cci = count_conflicts_cci(x, W)
+                    n_aci = count_conflicts_aci(x, W, cutoff=config.CUTOFF) if M is not None else 0
+                    for name, value in (("conflicts_cci", n_cci), ("conflicts_aci", n_aci),
+                                        ("conflicts_total", n_cci + n_aci)):
+                        if name in df.columns and pd.notna(row[name]) and int(row[name]) != value:
+                            anomalies.append(
+                                f"{tag}: [V21] {name} enregistré {int(row[name])} "
+                                f"!= recalculé {value}")
+                            row_ok = False
+
+            # E7 : Delta_Bruit recalculé à partir des deux coûts sur W_ref
+            if experiment_id == "E7" and row_ok and "cost_relatif" in df.columns:
+                cost_ref = float(row["cost_ref"])
+                expected = ((float(row["cost_noisy"]) - cost_ref) / cost_ref * 100.0
+                            if cost_ref > 0 else np.nan)
+                recorded = row["cost_relatif"]
+                if (np.isnan(expected) != pd.isna(recorded)) or (
+                        not np.isnan(expected) and abs(expected - float(recorded)) > 1e-4):
+                    anomalies.append(f"{csv_path.name} ligne {idx}: [V21] cost_relatif incohérent")
+                    row_ok = False
+
+            n_covered += int(row_covered)
+            n_verified += int(row_ok)
+
+    # Couverture : part des lignes effectivement recalculées (V20)
+    coverage = 100.0 * n_covered / n_rows if n_rows else 0.0
+    return {"anomalies": anomalies, "n_rows": n_rows, "n_covered": n_covered,
+            "n_verified": n_verified, "coverage": coverage}
+
+
+# Colonnes de reproductibilité non reproduites dans les tableaux du PDF d'audit
+# (elles figurent sur la page de couverture)
+_PDF_HIDDEN_COLUMNS = (
+    "assignment", "assignment_ref", "assignment_noisy", "w_source", "area",
+    "perturbation_kind", "perturbation_level", "perturbation_seed",
+    "patience_sweeps", "max_sweeps", "code_version", "llm_model",
+    "interference_mode", "algorithm_seed",
+)
+
+
+# ============================================================================
 # 4. COMPOSANTS DE RENDU ET MISE EN PAGE DU PDF
 # ============================================================================
+
+# Durées : CSV en secondes pleine précision, tableaux en ms (4 décimales).
+# Identifiants suffixés _US conservés (règle de non-renommage), contenu en ms.
+_SECONDS_TO_MILLISECONDS = 1e3
+_LBL_TIME_US = "Temps d'exécution (ms)"
+
+# Notation officielle des compteurs discrets (spécification v1.0, Eq. 7 à 9)
+_LBL_C_CCI = "C<sub>CCI</sub>"
+_LBL_C_ACI = "C<sub>ACI</sub>"
+_LBL_C_TOT = "C<sub>tot</sub>"
+
+_NOTE_C_CCI = (
+    "C<sub>CCI</sub> = nombre entier de paires voisines (W<sub>ij</sub> &gt; 0) "
+    "partageant le même canal ; ce compteur est distinct du coût pondéré J(x)."
+)
+_NOTE_TIME_US = "Temps exprimés en millisecondes (ms), quatre décimales."
+
+
+def _traceability_note(experiment_id: str, mode: str) -> str:
+    """Ligne de traçabilité des tables standalone, lue dans run_metadata.json."""
+    try:
+        with open(config.CSV_DIR / experiment_id / mode / "run_metadata.json",
+                  "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    return (
+        f" Traçabilité : code v{meta.get('code_version')}, scénario {meta.get('scenario')}, "
+        f"graines de topologie {meta.get('topology_seeds')}, {meta.get('algorithm_seed_rule')}, "
+        f"R = {meta.get('num_restarts')}, patience_sweeps = {meta.get('patience_sweeps')}, "
+        f"max_sweeps = {meta.get('max_sweeps')}, mode {meta.get('interference_mode')}, "
+        f"LLM : {meta.get('llm_model')}."
+    )
+
+
+def _format_time_us(seconds, decimal_comma: bool = False) -> str:
+    """Durée stockée en secondes, restituée en millisecondes à quatre décimales."""
+    text = f"{float(seconds) * _SECONDS_TO_MILLISECONDS:.4f}"
+    return text.replace(".", ",") if decimal_comma else text
+
 
 # [FIX-E7] Correspondance suffixe statistique -> libelle court.
 # Utilise pour construire les en-tetes a 2 niveaux (groupes / sous-en-tetes).
@@ -286,15 +476,16 @@ _GROUP_HEADER_LABELS = {
     "cost_rel": "Coût relatif (%)",
     "change": "Taux de changement (%)",
     "changes": "Nb. réaffectations canaux",  # [FIX-E8] libelle enrichi
+    "reassign_rate": "Taux de réaffectation (%)",
     "cost": "Coût J(x)",
     "cost_initial": "J_init",
     "cost_final": "J_final",
     "normalized_cost": "Coût normalisé",
-    "conflicts_total": "Conflits totaux",
-    "conflicts_cci": "Conflits C_CCI",
-    "conflicts_aci": "Conflits C_ACI",
+    "conflicts_total": _LBL_C_TOT,
+    "conflicts_cci": _LBL_C_CCI,
+    "conflicts_aci": _LBL_C_ACI,
     "used_channels": "Canaux utilisés",
-    "time": "Temps (ms)",
+    "time": _LBL_TIME_US,
     "n_sweeps": "Sweeps",
 }
 
@@ -381,10 +572,8 @@ def _format_cell_value(val, col_name: str) -> str:
         if "cost" in col_name.lower() or "cout" in col_name.lower():
             return f"{val:.2f}"
         elif "time" in col_name.lower():
-            # [FIX-E8] Suppression du suffixe "ms" : l'unite figure dans
-            # l'en-tete de groupe ("Temps d'adaptation (ms)").
-            # [FIX-E9] Passage a 3 decimales pour respecter le format E9.
-            return f"{val * 1000:.3f}"
+            # Unité portée par l'en-tête de groupe (ms)
+            return _format_time_us(val)
         elif "changes" in col_name.lower():
             # [FIX-E8] Colonnes "changes_mean", "changes_std", ... en 2 decimales.
             return f"{val:.2f}"
@@ -476,9 +665,9 @@ def _abbreviate_column(col: str) -> str:
 # [FIX-E9] Groupes metriques ordonnes tels qu'attendus dans les tableaux E9.
 # Chaque entree : (prefixe_colonnes, libelle_affichage)
 _E9_METRIC_GROUPS = [
-    ("cost",             "Coût"),
-    ("conflicts_total",  "Conflit"),
-    ("time",             "Temps d'exécution (ms)"),
+    ("cost",             "Coût J(x)"),
+    ("conflicts_cci",    _LBL_C_CCI),
+    ("time",             _LBL_TIME_US),
 ]
 
 
@@ -489,7 +678,7 @@ def _render_e9_table(sub_df, method_name, table_counter,
     [FIX-E9] Construit un tableau a 3 niveaux d'en-tetes specifique a E9 :
         Niveau 1 : nom de la methode (fusion horizontale sur toutes les colonnes
                    de metriques, la colonne "Nombre d'essais" reste a gauche)
-        Niveau 2 : groupes metriques (Coût | Conflit | Temps d'exécution (ms))
+        Niveau 2 : groupes metriques (Coût | C_CCI | Temps d'exécution (µs))
         Niveau 3 : suffixes statistiques (moy. | e.t. | med. | min | max)
 
     Parameters
@@ -842,20 +1031,21 @@ def _e4_metric_groups(mode: str):
     """
     if mode == "adjacent":
         return [
-            ("cost",            "Coût"),
-            ("conflicts_cci",   "Conflits C_CCI"),
-            ("conflicts_aci",   "Conflits C_ACI"),
-            ("conflicts_total", "Conflits C_tot"),
+            ("cost",            "Coût J(x)"),
+            ("conflicts_cci",   _LBL_C_CCI),
+            ("conflicts_aci",   _LBL_C_ACI),
+            ("conflicts_total", _LBL_C_TOT),
             ("used_channels",   "Canaux utilisés"),
-            ("time",            "Temps d'exécution (ms)"),
+            ("time",            _LBL_TIME_US),
             ("n_sweeps",        "Nombre de sweeps"),
         ]
     else:
+        # CCI-only : compteur discret co-canal, distinct de J(x)
         return [
-            ("cost",            "Coût"),
-            ("conflicts_total", "Conflit"),
+            ("cost",            "Coût J(x)"),
+            ("conflicts_cci",   _LBL_C_CCI),
             ("used_channels",   "Canaux utilisés"),
-            ("time",            "Temps d'exécution (ms)"),
+            ("time",            _LBL_TIME_US),
             ("n_sweeps",        "Nombre de sweeps"),
         ]
 
@@ -885,17 +1075,16 @@ def _e3_metric_groups(mode: str, table_type: str):
     # cost_conflict
     if mode == "adjacent":
         return [
-            ("cost",            "Coût"),
-            ("conflicts_cci",   "Conflits C_CCI"),
-            ("conflicts_aci",   "Conflits C_ACI"),
-            ("conflicts_total", "Conflits C_tot"),
+            ("cost",            "Coût J(x)"),
+            ("conflicts_cci",   _LBL_C_CCI),
+            ("conflicts_aci",   _LBL_C_ACI),
+            ("conflicts_total", _LBL_C_TOT),
         ]
     else:
-        # En CCI-only, C_ACI = 0 par construction. On affiche uniquement
-        # le cout et le total (qui vaut C_CCI).
+        # CCI-only : C_ACI = 0 par construction, seul C_CCI est affiché
         return [
-            ("cost",            "Coût"),
-            ("conflicts_total", "Conflit"),
+            ("cost",            "Coût J(x)"),
+            ("conflicts_cci",   _LBL_C_CCI),
         ]
 
 def _e2_metric_groups(mode: str, method_name: str):
@@ -905,19 +1094,19 @@ def _e2_metric_groups(mode: str, method_name: str):
     """
     if mode == "adjacent":
         groups = [
-            ("cost",             "Coût"),
-            ("conflicts_cci",    "Conflits C_CCI"),
-            ("conflicts_aci",    "Conflits C_ACI"),
-            ("conflicts_total",  "Conflits C_tot"),
+            ("cost",             "Coût J(x)"),
+            ("conflicts_cci",    _LBL_C_CCI),
+            ("conflicts_aci",    _LBL_C_ACI),
+            ("conflicts_total",  _LBL_C_TOT),
             ("used_channels",    "Canaux utilisés"),
-            ("time",             "Temps (ms)"),
+            ("time",             _LBL_TIME_US),
         ]
     else:
         groups = [
-            ("cost",             "Coût"),
-            ("conflicts_cci",    "Conflit"),
+            ("cost",             "Coût J(x)"),
+            ("conflicts_cci",    _LBL_C_CCI),
             ("used_channels",    "Canaux utilisés"),
-            ("time",             "Temps (ms)"),
+            ("time",             _LBL_TIME_US),
         ]
 
     # Le solveur BD-CeNN expose en plus le nombre de sweeps (nouvelle convention).
@@ -937,7 +1126,8 @@ def _e2_format_value(val, prefix: str) -> str:
         return str(val)
 
     if prefix == "time":
-        return f"{v:.2f}".replace(".", ",")
+        # Correction : la valeur était affichée en secondes sous un en-tête "ms"
+        return _format_time_us(v, decimal_comma=True)
     if prefix in ("cost",):
         return f"{v:.2f}".replace(".", ",")
     if prefix == "n_sweeps":
@@ -1139,15 +1329,16 @@ def _build_e2_standalone_table_pdf(
     # Note de bas de table
     note_parts = [
         "<i>Note.</i> Moy. = Moyenne, É.T. = Écart-type, "
-        "Méd. = Médiane, Min. = Minimal, Max. = Maximal"
+        "Méd. = Médiane, Min. = Minimal, Max. = Maximal.",
+        _NOTE_C_CCI,
     ]
     if is_adjacent:
         note_parts.append(
-            "C<sub>CCI</sub> = conflits co-canal, "
             "C<sub>ACI</sub> = conflits adjacents, "
-            "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>"
+            "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
-    note_txt = ", ".join(note_parts) + "."
+    note_parts.append(_NOTE_TIME_US)
+    note_txt = " ".join(note_parts) + _traceability_note("E2", mode)
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -1377,15 +1568,16 @@ def _build_e3_standalone_table_pdf(
     # Note de bas de table
     note_parts = [
         "<i>Note.</i> Moy. = Moyenne, É.T. = Écart-type, "
-        "Méd. = Médiane, Min. = Minimal, Max. = Maximal"
+        "Méd. = Médiane, Min. = Minimal, Max. = Maximal."
     ]
-    if is_adjacent and table_type == "cost_conflict":
-        note_parts.append(
-            "C<sub>CCI</sub> = conflits co-canal, "
-            "C<sub>ACI</sub> = conflits adjacents, "
-            "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>"
-        )
-    note_txt = ", ".join(note_parts) + "."
+    if table_type == "cost_conflict":
+        note_parts.append(_NOTE_C_CCI)
+        if is_adjacent:
+            note_parts.append(
+                "C<sub>ACI</sub> = conflits adjacents, "
+                "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
+            )
+    note_txt = " ".join(note_parts) + _traceability_note("E3", mode)
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -1522,7 +1714,7 @@ def _build_e4_standalone_table_pdf(
         except Exception:
             return str(val)
         if prefix == "time":
-            return f"{v:.2f}".replace(".", ",")
+            return _format_time_us(v, decimal_comma=True)
         if prefix == "cost":
             return f"{v:.2f}".replace(".", ",")
         if prefix == "n_sweeps":
@@ -1629,15 +1821,16 @@ def _build_e4_standalone_table_pdf(
     # --- Note de bas de table
     note_parts = [
         "<i>Note.</i> Moy. = Moyenne, É.T. = Écart-Type, Méd. = Médiane. "
-        "Le symbole « — » indique une métrique non applicable à la méthode."
+        "Le symbole « — » indique une métrique non applicable à la méthode.",
+        _NOTE_C_CCI,
     ]
     if is_adjacent:
         note_parts.append(
-            "C<sub>CCI</sub> = conflits co-canal, "
             "C<sub>ACI</sub> = conflits adjacents, "
             "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
-    note_txt = " ".join(note_parts)
+    note_parts.append(_NOTE_TIME_US)
+    note_txt = " ".join(note_parts) + _traceability_note("E4", mode)
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -1672,7 +1865,7 @@ def _build_e6_standalone_table_pdf(
       - En-tete a 2 niveaux : ligne 1 = groupes de metriques (fusionnes
         horizontalement), ligne 2 = suffixes statistiques.
       - Quatre sections (Random, Greedy, DSATUR, BD-CeNN).
-      - Pour chaque section, cinq lignes (N = 20, 30, 50, 100, 200).
+      - Pour chaque section, cinq lignes (N = 8, 30, 50, 100, 200).
       - Note de bas de table.
 
     Format : A4 paysage.
@@ -1774,8 +1967,8 @@ def _build_e6_standalone_table_pdf(
         except Exception:
             return str(val)
         if prefix == "time":
-            # Conversion en ms pour uniformiser l'affichage (E6 stocke en s)
-            return f"{v * 1000:.2f}".replace(".", ",")
+            # Durée stockée en secondes, affichée en ms (quatre décimales)
+            return _format_time_us(v, decimal_comma=True)
         if prefix == "cost":
             return f"{v:.2f}".replace(".", ",")
         if prefix == "n_sweeps":
@@ -1882,15 +2075,16 @@ def _build_e6_standalone_table_pdf(
     # --- Note de bas de table
     note_parts = [
         "<i>Note.</i> moy. = moyenne, é.t. = écart-type, méd. = médiane. "
-        "Le symbole « — » indique une métrique non applicable à la méthode."
+        "Le symbole « — » indique une métrique non applicable à la méthode.",
+        _NOTE_C_CCI,
     ]
     if is_adjacent:
         note_parts.append(
-            "C<sub>CCI</sub> = conflits co-canal, "
             "C<sub>ACI</sub> = conflits adjacents, "
             "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
-    note_txt = " ".join(note_parts)
+    note_parts.append(_NOTE_TIME_US)
+    note_txt = " ".join(note_parts) + _traceability_note("E6", mode)
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -2005,7 +2199,7 @@ def _build_e8_standalone_table_pdf(
         except Exception:
             return str(val)
         if prefix == "time":
-            return f"{v * 1000:.2f}".replace(".", ",")
+            return _format_time_us(v, decimal_comma=True)
         if prefix == "cost":
             return f"{v:.2f}".replace(".", ",")
         if prefix == "changes":
@@ -2125,7 +2319,10 @@ def _build_e8_standalone_table_pdf(
     # --- Note de bas de table
     note_txt = (
         "<i>Note.</i> moy. = moyenne, é.t. = écart-type, méd. = médiane. "
-        "Les temps ont été convertis en millisecondes (ms)."
+        + _NOTE_TIME_US
+        + " Warm Start : un restart depuis l'allocation précédente ; Cold Start : "
+        "dix restarts depuis des initialisations aléatoires."
+        + _traceability_note("E8", mode)
     )
 
     story = [
@@ -2237,7 +2434,7 @@ def _build_e9_standalone_table_pdf(
         except Exception:
             return str(val)
         if prefix == "time":
-            return f"{v * 1000:.2f}".replace(".", ",")
+            return _format_time_us(v, decimal_comma=True)
         if prefix == "cost":
             return f"{v:.2f}".replace(".", ",")
         if prefix == "gain_pct":
@@ -2360,22 +2557,20 @@ def _build_e9_standalone_table_pdf(
     # Note
     note_parts = [
         "<i>Note.</i> moy. = moyenne, é.t. = écart-type, méd. = médiane. "
-        "Les temps ont été convertis en millisecondes (ms)."
+        + _NOTE_TIME_US,
+        _NOTE_C_CCI,
     ]
     if is_adjacent:
         note_parts.append(
-            "C<sub>CCI</sub> = conflits co-canal, "
             "C<sub>ACI</sub> = conflits adjacents, "
-            "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>. "
-            "Gain(R) = (J<sub>1</sub> - J<sub>R</sub>) / J<sub>1</sub> × 100. "
-            "CostRatio(R) = T<sub>R</sub> / T<sub>1</sub>."
+            "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
-    else:
-        note_parts.append(
-            "Gain(R) = (J<sub>1</sub> - J<sub>R</sub>) / J<sub>1</sub> × 100. "
-            "CostRatio(R) = T<sub>R</sub> / T<sub>1</sub>."
-        )
-    note_txt = " ".join(note_parts)
+    note_parts.append(
+        "Gain(R) = (J<sub>1</sub> - J<sub>R</sub>) / J<sub>1</sub> × 100. "
+        "CostRatio(R) = T<sub>R</sub> / T<sub>1</sub>, temps cumulés d'une passe "
+        "unique de vingt essais imbriqués."
+    )
+    note_txt = " ".join(note_parts) + _traceability_note("E9", mode)
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -2688,7 +2883,7 @@ def _generate_e9_standalone_tables(mode: str):
 # ============================================================================
 # [FIX-E6-TABLES] Ordre d'affichage impose par le memoire pour les tables E6.
 # Structure : 1 seule table par regime, 4 sections (Random, Greedy, DSATUR,
-# BD-CeNN), 5 lignes par section (N = 20, 30, 50, 100, 200).
+# BD-CeNN), 5 lignes par section (N = 8, 30, 50, 100, 200).
 # Format A4 paysage.
 # ============================================================================
 
@@ -2700,8 +2895,8 @@ _E6_STAT_DISPLAY = [
     ("max",    "Max"),
 ]
 
-# 5 valeurs de N explorees dans E6
-_E6_N_VALUES = [20, 30, 50, 100, 200]
+# Valeurs de N explorées dans E6, identiques à experiments.run_experiment_E6
+_E6_N_VALUES = [8, 30, 50, 100, 200]
 
 # Ordre d'affichage des methodes
 _E6_METHOD_ORDER = ["Random", "Greedy", "DSATUR", "BD-CeNN"]
@@ -2724,20 +2919,21 @@ def _e6_metric_groups(mode: str):
     """
     if mode == "adjacent":
         return [
-            ("cost",            "Coût"),
-            ("conflicts_cci",   "Conflits C_CCI"),
-            ("conflicts_aci",   "Conflits C_ACI"),
-            ("conflicts_total", "Conflits C_tot"),
+            ("cost",            "Coût J(x)"),
+            ("conflicts_cci",   _LBL_C_CCI),
+            ("conflicts_aci",   _LBL_C_ACI),
+            ("conflicts_total", _LBL_C_TOT),
             ("used_channels",   "Canaux utilisés"),
-            ("time",            "Temps d'exécution (ms)"),
+            ("time",            _LBL_TIME_US),
             ("n_sweeps",        "Nombre de sweeps"),
         ]
     else:
+        # CCI-only : compteur discret co-canal, distinct de J(x)
         return [
-            ("cost",            "Coût"),
-            ("conflicts_total", "Conflit"),
+            ("cost",            "Coût J(x)"),
+            ("conflicts_cci",   _LBL_C_CCI),
             ("used_channels",   "Canaux utilisés"),
-            ("time",            "Temps d'exécution (ms)"),
+            ("time",            _LBL_TIME_US),
             ("n_sweeps",        "Nombre de sweeps"),
         ]
 
@@ -2817,21 +3013,21 @@ def _e9_standalone_metric_groups(mode: str):
     """
     if mode == "adjacent":
         return [
-            ("cost",            "Coût",                5),
-            ("conflicts_cci",   "C_CCI",               5),
-            ("conflicts_aci",   "C_ACI",               5),
-            ("conflicts_total", "C_tot",               5),
-            ("time",            "Temps d'exécution (ms)", 5),
-            ("gain_pct",        "Gain (%)",            1),
-            ("cost_ratio",      "CostRatio",           1),
+            ("cost",            "Coût J(x)",   5),
+            ("conflicts_cci",   _LBL_C_CCI,    5),
+            ("conflicts_aci",   _LBL_C_ACI,    5),
+            ("conflicts_total", _LBL_C_TOT,    5),
+            ("time",            _LBL_TIME_US,  5),
+            ("gain_pct",        "Gain (%)",    1),
+            ("cost_ratio",      "CostRatio",   1),
         ]
     else:
         return [
-            ("cost",            "Coût",                5),
-            ("conflicts_total", "Conflit",             5),
-            ("time",            "Temps d'exécution (ms)", 5),
-            ("gain_pct",        "Gain (%)",            1),
-            ("cost_ratio",      "CostRatio",           1),
+            ("cost",            "Coût J(x)",   5),
+            ("conflicts_cci",   _LBL_C_CCI,    5),
+            ("time",            _LBL_TIME_US,  5),
+            ("gain_pct",        "Gain (%)",    1),
+            ("cost_ratio",      "CostRatio",   1),
         ]
 
 def build_pdf_report(
@@ -2840,7 +3036,8 @@ def build_pdf_report(
     verifications: list,
     anomalies: list,
     all_tables: dict,
-    output_path: Path
+    output_path: Path,
+    run_metadata: dict = None,
 ):
     """
     Genere le document d'audit PDF ReportLab.
@@ -2931,6 +3128,27 @@ def build_pdf_report(
     verdict_text = "CONFORME" if len(anomalies) == 0 else "NON CONFORME"
     verdict_color = "#15803d" if len(anomalies) == 0 else "#b91c1c"
 
+    # Métadonnées de reproductibilité lues dans run_metadata.json (recommandation C)
+    run_metadata = run_metadata or {}
+    trace_fields = [
+        ("Scenario", "scenario"),
+        ("Graines de topologie", "topology_seeds"),
+        ("Graine algorithmique", "algorithm_seed_rule"),
+        ("num_restarts", "num_restarts"),
+        ("Budgets de restarts (E9)", "restart_budgets"),
+        ("patience_sweeps", "patience_sweeps"),
+        ("max_sweeps", "max_sweeps"),
+        ("Mode", "interference_mode"),
+        ("Version du code", "code_version"),
+        ("Modele LLM", "llm_model"),
+        ("Recalcul independant", "recompute_coverage"),
+    ]
+    trace_rows = [
+        [Paragraph(label, style_meta_label),
+         Paragraph(str(run_metadata[key]), style_meta_cell)]
+        for label, key in trace_fields if key in run_metadata
+    ]
+
     meta_data = [
         [Paragraph("Auteur", style_meta_label),
          Paragraph("Nelson MUKABI NGOMBO", style_meta_cell)],
@@ -2938,6 +3156,7 @@ def build_pdf_report(
          Paragraph(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), style_meta_cell)],
         [Paragraph("Version specification", style_meta_label),
          Paragraph("1.0 (Gelee)", style_meta_cell)],
+        *trace_rows,
         [Paragraph("Verdict global", style_meta_label),
          Paragraph(f"<font color='{verdict_color}'><b>{verdict_text}</b></font>", style_meta_cell)],
         [Paragraph("Anomalies detectees", style_meta_label),
@@ -3073,7 +3292,7 @@ def build_pdf_report(
         legend_text = (
             "<i>Nomenclature : Moy. = Moyenne, E.T. = Ecart-type, "
             "C_CCI = Conflits co-canal, C_ACI = Conflits adjacents, "
-            "C_tot = Conflits totaux, t_exec = Temps d'execution (en ms), "
+            "C_tot = Conflits totaux, t_exec = Temps d'execution (en ms, quatre decimales), "
             "Sweeps = Balayages complets, K_used = Canaux utilises.</i>"
         )
         story.append(Paragraph(legend_text, style_small))
@@ -3333,6 +3552,7 @@ def validate_experiment(experiment_id: str, modes: list = None):
     if modes is None:
         modes = ["cochannel", "adjacent"]
 
+    total_anomalies = 0
     for mode in modes:
         csv_dir = config.CSV_DIR / experiment_id / mode
         if not csv_dir.exists():
@@ -3346,6 +3566,25 @@ def validate_experiment(experiment_id: str, modes: list = None):
 
         # Classification intelligente des fichiers
         classified = classify_csv_files(csv_dir)
+
+        # [V20] [V21] Recalcul indépendant de 100 % des lignes officielles
+        recompute = independent_recompute(experiment_id, mode, csv_dir)
+        anomalies.extend(recompute["anomalies"])
+        verifications.append(VerificationResult(
+            "V20",
+            f"Couverture du recalcul indépendant : {recompute['coverage']:.1f} % "
+            f"({recompute['n_covered']}/{recompute['n_rows']} lignes)",
+            recompute["n_rows"] > 0 and recompute["n_covered"] == recompute["n_rows"],
+        ))
+        n_mismatch = sum("[V21]" in a for a in recompute["anomalies"])
+        verifications.append(VerificationResult(
+            "V21",
+            f"J(x), C_CCI, C_ACI recalculés depuis W, M et x : {n_mismatch} écart(s)",
+            n_mismatch == 0,
+        ))
+        if recompute["anomalies"]:
+            print(f"[ALERTE] {experiment_id} ({mode}) : "
+                  f"{len(recompute['anomalies'])} anomalie(s) au recalcul indépendant.")
 
         # -------------------------------------------------------------------
         # A. TRAITEMENT DES FICHIERS DE SYNTHESE (summary_metrics.csv)
@@ -3421,7 +3660,10 @@ def validate_experiment(experiment_id: str, modes: list = None):
         for csv_path in classified["metrics"]:
             try:
                 df = pd.read_csv(csv_path)
-                all_tables[csv_path.name] = (df, "metrics")
+                all_tables[csv_path.name] = (
+                    df.drop(columns=[c for c in _PDF_HIDDEN_COLUMNS if c in df.columns]),
+                    "metrics",
+                )
 
                 fname = csv_path.name
 
@@ -3524,38 +3766,6 @@ def validate_experiment(experiment_id: str, modes: list = None):
 
             except Exception as e:
                 anomalies.append(f"Erreur d'analyse sur {csv_path.name}: {e}")
-
-                                # [FIX-E10] Invariant specifique E10 : coherence de la
-                # decomposition C_tot = C_CCI + C_ACI pour le CSV solver_metrics_e10.
-                # Ce CSV contient 20 lignes (une par cas) au lieu d'une
-                # agregation, donc la verification ligne a ligne est directe.
-                if "solver_metrics" in fname:
-                    if all(c in df.columns for c in
-                           ["conflicts_cci", "conflicts_aci", "conflicts_total"]):
-                        v_e10_ok = True
-                        for idx, row in df.iterrows():
-                            expected = int(row["conflicts_cci"]) + int(row["conflicts_aci"])
-                            if int(row["conflicts_total"]) != expected:
-                                v_e10_ok = False
-                                anomalies.append(
-                                    f"{fname} ligne {idx}: [V10-E10] "
-                                    f"C_tot ({row['conflicts_total']}) != "
-                                    f"C_CCI + C_ACI ({expected})"
-                                )
-                        verifications.append(VerificationResult(
-                            "V10-E10",
-                            f"Coherence C_tot = C_CCI + C_ACI pour E10 ({fname})",
-                            v_e10_ok,
-                        ))
-
-                    # [FIX-E10] Invariant supplementaire : sweeps >= 0
-                    if "sweeps" in df.columns:
-                        v_sweeps_ok = (df["sweeps"].dropna() >= 0).all()
-                        verifications.append(VerificationResult(
-                            "V10-SWEEPS",
-                            f"Sweeps >= 0 ({fname})",
-                            v_sweeps_ok,
-                        ))
 
         # -------------------------------------------------------------------
         # C. TRAITEMENT DES FICHIERS D'ALLOCATIONS (cell_channels.csv)
@@ -3693,6 +3903,18 @@ def validate_experiment(experiment_id: str, modes: list = None):
         validation_sub_dir.mkdir(parents=True, exist_ok=True)
         pdf_path = validation_sub_dir / f"validation_report_{experiment_id}_{mode}.pdf"
 
+        run_metadata = {}
+        metadata_path = csv_dir / "run_metadata.json"
+        if metadata_path.exists():
+            try:
+                run_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except ValueError:
+                anomalies.append(f"run_metadata.json illisible ({experiment_id}, {mode})")
+        run_metadata["recompute_coverage"] = (
+            f"{recompute['coverage']:.1f} % "
+            f"({recompute['n_covered']}/{recompute['n_rows']} lignes)"
+        )
+
         try:
             build_pdf_report(
                 experiment_id=experiment_id,
@@ -3700,7 +3922,8 @@ def validate_experiment(experiment_id: str, modes: list = None):
                 verifications=verifications,
                 anomalies=anomalies,
                 all_tables=all_tables,
-                output_path=pdf_path
+                output_path=pdf_path,
+                run_metadata=run_metadata,
             )
             print(f"[SUCCESS] Rapport de conformite genere : {pdf_path}")
         except Exception as e:
@@ -3740,6 +3963,10 @@ def validate_experiment(experiment_id: str, modes: list = None):
         # C_tot en mode adjacent et metriques Gain / CostRatio).
         elif experiment_id == "E9":
             _generate_e9_standalone_tables(mode)
+
+        total_anomalies += len(anomalies)
+
+    return total_anomalies
 # ============================================================================
 # 6. POINT D'ENTREE AUTONOME
 # ============================================================================
@@ -3752,6 +3979,11 @@ if __name__ == "__main__":
     exp_id = sys.argv[1]
     modes_arg = sys.argv[2:] if len(sys.argv) > 2 else None
 
-    print(f"[MANUAL AUDIT] Relance de l'audit pour {exp_id}...")
-    validate_experiment(experiment_id=exp_id, modes=modes_arg)
-    print("[DONE] Audit termine.")
+    # « all » : audit de toutes les campagnes officielles, relues depuis le disque
+    targets = [f"E{i}" for i in range(1, 11)] if exp_id.lower() == "all" else [exp_id]
+    total = 0
+    for target in targets:
+        print(f"[MANUAL AUDIT] Relance de l'audit pour {target}...")
+        total += validate_experiment(experiment_id=target, modes=modes_arg) or 0
+    print(f"[DONE] Audit termine : {total} anomalie(s).")
+    sys.exit(1 if total else 0)

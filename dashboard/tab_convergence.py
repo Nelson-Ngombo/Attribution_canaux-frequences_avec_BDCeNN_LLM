@@ -12,6 +12,8 @@ Enhanced version:
 import time
 import streamlit as st
 
+import config
+
 from dashboard import session_manager as sm
 from dashboard import toast
 from dashboard.chart_factory import (
@@ -92,6 +94,22 @@ def _run_full_experiment():
         sm.set_value("experiment_running", False)
 
 
+def _render_run_traceability(topology):
+    """Bandeau de reproductibilité du run courant (recommandation C de l'encadreur)."""
+    record = sm.get("experiment_record")
+    bd_modes = record.solver_results.get("BD-CeNN", {}) if record else {}
+    bd_meta = (next(iter(bd_modes.values())).metadata if bd_modes else None) or {}
+    modes = " + ".join(config.INTERFERENCE_MODE_LABELS[m] for m in bd_modes)
+    st.caption(
+        f"Traçabilité : topology_seed = {topology.seed} | "
+        f"algorithm_seed = {config.algorithm_seed(topology.seed)} | "
+        f"num_restarts = {bd_meta.get('num_restarts', sm.get('num_restarts'))} | "
+        f"patience_sweeps = {config.PATIENCE_SWEEPS} | "
+        f"max_sweeps = {bd_meta.get('max_sweeps', sm.get('max_iter'))} | "
+        f"mode {modes or 'solveurs non exécutés'} | code v{config.CODE_VERSION}"
+    )
+
+
 def render():
     """Point d'entree de l'onglet."""
     st.header("Convergence energetique et sweeps")
@@ -106,6 +124,7 @@ def render():
         return
 
     render_scenario_summary(topology)
+    _render_run_traceability(topology)
     st.divider()
 
     section_title("Parametrage et exécution du solveur")
@@ -192,21 +211,23 @@ def render():
                 })
                 st.dataframe(df, use_container_width=True, height=250)
 
-    # Métrique Delta_ACI
-    if record.delta_aci_percent is not None:
+    # Delta_ACI (Eq. delta-aci) : optimum CCI+ACI comparé à l'optimum CCI-only
+    if "cci" in bd_results and "cci_aci" in bd_results:
         st.divider()
         section_title("Métrique Delta_ACI")
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.metric(
-                "Delta_ACI (BD-CeNN)",
-                f"+{record.delta_aci_percent:.2f}%",
-                help="Surcoût relatif induit lors de l'évaluation sous modèle adjacent.",
-            )
-        with col2:
-            info_banner(
-                "Le Delta_ACI mesure le saut energetique lorsque la solution physique "
-                "est soumise aux debordements spectraux du canal adjacent. Plus il est faible, "
-                "plus l'allocation est robuste.",
-                kind="info",
-            )
+        delta = record.delta_aci_percent
+        kpi_row([
+            {"label": "J_CCI (optimum CCI-only)", "value": f"{bd_results['cci'].cost:.4f}"},
+            {"label": "J_CCI+ACI (optimum CCI+ACI)", "value": f"{bd_results['cci_aci'].cost:.4f}"},
+            {"label": "Delta_ACI (BD-CeNN)",
+             "value": f"{delta:+.2f} %" if delta is not None else "Non défini",
+             "help": "(J_CCI+ACI - J_CCI) / J_CCI x 100, non défini si J_CCI = 0."},
+        ])
+        info_banner(
+            "Le Delta_ACI compare le coût de l'allocation optimisée en régime CCI+ACI au coût "
+            "de l'allocation optimisée en régime CCI-only, chacun évalué dans son propre régime. "
+            "Il mesure le surcoût d'interférence introduit par les canaux adjacents sur cette "
+            "topologie, et non la robustesse d'une allocation. Une valeur élevée est attendue "
+            "lorsque K est faible devant le cutoff ou que le graphe est dense.",
+            kind="info",
+        )

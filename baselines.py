@@ -6,7 +6,9 @@ Implements Random, Order-based Greedy, and DSATUR assignment algorithms.
 
 import numpy as np
 
-def create_channel_interference_matrix(K, decay=0.5, cutoff=2):
+import config
+
+def create_channel_interference_matrix(K, decay=config.ALPHA, cutoff=config.CUTOFF):
     """
     Generates a K x K adjacent channel interference (ACI) matrix M.
     Models the physical spectral leakage between contiguous frequency bands.

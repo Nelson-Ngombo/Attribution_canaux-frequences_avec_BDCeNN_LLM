@@ -75,7 +75,8 @@ def save_interactive_run(record: ExperimentRecord,
                 df = pd.DataFrame(rows)
                 mdir = _mode_dir(mode)
                 csv_path = mdir / "csv" / f"metrics_{ts}_{experiment_id}.csv"
-                df.to_csv(csv_path, index=False, float_format="%.6f")
+                # Pleine précision : aucune troncature des durées en secondes
+                df.to_csv(csv_path, index=False, float_format="%.9f")
                 saved["csv"].append(str(csv_path))
 
         # 3. Sauvegarde de la trajectoire d'énergie en sweeps (Chantier D)

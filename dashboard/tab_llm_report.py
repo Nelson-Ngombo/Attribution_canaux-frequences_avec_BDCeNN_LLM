@@ -5,6 +5,7 @@ Tab 5: LLM Analysis Report with Independent Regex-based Audit.
 import streamlit as st
 import numpy as np
 
+import config
 from dashboard import session_manager as sm
 from dashboard import toast
 from dashboard.chart_factory import MODE_LABELS
@@ -91,6 +92,16 @@ def _build_case_data(record, mode: str) -> dict:
 
     model_label = "CCI-only" if mode == "cci" else "CCI+ACI"
 
+    # Hyperparamètres réellement utilisés par le run (sliders du dashboard)
+    bd_meta = bd_result.metadata or {}
+    run_metadata = config.build_run_metadata(
+        scenario=topology.scenario_name or "CUSTOM",
+        topology_seed=topology.seed,
+        interference_mode=mode,
+        num_restarts=bd_meta.get("num_restarts", config.NUM_RESTARTS),
+        max_sweeps=bd_meta.get("max_sweeps", config.MAX_SWEEPS_BD),
+    )
+
     return {
         "case_id": f"DASHBOARD_{record.experiment_id}",
         "scenario": topology.scenario_name or "CUSTOM",
@@ -108,6 +119,8 @@ def _build_case_data(record, mode: str) -> dict:
             "time_seconds": float(bd_result.wall_time_seconds),
             "sweeps": int(bd_result.n_sweeps),  # sweeps mapped for LLM key
             "used_channels": int(bd_result.used_channels),
+            # Budget réellement utilisé : cité dans le prompt et admis par la whitelist
+            "num_restarts": int(bd_meta.get("num_restarts", config.NUM_RESTARTS)),
         },
         "baselines": baselines,
         "conflicting_cells": conflicting_cells,
@@ -117,6 +130,9 @@ def _build_case_data(record, mode: str) -> dict:
         "total_edges": total_edges,
         "cell_summary": cell_summary,
         "topology_meta": topology_meta,
+        # Hors prompt : en-tête des PDF et panneau de traçabilité
+        "algorithm_seed": run_metadata["algorithm_seed"],
+        "run_metadata": run_metadata,
     }
 
 
@@ -142,36 +158,50 @@ def _generate_llm_report(mode: str):
 
         sm.set_value(f"llm_response_{mode}", response)
 
+        from llm_assistant import (verify_structured_claims, semantic_audit,
+                                   get_llm_inference_params)
+        from verifier import combine_numeric_status
+
+        # Paramètres et modèle ayant effectivement produit ce rapport
+        sm.set_value(f"llm_params_{mode}", get_llm_inference_params())
+
         verifier = sm.get("verifier")
         audit = verifier.audit(response, case_data)
         sm.set_value(f"audit_report_{mode}", audit)
 
-        # Audit structurel complementaire (chantier superviseur section 13)
-        try:
-            from llm_assistant import verify_structured_claims
-            audit_struct = verify_structured_claims(response, case_data)
-            sm.set_value(f"audit_struct_{mode}", audit_struct)
-        except Exception:
-            sm.set_value(f"audit_struct_{mode}", None)
+        # Audit numérique bloquant : whitelist ET quadruplets
+        # (scénario, méthode, métrique, valeur)
+        audit_struct = verify_structured_claims(response, case_data)
+        sm.set_value(f"audit_struct_{mode}", audit_struct)
+        numeric_status = combine_numeric_status(audit, audit_struct)
+        sm.set_value(f"numeric_status_{mode}", numeric_status)
 
-        if audit.status == "CERTIFIED":
+        # Audit sémantique séparé, sans effet sur la certification numérique
+        sm.set_value(f"audit_semantic_{mode}", semantic_audit(response, case_data))
+
+        if numeric_status == "CERTIFIED":
             toast.success(f"Rapport genere et certifie ({MODE_LABELS[mode]})")
-        elif audit.status == "FAILED":
-            toast.warning(f"Rapport genere mais audit echec ({audit.invented_count} valeurs suspectes)")
+        elif numeric_status == "FAILED":
+            toast.warning(
+                f"Rapport NON certifie : {audit.invented_count} valeur(s) hors whitelist, "
+                f"{len(audit_struct['invalid_claims'])} quadruplet(s) mal attribue(s)"
+            )
         else:
-            toast.info(f"Rapport genere (audit WARNING : aucune valeur numerique)")
+            toast.info("Rapport genere (audit WARNING : aucune valeur numerique)")
 
     except Exception as e:
         import traceback
         render_error_box(type(e).__name__, str(e), traceback.format_exc())
 
 
-def _render_audit_badge(audit_report):
+def _render_audit_badge(audit_report, numeric_status=None, n_invalid_quadruplets=0):
     if audit_report is None:
         info_banner("Aucun audit realise.", kind="info")
         return
 
-    if audit_report.status == "CERTIFIED":
+    # Statut combiné (whitelist + quadruplets) prioritaire sur la seule whitelist
+    status = numeric_status or audit_report.status
+    if status == "CERTIFIED":
         st.markdown(
             f"""
             <div style="background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
@@ -188,7 +218,7 @@ def _render_audit_badge(audit_report):
             """,
             unsafe_allow_html=True,
         )
-    elif audit_report.status == "WARNING":
+    elif status == "WARNING":
         st.markdown(
             f"""
             <div style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
@@ -213,8 +243,8 @@ def _render_audit_badge(audit_report):
                     RAPPORT NON CERTIFIE
                 </div>
                 <div style="color: #b91c1c; font-size: 0.9rem; margin-top: 0.3rem;">
-                    {audit_report.invented_count} valeur(s) numerique(s) ne correspondent
-                    pas aux donnees certifiees.<br>
+                    {audit_report.invented_count} valeur(s) hors whitelist et
+                    {n_invalid_quadruplets} quadruplet(s) mal attribue(s).<br>
                     Taux d'exactitude : {audit_report.accuracy_rate:.1f}%
                 </div>
             </div>
@@ -246,6 +276,45 @@ def _render_verification_table(audit_report):
                  use_container_width=True, height=300)
 
 
+def _render_semantic_badge(semantic):
+    """Statut sémantique, affiché séparément du statut numérique."""
+    if semantic is None:
+        info_banner("Aucun audit semantique realise.", kind="info")
+        return
+    kind = {"SEMANTIQUE_OK": "success", "SEMANTIQUE_RESERVES": "warning"}.get(
+        semantic["status"], "error")
+    getattr(st, kind)(
+        f"{semantic['status']} : score {semantic['score']:.1f} % "
+        f"({semantic['version']}, non bloquant)"
+    )
+    for check in semantic["checks"]:
+        if not check["passed"]:
+            st.caption(f"{check['code']} : {check['label']} ({check['detail']})")
+
+
+def _render_llm_params(params, case_data):
+    """Modèle exact, paramètres d'inférence et métadonnées du run audité."""
+    if params is None:
+        from llm_assistant import get_llm_inference_params
+        params = get_llm_inference_params()
+    st.markdown(
+        f"**Modele** : `{params['model']}`  \n"
+        f"**temperature** = {params['temperature']} | **top_p** = {params['top_p']} | "
+        f"**top_k** = {params['top_k']}  \n"
+        f"**max_output_tokens** = {params['max_output_tokens']} | **seed** = {params['seed']}  \n"
+        f"**Directive Zero-Hallucination** : {params['directive_version']}  \n"
+        f"**Audit semantique** : {params['semantic_audit_version']}"
+    )
+    meta = (case_data or {}).get("run_metadata")
+    if meta:
+        st.caption(
+            f"Scenario {meta['scenario']} | topology_seed = {meta['topology_seed']} | "
+            f"algorithm_seed = {meta['algorithm_seed']} | num_restarts = {meta['num_restarts']} | "
+            f"patience_sweeps = {meta['patience_sweeps']} | max_sweeps = {meta['max_sweeps']} | "
+            f"mode {meta['interference_mode']} | code v{meta['code_version']}"
+        )
+
+
 def render():
     """Point d'entree de l'onglet."""
     st.header("Analyse qualitative et audit symbolique")
@@ -265,7 +334,7 @@ def render():
     )
 
     # Vérification d'initialisation du LLM
-    from llm_assistant import is_llm_available, get_active_model, get_initialization_error
+    from llm_assistant import is_llm_available, get_initialization_error
     if not is_llm_available():
         info_banner(
             "Le LLM n'est pas initialise. "
@@ -273,7 +342,14 @@ def render():
             kind="warning",
         )
     else:
-        st.caption(f"Modele LLM connecte : `{get_active_model()}`")
+        from llm_assistant import get_llm_inference_params
+        params = get_llm_inference_params()
+        st.caption(
+            f"Modele LLM : `{params['model']}` | temperature = {params['temperature']} | "
+            f"top_p = {params['top_p']} | top_k = {params['top_k']} | "
+            f"max_output_tokens = {params['max_output_tokens']} | "
+            f"directive {params['directive_version']}"
+        )
 
     available_modes = list(record.solver_results.get("BD-CeNN", {}).keys())
     if not available_modes:
@@ -318,11 +394,23 @@ def render():
         if response.startswith("[ERREUR LLM]") or response.startswith("[LLM_ERROR]"):
             st.error(response)
         else:
+            if sm.get(f"numeric_status_{mode}") == "FAILED":
+                st.error("Rapport NON CERTIFIE numeriquement : aucun de ses chiffres ne doit "
+                         "etre repris (voir le detail des divergences).")
             st.markdown(response)
 
     with col_right:
-        section_title("Verificateur automatique")
-        _render_audit_badge(audit_report)
+        section_title("Audit numerique (bloquant)")
+        struct_report = sm.get(f"audit_struct_{mode}")
+        _render_audit_badge(
+            audit_report,
+            numeric_status=sm.get(f"numeric_status_{mode}"),
+            n_invalid_quadruplets=len(struct_report["invalid_claims"]) if struct_report else 0,
+        )
+        section_title("Audit semantique (non bloquant)")
+        _render_semantic_badge(sm.get(f"audit_semantic_{mode}"))
+        with st.expander("Parametres d'inference LLM et tracabilite", expanded=True):
+            _render_llm_params(sm.get(f"llm_params_{mode}"), sm.get(f"llm_case_data_{mode}"))
 
         if audit_report:
             with st.expander("Voir le detail des verifications"):

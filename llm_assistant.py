@@ -52,6 +52,18 @@ INTER_REQUEST_DELAY = 3.0
 LLM_TIMEOUT_SECONDS = 45
 PROBE_TIMEOUT_SECONDS = 20
 
+# Paramètres d'inférence gelés pour la campagne scientifique (recommandation E10)
+LLM_TEMPERATURE = 0.0
+LLM_TOP_P = 1.0
+LLM_TOP_K = 1
+LLM_MAX_OUTPUT_TOKENS = 8000
+LLM_SEED = 2026
+# E10 interroge un modèle unique ; la rotation reste réservée au dashboard
+LLM_CAMPAIGN_FIXED_MODEL = True
+LLM_CAMPAIGN_MODEL = GOOGLE_MODEL_PREFERRED
+# Version de la directive, archivée hors prompt pour ne pas polluer la whitelist
+ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.1"
+
 from config import LLM_LOGS_DIR, FIGURES_DIR, CSV_DIR
 
 LLM_LOGS_DIR = Path(LLM_LOGS_DIR)
@@ -245,6 +257,31 @@ def get_active_model() -> str:
     return _get_active_model_internal()
 
 
+def get_last_responding_model() -> str:
+    """Identifiant exact du dernier modèle ayant effectivement répondu."""
+    with _state_lock:
+        return (_state["last_successful_model"] or "").replace("models/", "")
+
+
+def get_llm_inference_params() -> dict:
+    """Paramètres d'inférence exacts, affichés dans le dashboard et les rapports."""
+    model = (get_last_responding_model()
+             or _get_active_model_internal().replace("models/", "")
+             or GOOGLE_MODEL_PREFERRED.replace("models/", ""))
+    return {
+        "model": model,
+        "campaign_model": LLM_CAMPAIGN_MODEL.replace("models/", ""),
+        "fixed_model_for_campaign": LLM_CAMPAIGN_FIXED_MODEL,
+        "temperature": LLM_TEMPERATURE,
+        "top_p": LLM_TOP_P,
+        "top_k": LLM_TOP_K,
+        "max_output_tokens": LLM_MAX_OUTPUT_TOKENS,
+        "seed": LLM_SEED,
+        "directive_version": ZERO_HALLUCINATION_DIRECTIVE_VERSION,
+        "semantic_audit_version": SEMANTIC_AUDIT_VERSION,
+    }
+
+
 def get_initialization_error() -> str:
     with _state_lock:
         return _state["error_message"] or ""
@@ -300,6 +337,14 @@ def _fmt(value, ndigits=2):
     except Exception:
         pass
     return str(value)
+
+
+def _fmt_us(seconds) -> str:
+    """Durée stockée en secondes, restituée en millisecondes (4 décimales)."""
+    try:
+        return f"{float(seconds) * 1e3:.4f}"
+    except (TypeError, ValueError):
+        return str(seconds)
 
 
 def _conflicts_summary_text(m: dict, model_label: str) -> str:
@@ -373,7 +418,7 @@ def build_prompt(case_data: dict) -> str:
             baseline_lines.append(
                 f"  - {name} : cout J = {_fmt(b[name].get('cost'))}, "
                 f"{conflict_text}, "
-                f"temps t_exec = {_fmt(b[name].get('time'), 6)} s"
+                f"temps t_exec = {_fmt_us(b[name].get('time'))} ms"
             )
     baseline_str = "\n".join(baseline_lines) if baseline_lines else "  (aucune baseline)"
 
@@ -485,7 +530,7 @@ def build_prompt(case_data: dict) -> str:
 === METRIQUES DE CONVERGENCE (BD-CeNN) ===
 - Cout initial de l'energie J_0 : {_fmt(m.get('cost_initial'))}
 - Cout final J(x*) : {_fmt(m.get('cost_final'))}
-- Temps d'execution du solveur t_exec : {_fmt(m.get('time_seconds'), 6)} s
+- Temps d'execution du solveur t_exec : {_fmt_us(m.get('time_seconds'))} ms
 - Nombre de balayages (sweeps) effectues : {_fmt(m.get('sweeps'))}
 - Nombre de canaux utilises : {_fmt(m.get('used_channels'))}
 - Nombre de restarts du solveur : {_fmt(m.get('num_restarts'))}
@@ -523,8 +568,6 @@ D) Evalue les contraintes topologiques du reseau geres par le solveur. Identifie
 
 E) Formule des recommandations pour eviter les pieges des minima locaux (modification stochastique,
    augmentation des restarts).
-
-F) Donne une note de confiance en toutes lettres (de un a cinq) avec justification technique.
 """
     return prompt.strip()
 
@@ -551,10 +594,13 @@ def _call_with_timeout(model_to_try: str, prompt: str,
             resp = client.models.generate_content(
                 model=model_to_try,
                 contents=prompt,
+                # Inférence déterministe et paramètres archivés (E10)
                 config=types.GenerateContentConfig(
-                    temperature=0.2,
+                    temperature=LLM_TEMPERATURE,
                     max_output_tokens=max_tokens,
-                    top_p=0.9,
+                    top_p=LLM_TOP_P,
+                    top_k=LLM_TOP_K,
+                    seed=LLM_SEED,
                 ),
             )
             result["response"] = resp
@@ -603,7 +649,8 @@ def _extract_text_from_response(response) -> str:
 
 
 def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
-            inter_request_delay: float = INTER_REQUEST_DELAY) -> str:
+            inter_request_delay: float = INTER_REQUEST_DELAY,
+            allow_fallback: bool = True) -> str:
     ensure_init_started()
     status = _get_status()
 
@@ -632,11 +679,14 @@ def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
         candidates = [last_ok] + [m for m in all_models if m != last_ok]
     else:
         candidates = all_models
+    if not allow_fallback:
+        # Modèle unique imposé (campagne E10) : aucune substitution silencieuse
+        candidates = [LLM_CAMPAIGN_MODEL]
 
     tried_models = set()
     last_error = None
     empty_response_count = 0
-    current_max_tokens = 8000
+    current_max_tokens = LLM_MAX_OUTPUT_TOKENS
 
     for attempt in range(1, max_retries + 1):
         model_to_try = next(
@@ -746,11 +796,16 @@ def _collect_allowed_numbers(case_data: dict) -> set:
                 "num_restarts"]:
         if key in m:
             add(m[key])
+    # Durées admises aussi en millisecondes, unité d'affichage du prompt et du PDF
+    if "time_seconds" in m:
+        add(float(m["time_seconds"]) * 1e3)
 
     for base_data in case_data.get("baselines", {}).values():
         for k in ["cost", "conflicts_cci", "conflicts_aci", "conflicts_total", "time"]:
             if k in base_data:
                 add(base_data[k])
+        if "time" in base_data:
+            add(float(base_data["time"]) * 1e3)
 
     for c in case_data.get("conflicting_cells", []):
         add(c)
@@ -768,7 +823,8 @@ def _collect_allowed_numbers(case_data: dict) -> set:
         try:
             add(int(i))
             add(int(j))
-            add(int(w))
+            # Poids bruité (S6) conservé à deux décimales, sans troncature
+            add(w)
         except Exception:
             pass
 
@@ -867,9 +923,12 @@ STRUCTURED_CLAIM_PATTERNS = [
 ]
 
 
-def _numbers_match(val: float, ref: float,
-                   rel_tol: float = 0.01, abs_tol: float = 0.01) -> bool:
-    """Comparaison tolerante : relative ET absolue."""
+# Mention explicite d'un scénario (S1 à S7) dans la phrase d'une revendication
+_SCENARIO_TOKEN = re.compile(r"\bS([1-7])\b")
+_SENTENCE_BREAK = re.compile(r"[.!?;](?=\s|$)|\n")
+
+
+def _numbers_match(val, ref, rel_tol=0.01, abs_tol=0.01):
     if val == ref:
         return True
     if ref == 0:
@@ -878,7 +937,7 @@ def _numbers_match(val: float, ref: float,
 
 
 def _build_structured_facts(case_data: dict) -> list:
-    """Construit la base de faits certifies (methode, metrique, valeur)."""
+    """Base de quadruplets certifiés (scénario, méthode, métrique, valeur)."""
     facts = []
     scenario = case_data.get("scenario", "")
 
@@ -886,6 +945,9 @@ def _build_structured_facts(case_data: dict) -> list:
     bd_metrics = [
         ("cost_initial", "cost_initial"),
         ("cost_final",   "cost_final"),
+        # Une revendication « coût du BD-CeNN » désigne J_0 ou J(x*)
+        ("cost",         "cost_final"),
+        ("cost",         "cost_initial"),
         ("C_CCI",        "conflicts_cci"),
         ("C_ACI",        "conflicts_aci"),
         ("C_tot",        "conflicts"),
@@ -899,7 +961,8 @@ def _build_structured_facts(case_data: dict) -> list:
                 "scenario": scenario,
                 "method":   "BD-CeNN",
                 "metric":   metric_label,
-                "value":    float(m[key]),
+                # Le temps est cité en ms dans le prompt
+                "value":    float(m[key]) * 1e3 if metric_label == "time" else float(m[key]),
             })
 
     for base_name, base_data in case_data.get("baselines", {}).items():
@@ -908,20 +971,32 @@ def _build_structured_facts(case_data: dict) -> list:
             ("C_CCI", "conflicts_cci"),
             ("C_ACI", "conflicts_aci"),
             ("C_tot", "conflicts_total"),
+            ("time",  "time"),
         ]:
             if key in base_data:
                 facts.append({
                     "scenario": scenario,
                     "method":   base_name,
                     "metric":   metric_label,
-                    "value":    float(base_data[key]),
+                    "value":    (float(base_data[key]) * 1e3 if metric_label == "time"
+                                 else float(base_data[key])),
                 })
 
     return facts
 
 
+def _claimed_scenario(text: str, position: int):
+    """Scénario cité dans la phrase qui contient la revendication, sinon None."""
+    starts = [m.end() for m in _SENTENCE_BREAK.finditer(text, 0, position)]
+    start = starts[-1] if starts else 0
+    end_match = _SENTENCE_BREAK.search(text, position)
+    end = end_match.start() if end_match else len(text)
+    found = _SCENARIO_TOKEN.findall(text[start:end])
+    return f"S{found[0]}" if len(set(found)) == 1 else (None if not found else "AMBIGU")
+
+
 def _extract_structured_claims(text: str) -> list:
-    """Extrait les revendications (methode, metrique, valeur) du texte LLM."""
+    """Extrait les quadruplets (scénario, méthode, métrique, valeur) du texte LLM."""
     claims = []
     for pattern, kind in STRUCTURED_CLAIM_PATTERNS:
         for match in pattern.finditer(text):
@@ -950,6 +1025,7 @@ def _extract_structured_claims(text: str) -> list:
                 continue
 
             claims.append({
+                "scenario": _claimed_scenario(text, match.start()),
                 "method": method,
                 "metric": metric,
                 "value":  value,
@@ -959,24 +1035,29 @@ def _extract_structured_claims(text: str) -> list:
 
 
 def verify_structured_claims(text: str, case_data: dict,
-                              rel_tol: float = 0.01,
-                              abs_tol: float = 0.01) -> dict:
+                             rel_tol: float = 0.01,
+                             abs_tol: float = 0.01) -> dict:
     """
-    Verifie les associations (scenario, methode, metrique, valeur).
-    Retourne un rapport distinct de la verification numerique pure.
+    Vérifie chaque quadruplet (scénario, méthode, métrique, valeur). Un
+    scénario non cité dans la phrase est celui du cas ; un scénario cité
+    différent, ou plusieurs scénarios dans la même phrase, invalide la ligne.
     """
-    facts  = _build_structured_facts(case_data)
+    facts = _build_structured_facts(case_data)
     claims = _extract_structured_claims(text)
+    case_scenario = case_data.get("scenario", "")
 
     valid, invalid = [], []
     for claim in claims:
-        matched = False
-        for fact in facts:
-            if (fact["method"] == claim["method"]
-                and fact["metric"] == claim["metric"]
-                and _numbers_match(claim["value"], fact["value"], rel_tol, abs_tol)):
-                matched = True
-                break
+        claim["scenario_explicit"] = claim["scenario"] is not None
+        if claim["scenario"] is None:
+            claim["scenario"] = case_scenario
+        matched = any(
+            fact["scenario"] == claim["scenario"]
+            and fact["method"].lower() == claim["method"].lower()
+            and fact["metric"] == claim["metric"]
+            and _numbers_match(claim["value"], fact["value"], rel_tol, abs_tol)
+            for fact in facts
+        )
         (valid if matched else invalid).append(claim)
 
     return {
@@ -987,15 +1068,132 @@ def verify_structured_claims(text: str, case_data: dict,
         "accuracy_rate_struct": (len(valid) / len(claims) * 100.0) if claims else 100.0,
     }
 
+
+def numeric_certification(verification: dict, structured: dict = None) -> dict:
+    """
+    Badge de l'audit numérique : la whitelist ET les quadruplets doivent être
+    conformes. Tout chiffre halluciné ou mal attribué bloque la certification.
+    """
+    structured = structured or {}
+    invalid = structured.get("invalid_claims", [])
+    if verification.get("has_hallucination") or invalid:
+        status = "NON_CERTIFIE"
+    elif not verification.get("all_numbers"):
+        status = "AVERTISSEMENT"
+    else:
+        status = "CERTIFIE"
+    return {
+        "status": status,
+        "certified": status == "CERTIFIE",
+        "invented_count": len(verification.get("invented_numbers", [])),
+        "checked_quadruplets": int(structured.get("total_claims", 0)),
+        "invalid_quadruplets": len(invalid),
+        "accuracy_rate": float(verification.get("accuracy_rate", 0.0)),
+    }
+
+
+# -----------------------------------------------------------------------------
+# C-ter. AUDIT SÉMANTIQUE (séparé de l'audit numérique)
+# -----------------------------------------------------------------------------
+SEMANTIC_AUDIT_VERSION = "SEM-1.0"
+
+_SECTION_LETTERS = ("A", "B", "C", "D", "E", "F")
+_NUMBERED_LIST = re.compile(r"(?m)^\s*\d+[.)]\s")
+_OVERCLAIM = re.compile(
+    r"optimum\s+global\s+(?:est\s+)?(?:garanti|certain)|fiable\s+[àa]\s+100"
+    r"|garanti[t]?\s+l['’]optim|parfaitement\s+optimal",
+    re.IGNORECASE)
+_CONFIDENCE_WORDS = ("un", "une", "deux", "trois", "quatre", "cinq")
+
+
+def _section_pattern(letter: str):
+    return re.compile(rf"(?m)^[\s#>*_-]*{letter}\)")
+
+
+def semantic_audit(text: str, case_data: dict) -> dict:
+    """
+    Audit sémantique déterministe : structure A) à F), style imposé, cohérence
+    avec le régime spectral et honnêteté des comparaisons (règle R5). Il
+    n'intervient jamais dans le badge numérique et ne remplace pas la grille
+    de notation manuelle de E10.
+    """
+    checks = []
+
+    def record(code, label, passed, detail=""):
+        checks.append({"code": code, "label": label,
+                       "passed": bool(passed), "detail": detail})
+
+    missing = [s for s in _SECTION_LETTERS if not _section_pattern(s).search(text)]
+    record("S1", "Rubriques A) à F) présentes", not missing, ", ".join(missing))
+    record("S2", "Aucune liste numérotée", _NUMBERED_LIST.search(text) is None)
+
+    if case_data.get("model_label", "CCI-only") == "CCI-only":
+        aci_values = re.findall(
+            r"C_\{?ACI\}?[^.\n]{0,30}?(?:=|vaut|est|atteint)\s*(\d+)", text)
+        nonzero = [v for v in aci_values if int(v) > 0]
+        record("S3", "Aucun conflit adjacent non nul en régime CCI-only",
+               not nonzero, ", ".join(nonzero))
+
+    metrics = case_data.get("metrics", {})
+    baselines = case_data.get("baselines", {})
+    bd_time = metrics.get("time_seconds")
+    faster = [n for n, b in baselines.items()
+              if bd_time is not None and b.get("time", np.inf) < bd_time]
+    if faster:
+        record("S4", "Baseline plus rapide reconnue (R5)",
+               any(n in text for n in faster), ", ".join(faster))
+
+    bd_cost = metrics.get("cost_final")
+    cheaper = [n for n, b in baselines.items()
+               if bd_cost is not None and b.get("cost", np.inf) < bd_cost]
+    if cheaper:
+        record("S5", "Baseline de coût inférieur reconnue (R5)",
+               all(n in text for n in cheaper), ", ".join(cheaper))
+        false_primacy = re.search(
+            r"BD-CeNN[^.\n]{0,80}(?:co[ûu]t|J\(x)[^.\n]{0,40}le\s+plus\s+(?:bas|faible)",
+            text, re.IGNORECASE)
+        record("S6", "Aucune primauté de coût revendiquée à tort",
+               false_primacy is None, ", ".join(cheaper))
+
+    record("S7", "Aucune sur-affirmation (optimum garanti, fiabilité totale)",
+           _OVERCLAIM.search(text) is None)
+
+    section_f = re.search(r"(?ms)^[\s#>*_-]*F\)(.*)", text)
+    note_in_letters = bool(section_f) and any(
+        re.search(rf"\b{w}\b", section_f.group(1), re.IGNORECASE)
+        for w in _CONFIDENCE_WORDS)
+    record("S8", "Note de confiance en toutes lettres (F)", note_in_letters)
+
+    passed = sum(c["passed"] for c in checks)
+    score = 100.0 * passed / len(checks) if checks else 0.0
+    if passed == len(checks):
+        status = "SEMANTIQUE_OK"
+    elif score >= 75.0:
+        status = "SEMANTIQUE_RESERVES"
+    else:
+        status = "SEMANTIQUE_ECHEC"
+    return {"status": status, "score": score, "checks": checks,
+            "version": SEMANTIC_AUDIT_VERSION}
+
 def regenerate_with_correction(case_data: dict, original_prompt: str,
-                                llm_response: str, verification: dict) -> str:
-    if not verification["has_hallucination"]:
+                                llm_response: str, verification: dict,
+                                structured_verification: dict = None) -> str:
+    invalid_claims = (structured_verification or {}).get("invalid_claims", [])
+    if not verification["has_hallucination"] and not invalid_claims:
         return llm_response
 
-    faulty_str = "\n".join(
+    faulty_lines = [
         f"  - valeur citee : {raw} (non presente dans les donnees)"
         for _, raw in verification["invented_numbers"]
-    )
+    ]
+    # Quadruplets mal attribués : valeur certifiée rattachée à la mauvaise méthode,
+    # métrique ou au mauvais scénario
+    faulty_lines += [
+        f"  - association invalide : \"{c['raw']}\" "
+        f"(scenario {c['scenario']}, methode {c['method']}, metrique {c['metric']})"
+        for c in invalid_claims
+    ]
+    faulty_str = "\n".join(faulty_lines)
 
     m = case_data.get("metrics", {})
     model_label = case_data.get("model_label", "CCI-only")
@@ -1005,7 +1203,7 @@ def regenerate_with_correction(case_data: dict, original_prompt: str,
         f"Cout initial = {_fmt(m.get('cost_initial'))} ; "
         f"Cout final = {_fmt(m.get('cost_final'))} ; "
         f"{_conflicts_summary_text(m, model_label)} ; "
-        f"Temps = {_fmt(m.get('time_seconds'), 6)} s ; "
+        f"Temps = {_fmt_us(m.get('time_seconds'))} ms ; "
         f"Balayages (sweeps) = {_fmt(m.get('sweeps'))} ; "
         f"Canaux utilises = {_fmt(m.get('used_channels'))}."
     )
@@ -1027,7 +1225,8 @@ Donnees physiques valides :
 
 Corrige ta reponse en veillant au strict respect de la nomenclature.
 """
-    return ask_llm(correction_prompt, inter_request_delay=INTER_REQUEST_DELAY)
+    return ask_llm(correction_prompt, inter_request_delay=INTER_REQUEST_DELAY,
+                   allow_fallback=not LLM_CAMPAIGN_FIXED_MODEL)
 
 
 # -----------------------------------------------------------------------------
@@ -1038,6 +1237,9 @@ def generate_pdf_report(
     case_data: dict, prompt: str, raw_response: str,
     verification_initial: dict, corrected_response: str,
     verification_final: dict, output_path: Path, model_name: str = None,
+    verification_struct_initial: dict = None,
+    verification_struct_final: dict = None,
+    semantic_final: dict = None,
 ) -> None:
     """
     [FIX-REPORT] Rapport PDF d'audit LLM enrichi :
@@ -1093,12 +1295,26 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 0.3*cm))
 
+    # Traçabilité complète du cas : graines, hyperparamètres, version et inférence
+    run_meta = case_data.get("run_metadata", {})
+    llm_params = get_llm_inference_params()
     header_data = [
         ["Cas", case_data.get("case_id", "-")],
         ["Scenario", case_data.get("scenario", "-")],
         ["Configuration", f"N={case_data.get('N')}, K={case_data.get('K')}, seed={case_data.get('seed')}"],
+        ["Graines", f"topology_seed = {case_data.get('seed')}, "
+                    f"algorithm_seed = {run_meta.get('algorithm_seed', '-')}"],
+        ["Solveur", f"num_restarts = {run_meta.get('num_restarts', '-')}, "
+                    f"patience_sweeps = {run_meta.get('patience_sweeps', '-')}, "
+                    f"max_sweeps = {run_meta.get('max_sweeps', '-')}"],
         ["Mode", model_label],
+        ["Version du code", run_meta.get("code_version", "-")],
         ["Modele", model_name or "Non specifie"],
+        ["Inference", f"temperature = {llm_params['temperature']}, top_p = {llm_params['top_p']}, "
+                      f"top_k = {llm_params['top_k']}, max_output_tokens = "
+                      f"{llm_params['max_output_tokens']}, seed = {llm_params['seed']}"],
+        ["Directive", f"Zero-Hallucination {llm_params['directive_version']}, "
+                      f"audit semantique {llm_params['semantic_audit_version']}"],
         ["Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ]
     header_table = Table(header_data, colWidths=[4*cm, 12*cm])
@@ -1111,11 +1327,25 @@ def generate_pdf_report(
     story.append(header_table)
     story.append(Spacer(1, 0.4*cm))
 
-    if verification_final["has_hallucination"]:
-        badge = f'<font color="#b30000"><b>NON CERTIFIE</b></font> - {len(verification_final["invented_numbers"])} valeur(s) suspecte(s).'
+    # Deux statuts distincts : audit numérique (bloquant) et audit sémantique
+    numeric = numeric_certification(verification_final, verification_struct_final)
+    if numeric["status"] == "NON_CERTIFIE":
+        badge = (f'<font color="#b30000"><b>AUDIT NUMERIQUE : NON CERTIFIE</b></font> - '
+                 f'{numeric["invented_count"]} valeur(s) hors whitelist, '
+                 f'{numeric["invalid_quadruplets"]} quadruplet(s) mal attribue(s).')
+    elif numeric["status"] == "AVERTISSEMENT":
+        badge = ('<font color="#b45309"><b>AUDIT NUMERIQUE : AVERTISSEMENT</b></font> - '
+                 'aucune valeur numerique a verifier.')
     else:
-        badge = f'<font color="#006600"><b>CERTIFIE</b></font> - exactitude : {verification_final["accuracy_rate"]:.1f}%.'
+        badge = (f'<font color="#006600"><b>AUDIT NUMERIQUE : CERTIFIE</b></font> - '
+                 f'exactitude : {numeric["accuracy_rate"]:.1f}%, '
+                 f'{numeric["checked_quadruplets"]} quadruplet(s) conforme(s).')
     story.append(Paragraph(badge, style_body))
+    if semantic_final:
+        story.append(Paragraph(
+            f'<b>AUDIT SEMANTIQUE : {semantic_final["status"]}</b> - score '
+            f'{semantic_final["score"]:.1f}% ({semantic_final["version"]}, non bloquant).',
+            style_body))
     story.append(Spacer(1, 0.4*cm))
 
     # =========================================================================
@@ -1131,10 +1361,10 @@ def generate_pdf_report(
             ["Metrique", "Valeur"],
             ["Cout initial", _fmt(m.get("cost_initial"))],
             ["Cout final", _fmt(m.get("cost_final"))],
-            ["Conflits C_CCI", _fmt(m.get("conflicts_cci"))],
-            ["Conflits C_ACI", _fmt(m.get("conflicts_aci"))],
-            ["Conflits C_tot", _fmt(m.get("conflicts"))],
-            ["Temps (s)", _fmt(m.get("time_seconds"), 6)],
+            ["C_CCI", _fmt(m.get("conflicts_cci"))],
+            ["C_ACI", _fmt(m.get("conflicts_aci"))],
+            ["C_tot", _fmt(m.get("conflicts"))],
+            ["Temps d'exécution (ms)", _fmt_us(m.get("time_seconds"))],
             ["Balayages (sweeps)", _fmt(m.get("sweeps"))],
             ["Canaux utilises", _fmt(m.get("used_channels"))],
             ["Restarts", _fmt(m.get("num_restarts"))],
@@ -1144,8 +1374,8 @@ def generate_pdf_report(
             ["Metrique", "Valeur"],
             ["Cout initial", _fmt(m.get("cost_initial"))],
             ["Cout final", _fmt(m.get("cost_final"))],
-            ["Conflits C_CCI", _fmt(m.get("conflicts_cci"))],
-            ["Temps (s)", _fmt(m.get("time_seconds"), 6)],
+            ["C_CCI", _fmt(m.get("conflicts_cci"))],
+            ["Temps d'exécution (ms)", _fmt_us(m.get("time_seconds"))],
             ["Balayages (sweeps)", _fmt(m.get("sweeps"))],
             ["Canaux utilises", _fmt(m.get("used_channels"))],
             ["Restarts", _fmt(m.get("num_restarts"))],
@@ -1158,6 +1388,11 @@ def generate_pdf_report(
         ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
     ]))
     story.append(sim_table)
+    story.append(Paragraph(
+        "<i>C_CCI : nombre entier de paires voisines partageant le même canal, "
+        "distinct du coût pondéré J(x). Temps en millisecondes (ms), quatre décimales.</i>",
+        style_body,
+    ))
     story.append(Spacer(1, 0.4*cm))
 
     # =========================================================================
@@ -1227,9 +1462,19 @@ def generate_pdf_report(
             f"{verification_final['accuracy_rate']:.1f}%",
         ],
         [
-            "Statut",
-            "NON CERTIFIE" if verification_initial["has_hallucination"] else "CERTIFIE",
-            "NON CERTIFIE" if verification_final["has_hallucination"] else "CERTIFIE",
+            "Quadruplets (scenario, methode, metrique, valeur) verifies",
+            str((verification_struct_initial or {}).get("total_claims", "-")),
+            str((verification_struct_final or {}).get("total_claims", "-")),
+        ],
+        [
+            "Quadruplets mal attribues",
+            str(len((verification_struct_initial or {}).get("invalid_claims", []))),
+            str(len((verification_struct_final or {}).get("invalid_claims", []))),
+        ],
+        [
+            "Statut numerique",
+            numeric_certification(verification_initial, verification_struct_initial)["status"],
+            numeric_certification(verification_final, verification_struct_final)["status"],
         ],
     ]
     audit_table = Table(audit_data, colWidths=[7*cm, 4.5*cm, 4.5*cm])
@@ -1261,6 +1506,26 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 0.4*cm))
 
+    # Audit sémantique : qualité rédactionnelle, cohérence logique et style,
+    # restitué séparément et sans effet sur la certification numérique
+    if semantic_final:
+        story.append(Paragraph("4 bis. Audit semantique (non bloquant)", style_h1))
+        sem_rows = [["Code", "Controle", "Resultat"]]
+        for check in semantic_final["checks"]:
+            sem_rows.append([check["code"], Paragraph(check["label"], style_body),
+                             "OK" if check["passed"] else f"ECHEC {check['detail']}".strip()])
+        sem_table = Table(sem_rows, colWidths=[1.5*cm, 10*cm, 4.5*cm])
+        sem_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d6d")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(sem_table)
+        story.append(Spacer(1, 0.4*cm))
+
     # =========================================================================
     # SECTION 5 : Rapport Assistant LLM corrige (si applicable)
     # =========================================================================
@@ -1282,6 +1547,8 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
                model_folder: str = "cochannel") -> dict:
     case_id = case_data.get("case_id", "unknown")
     model_label = case_data.get("model_label", "CCI-only")
+    # Modèle unique pour la campagne scientifique : aucun basculement silencieux
+    allow_fallback = not LLM_CAMPAIGN_FIXED_MODEL
 
     raw_dir, reports_dir = _get_mode_folders(model_label)
     prompt = build_prompt(case_data)
@@ -1289,7 +1556,7 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
     with open(raw_dir / f"{case_id}_prompt.txt", "w", encoding="utf-8") as f:
         f.write(prompt)
 
-    raw_response = ask_llm(prompt)
+    raw_response = ask_llm(prompt, allow_fallback=allow_fallback)
 
     if raw_response.startswith("[ERREUR LLM]"):
         with open(raw_dir / f"{case_id}_error.txt", "w", encoding="utf-8") as f:
@@ -1307,32 +1574,41 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
             "raw_response": raw_response, "corrected_response": raw_response,
             "verification_initial": empty_verif, "verification_final": empty_verif,
             "correction_attempts": 0, "pdf_path": None, "status": "LLM_FAILED",
+            "llm_params": get_llm_inference_params(),
         }
 
     with open(raw_dir / f"{case_id}_raw_response.txt", "w", encoding="utf-8") as f:
         f.write(raw_response)
     verification_initial = verify_numbers(raw_response, case_data)
-
-    # [FIX-LLM-STRUCT] Verification structuree en complement
     verification_struct_initial = verify_structured_claims(raw_response, case_data)
+    numeric_initial = numeric_certification(verification_initial, verification_struct_initial)
 
     corrected_response = raw_response
     verification_final = verification_initial
     verification_struct_final = verification_struct_initial
+    numeric_final = numeric_initial
     correction_attempts = 0
 
-    while verification_final["has_hallucination"] and correction_attempts < max_correction_attempts:
+    # La boucle porte sur la certification numérique combinée : un chiffre
+    # inventé OU un quadruplet mal attribué déclenche la régénération.
+    while (numeric_final["status"] == "NON_CERTIFIE"
+           and correction_attempts < max_correction_attempts):
         correction_attempts += 1
-        corrected_response = regenerate_with_correction(
-            case_data, prompt, corrected_response, verification_final
+        candidate = regenerate_with_correction(
+            case_data, prompt, corrected_response, verification_final,
+            structured_verification=verification_struct_final,
         )
-        if corrected_response.startswith("[ERREUR LLM]"):
-            corrected_response = raw_response
+        if candidate.startswith("[ERREUR LLM]"):
             break
+        corrected_response = candidate
         verification_final = verify_numbers(corrected_response, case_data)
         verification_struct_final = verify_structured_claims(corrected_response, case_data)
+        numeric_final = numeric_certification(verification_final, verification_struct_final)
         with open(raw_dir / f"{case_id}_corrected_v{correction_attempts}.txt", "w", encoding="utf-8") as f:
             f.write(corrected_response)
+
+    semantic_final = semantic_audit(corrected_response, case_data)
+    llm_params = get_llm_inference_params()
 
     pdf_path = reports_dir / f"rapport_{case_id}_{case_data.get('scenario')}.pdf"
 
@@ -1345,7 +1621,10 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
         case_data=case_data_with_attempts, prompt=prompt,
         raw_response=raw_response, verification_initial=verification_initial,
         corrected_response=corrected_response, verification_final=verification_final,
-        output_path=pdf_path, model_name=get_active_model(),
+        output_path=pdf_path, model_name=llm_params["model"],
+        verification_struct_initial=verification_struct_initial,
+        verification_struct_final=verification_struct_final,
+        semantic_final=semantic_final,
     )
 
     return {
@@ -1358,6 +1637,10 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
         "verification_final": verification_final,
         "verification_struct_initial": verification_struct_initial,
         "verification_struct_final": verification_struct_final,
+        "numeric_initial": numeric_initial,
+        "numeric_final": numeric_final,
+        "semantic_final": semantic_final,
+        "llm_params": llm_params,
         "correction_attempts": correction_attempts,
         "pdf_path": str(pdf_path), "status": "OK",
     }

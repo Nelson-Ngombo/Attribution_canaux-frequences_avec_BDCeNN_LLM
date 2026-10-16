@@ -44,8 +44,11 @@ st.set_page_config(
 # Global error boundary
 # ---------------------------------------------------------------------------
 def _run_dashboard():
-    from dashboard.theme import apply_theme, render_app_header, render_sidebar_status_card
+    from dashboard.theme import (apply_theme, render_app_header, render_sidebar_status_card,
+                                 render_sidebar_llm_params, render_sidebar_footer,
+                                 install_plotly_resize_fix)
     apply_theme()
+    install_plotly_resize_fix()
 
     from dashboard import session_manager as sm
     sm.initialize_state()
@@ -111,6 +114,15 @@ def _run_dashboard():
         except Exception as e:
             render_sidebar_status_card("Assistant LLM", f"Erreur ({type(e).__name__})", kind="err")
 
+        # Modèle exact et paramètres d'inférence (recommandation C)
+        try:
+            from llm_assistant import get_llm_inference_params
+
+            st.markdown("### Parametres LLM")
+            render_sidebar_llm_params(get_llm_inference_params())
+        except Exception as e:
+            st.caption(f"Parametres LLM indisponibles ({type(e).__name__})")
+
         st.markdown("### Modeles d'interference")
         st.caption(
             "**CCI-only** : conflit si x_i = x_j.\n\n"
@@ -119,7 +131,8 @@ def _run_dashboard():
         )
 
         st.markdown("### Auteur")
-        st.caption("Nelson Ngombo")
+        import config
+        render_sidebar_footer(author="Nelson Ngombo", code_version=config.CODE_VERSION)
 
     # ---------- Header ----------
     render_app_header(

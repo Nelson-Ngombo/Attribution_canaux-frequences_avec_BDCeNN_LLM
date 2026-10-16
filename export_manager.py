@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, List
 import io
 import zipfile
+import numpy as np
 import pandas as pd
 
 import config
@@ -43,6 +44,58 @@ def get_output_dirs(interference_mode: str) -> dict:
     return dirs
 
 
+_TRACE_COLUMNS = ("scenario", "topology_seed", "algorithm_seed", "num_restarts",
+                  "patience_sweeps", "max_sweeps", "code_version", "llm_model")
+
+
+def build_record_metadata(record: ExperimentRecord) -> dict:
+    """Métadonnées de reproductibilité d'un run interactif (recommandation C)."""
+    topology = record.topology
+    bd_modes = record.solver_results.get("BD-CeNN", {})
+    bd_meta = (next(iter(bd_modes.values())).metadata if bd_modes else None) or {}
+    try:
+        from llm_assistant import get_llm_inference_params
+        llm_params = get_llm_inference_params()
+    except Exception:
+        llm_params = {}
+    modes = " + ".join(config.INTERFERENCE_MODE_LABELS.get(m, m) for m in bd_modes)
+    return config.build_run_metadata(
+        scenario=topology.scenario_name or "CUSTOM",
+        topology_seed=topology.seed,
+        interference_mode=modes or None,
+        num_restarts=bd_meta.get("num_restarts", config.NUM_RESTARTS),
+        llm_model=llm_params.get("model"),
+        # Valeurs réellement utilisées : le dashboard permet de modifier R et max_sweeps
+        max_sweeps=bd_meta.get("max_sweeps", config.MAX_SWEEPS_BD),
+        experiment_id=record.experiment_id,
+        N=int(topology.N),
+        K=int(topology.K),
+        threshold=float(topology.threshold),
+        area=getattr(topology, "area", None),
+        llm_inference=llm_params,
+    )
+
+
+def annotate_with_metadata(df: pd.DataFrame, record: ExperimentRecord) -> pd.DataFrame:
+    """Ajoute à chaque ligne exportée les colonnes de traçabilité du run."""
+    metadata = build_record_metadata(record)
+    df = df.copy()
+    for key in _TRACE_COLUMNS:
+        df[key] = metadata.get(key)
+    solver_col = next((c for c in ("solver", "Solveur") if c in df.columns), None)
+    if solver_col is not None and not df.empty:
+        # Les baselines n'ont pas de restart : valeur explicitement absente
+        df.loc[df[solver_col] != "BD-CeNN", "num_restarts"] = np.nan
+    return df
+
+
+def record_to_traceable_dict(record: ExperimentRecord) -> dict:
+    """Enregistrement complet sérialisable, accompagné de ses métadonnées."""
+    payload = record.to_dict()
+    payload["run_metadata"] = build_record_metadata(record)
+    return payload
+
+
 def _build_metrics_dataframe(record: ExperimentRecord) -> pd.DataFrame:
     """
     Convertit l'historique d'exécution d'un record en DataFrame Pandas plat.
@@ -64,7 +117,7 @@ def _build_metrics_dataframe(record: ExperimentRecord) -> pd.DataFrame:
                 "wall_time_seconds": mr.wall_time_seconds,
                 "n_sweeps": mr.n_sweeps,
             })
-    return pd.DataFrame(rows)
+    return annotate_with_metadata(pd.DataFrame(rows), record)
 
 
 def export_record_json(record: ExperimentRecord,
@@ -93,7 +146,7 @@ def export_record_json(record: ExperimentRecord,
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(record.to_dict(), f, indent=2, ensure_ascii=False)
+        json.dump(record_to_traceable_dict(record), f, indent=2, ensure_ascii=False)
 
     return output_path
 
@@ -112,7 +165,7 @@ def export_metrics_csv(record: ExperimentRecord,
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_path, index=False, float_format="%.6f")
+    df.to_csv(output_path, index=False, float_format="%.9f")
     return output_path
 
 
@@ -129,7 +182,7 @@ def export_metrics_split_csv(record: ExperimentRecord) -> dict:
             continue
         dirs = get_output_dirs(mode_key)
         path = dirs["csv"] / f"metrics_{record.experiment_id}_{mode_key}.csv"
-        sub_df.to_csv(path, index=False, float_format="%.6f")
+        sub_df.to_csv(path, index=False, float_format="%.9f")
         paths[mode_key] = path
 
     return paths
@@ -162,7 +215,7 @@ def export_convergence_csv(record: ExperimentRecord,
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_path, index=False, float_format="%.6f")
+    df.to_csv(output_path, index=False, float_format="%.9f")
     return output_path
 
 
@@ -185,8 +238,10 @@ def build_zip_bundle(record: ExperimentRecord,
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. JSON brut
-        record_json = json.dumps(record.to_dict(), indent=2, ensure_ascii=False)
+        record_json = json.dumps(record_to_traceable_dict(record), indent=2, ensure_ascii=False)
         zf.writestr(f"experiment_{record.experiment_id}.json", record_json)
+        zf.writestr("run_metadata.json",
+                    json.dumps(build_record_metadata(record), indent=2, ensure_ascii=False))
 
         # 2. Métriques globales
         df = _build_metrics_dataframe(record)

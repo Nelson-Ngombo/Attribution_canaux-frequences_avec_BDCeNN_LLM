@@ -244,3 +244,9 @@ def render_scenario_summary(topology, show_expand: bool = True):
                      unsafe_allow_html=True)
     cols[4].markdown(stat_pill("Aretes", str(topology.n_edges), COLORS["accent"]),
                      unsafe_allow_html=True)
+
+
+def topology_fingerprint(topology) -> str:
+    """Empreinte complète d'une topologie, utilisée dans les clés des graphiques."""
+    return (f"{topology.scenario_name or 'CUSTOM'}_N{topology.N}_K{topology.K}"
+            f"_A{int(topology.area)}_T{int(topology.threshold)}_s{topology.seed}")

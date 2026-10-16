@@ -11,6 +11,7 @@ It centralizes graph-related operations for the dashboard and solvers.
 from typing import List, Tuple, Optional
 import numpy as np
 
+import config
 from data_structures.topology import NetworkTopology
 from metrics import (
     compute_cost_cci,
@@ -25,7 +26,7 @@ from metrics import (
 class InterferenceGraph:
    
     def __init__(self, topology: NetworkTopology,
-                 aci_decay: float = 0.5, aci_cutoff: int = 2):
+                 aci_decay: float = config.ALPHA, aci_cutoff: int = config.CUTOFF):
         self.topology = topology
         self.N = topology.n_cells
         self.K = topology.n_channels

@@ -5,7 +5,10 @@ Provides CSS injection, color palette, and layout constants.
 Font sizes increased globally for better readability.
 """
 
+from datetime import datetime
+
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # ============================================================================
@@ -404,6 +407,164 @@ label {
     white-space: pre-wrap;
     line-height: 1.5;
 }
+
+/* ============ Sidebar LLM parameters card ============ */
+section[data-testid="stSidebar"] .llm-card {
+    background: linear-gradient(160deg, #24324a 0%, #1b2638 100%);
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 0.85rem;
+    margin-bottom: 0.6rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+section[data-testid="stSidebar"] .llm-card-model {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    padding-bottom: 0.7rem;
+    margin-bottom: 0.7rem;
+    border-bottom: 1px solid #334155;
+}
+section[data-testid="stSidebar"] .llm-icon-box {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    background: rgba(74, 158, 255, 0.12);
+    border: 1px solid rgba(74, 158, 255, 0.35);
+}
+section[data-testid="stSidebar"] .llm-icon {
+    display: inline-flex;
+    color: #4a9eff !important;
+}
+/* La règle globale de la barre latérale colore aussi les SVG : on rétablit l'héritage */
+section[data-testid="stSidebar"] .llm-icon svg,
+section[data-testid="stSidebar"] .llm-icon svg * {
+    color: inherit !important;
+}
+section[data-testid="stSidebar"] .llm-card-label {
+    font-size: 0.66rem !important;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #94a3b8 !important;
+}
+section[data-testid="stSidebar"] .llm-card-model-name {
+    font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+    font-size: 0.92rem !important;
+    font-weight: 600;
+    color: #f8fafc !important;
+    word-break: break-all;
+}
+section[data-testid="stSidebar"] .llm-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.45rem;
+}
+section[data-testid="stSidebar"] .llm-tile {
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid #2c3a52;
+    border-radius: 8px;
+    padding: 0.45rem 0.55rem;
+}
+section[data-testid="stSidebar"] .llm-tile-head {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.64rem !important;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: #94a3b8 !important;
+}
+section[data-testid="stSidebar"] .llm-tile-value {
+    margin-top: 0.15rem;
+    font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+    font-size: 0.95rem !important;
+    font-weight: 600;
+    color: #f1f5f9 !important;
+}
+section[data-testid="stSidebar"] .llm-directive {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.7rem;
+    font-size: 0.78rem !important;
+    color: #cbd5e1 !important;
+}
+section[data-testid="stSidebar"] .llm-directive .llm-icon {
+    color: #22c55e !important;
+}
+section[data-testid="stSidebar"] .llm-badge {
+    margin-left: auto;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    background: rgba(34, 197, 94, 0.15);
+    border: 1px solid rgba(34, 197, 94, 0.4);
+    font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+    font-size: 0.72rem !important;
+    font-weight: 600;
+    white-space: nowrap;
+    color: #86efac !important;
+}
+section[data-testid="stSidebar"] .llm-note {
+    margin-top: 0.55rem;
+    font-size: 0.72rem !important;
+    color: #94a3b8 !important;
+}
+
+/* ============ Sidebar footer (author, copyright, version) ============ */
+section[data-testid="stSidebar"] .sidebar-footer {
+    margin-top: 0.4rem;
+    padding: 0.8rem 0.9rem;
+    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid #334155;
+}
+section[data-testid="stSidebar"] .sidebar-footer-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+section[data-testid="stSidebar"] .sidebar-footer-author {
+    font-size: 0.92rem !important;
+    font-weight: 600;
+    color: #f1f5f9 !important;
+}
+section[data-testid="stSidebar"] .sidebar-footer-affiliation {
+    font-size: 0.72rem !important;
+    color: #94a3b8 !important;
+}
+section[data-testid="stSidebar"] .sidebar-footer-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 0.65rem;
+    padding-top: 0.55rem;
+    border-top: 1px solid #334155;
+    font-size: 0.72rem !important;
+    color: #94a3b8 !important;
+}
+section[data-testid="stSidebar"] .sidebar-footer-meta span {
+    font-size: 0.72rem !important;
+}
+section[data-testid="stSidebar"] .sidebar-footer-version {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    background: rgba(74, 158, 255, 0.12);
+    border: 1px solid rgba(74, 158, 255, 0.35);
+    font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+    font-size: 0.72rem !important;
+    color: #93c5fd !important;
+}
+section[data-testid="stSidebar"] .sidebar-footer-version .llm-icon {
+    color: #93c5fd !important;
+}
 </style>
 """
 
@@ -411,6 +572,117 @@ label {
 def apply_theme():
     """Injects the custom CSS. Must be called once after set_page_config."""
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+def install_plotly_resize_fix():
+    """
+    Une figure Plotly tracée dans un onglet masqué prend la largeur par défaut
+    (700 px). Un événement resize émis à chaque changement d'onglet force Plotly
+    (config responsive) à se recaler sur la largeur réelle du conteneur.
+    """
+    components.html(
+        """
+        <script>
+        const parentDoc = window.parent.document;
+        if (!parentDoc.__bdcennTabResize) {
+            parentDoc.__bdcennTabResize = true;
+            parentDoc.addEventListener("click", (event) => {
+                if (event.target.closest('button[role="tab"]')) {
+                    [50, 250, 600].forEach((delay) => setTimeout(
+                        () => window.parent.dispatchEvent(new Event("resize")), delay));
+                }
+            }, true);
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+# Tracés vectoriels au trait (grille 24 x 24), coloriés par currentColor
+_ICON_PATHS = {
+    "cpu": '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/>'
+           '<path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
+    "thermometer": '<path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/>',
+    "sliders": '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+    "layers": '<path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
+    "file": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>'
+            '<path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/>',
+    "hash": '<path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/>',
+    "check-circle": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m22 4-10 10.01-3-3"/>',
+    "shield": '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
+    "user": '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    "tag": '<path d="M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>'
+           '<circle cx="7" cy="7" r="1.5"/>',
+}
+
+
+def svg_icon(name: str, size: int = 14) -> str:
+    """Icône vectorielle au trait, héritant de la couleur du texte parent."""
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
+        f'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round">{_ICON_PATHS[name]}</svg>'
+    )
+
+
+def render_sidebar_llm_params(params: dict):
+    """Carte des paramètres d'inférence du LLM (modèle exact et réglages gelés)."""
+    tiles = [
+        ("thermometer", "Temperature", params["temperature"]),
+        ("sliders", "Top-p", params["top_p"]),
+        ("layers", "Top-k", params["top_k"]),
+        ("file", "Max tokens", params["max_output_tokens"]),
+        ("hash", "Seed", params["seed"]),
+        ("check-circle", "Audit sem.", params.get("semantic_audit_version", "-")),
+    ]
+    tiles_html = "".join(
+        f'<div class="llm-tile"><div class="llm-tile-head">'
+        f'<span class="llm-icon">{svg_icon(icon, 12)}</span>{label}</div>'
+        f'<div class="llm-tile-value">{value}</div></div>'
+        for icon, label, value in tiles
+    )
+    campaign_note = (
+        f'<div class="llm-note">Campagne E10 : modèle fixe '
+        f'{params.get("campaign_model", params["model"])}</div>'
+        if params.get("fixed_model_for_campaign") else ""
+    )
+    # HTML sans indentation : quatre espaces en tête de ligne produisent un bloc de code Markdown
+    html = (
+        '<div class="llm-card">'
+        '<div class="llm-card-model">'
+        f'<div class="llm-icon-box"><span class="llm-icon">{svg_icon("cpu", 18)}</span></div>'
+        '<div><div class="llm-card-label">Modèle actif</div>'
+        f'<div class="llm-card-model-name">{params["model"]}</div></div>'
+        '</div>'
+        f'<div class="llm-grid">{tiles_html}</div>'
+        f'<div class="llm-directive"><span class="llm-icon">{svg_icon("shield", 14)}</span>'
+        'Directive Zero-Hallucination'
+        f'<span class="llm-badge">{params["directive_version"]}</span></div>'
+        f'{campaign_note}'
+        '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_sidebar_footer(author: str, code_version: str,
+                          affiliation: str = "Faculté Polytechnique, Université de Kinshasa"):
+    """Pied de barre latérale : auteur, mention de copyright et version du code."""
+    html = (
+        '<div class="sidebar-footer">'
+        '<div class="sidebar-footer-row">'
+        f'<div class="llm-icon-box"><span class="llm-icon">{svg_icon("user", 16)}</span></div>'
+        f'<div><div class="sidebar-footer-author">{author}</div>'
+        f'<div class="sidebar-footer-affiliation">{affiliation}</div></div>'
+        '</div>'
+        '<div class="sidebar-footer-meta">'
+        f'<span>&copy; {datetime.now().year} BD-CeNN + LLM</span>'
+        f'<span class="sidebar-footer-version"><span class="llm-icon">{svg_icon("tag", 11)}</span>'
+        f'v{code_version}</span>'
+        '</div>'
+        '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def render_app_header(title: str = "BD-CeNN + LLM",

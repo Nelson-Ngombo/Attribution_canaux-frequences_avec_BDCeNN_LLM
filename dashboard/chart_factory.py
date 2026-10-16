@@ -167,7 +167,7 @@ def create_comparison_bar_chart(
         "conflicts_aci": "Conflits adjacents C_ACI",
         "conflicts_total": "Conflits totaux C_total",
         "used_channels": "Canaux utilises",
-        "wall_time_seconds": "Temps de calcul t_exec (s)",
+        "wall_time_seconds": "Temps de calcul t_exec (ms)",
         "n_sweeps": "Nombre de balayages (sweeps)",
     }
     ylabel = metric_labels.get(metric, metric)
@@ -192,6 +192,9 @@ def create_comparison_bar_chart(
                     val = getattr(mr, "n_conflicts_total", 0)
                 elif metric == "n_sweeps":
                     val = getattr(mr, "n_sweeps", 0)
+                elif metric == "wall_time_seconds":
+                    # Durée stockée en secondes, tracée en ms
+                    val = mr.wall_time_seconds * 1e3
                 else:
                     val = getattr(mr, metric, 0)
                 values.append(val if val is not None else 0)
@@ -204,8 +207,11 @@ def create_comparison_bar_chart(
         if not mode_present:
             continue
 
+        # Temps en ms à quatre décimales, coût à deux décimales
+        value_format = {"cost": "{:.2f}", "wall_time_seconds": "{:.4f}"}.get(metric)
         text_labels = [
-            f"{v:.2f}" if isinstance(v, float) and metric in ["cost", "wall_time_seconds"] else str(int(v)) if isinstance(v, (int, float)) else str(v)
+            value_format.format(v) if value_format and isinstance(v, float)
+            else str(int(v)) if isinstance(v, (int, float)) else str(v)
             for v in values
         ]
 
@@ -257,19 +263,20 @@ def create_delta_aci_chart(record: ExperimentRecord) -> Optional[go.Figure]:
     solvers = ["Random", "Greedy", "DSATUR", "BD-CeNN"]
     deltas = []
     valid_solvers = []
+    undefined_solvers = []
     for solver in solvers:
         modes = record.metrics.get(solver, {})
         if "cci" in modes and "cci_aci" in modes:
             cci = modes["cci"].cost
             aci = modes["cci_aci"].cost
-            if cci > 0:
-                delta = ((aci - cci) / cci) * 100.0
-            else:
-                delta = 0.0
-            deltas.append(delta)
+            # J_CCI = 0 : Delta_ACI non défini, jamais remplacé par zéro
+            if cci <= 0:
+                undefined_solvers.append(solver)
+                continue
+            deltas.append(((aci - cci) / cci) * 100.0)
             valid_solvers.append(solver)
 
-    if not valid_solvers:
+    if not valid_solvers and not undefined_solvers:
         return None
 
     colors = [SOLVER_COLORS.get(s, "#7f7f7f") for s in valid_solvers]
@@ -279,7 +286,7 @@ def create_delta_aci_chart(record: ExperimentRecord) -> Optional[go.Figure]:
             x=valid_solvers,
             y=deltas,
             marker_color=colors,
-            text=[f"+{d:.1f}%" for d in deltas],
+            text=[f"{d:+.1f} %" for d in deltas],
             textposition="outside",
             hovertemplate="%{x}<br>Delta_ACI: %{y:.2f}%<extra></extra>",
         )
@@ -299,6 +306,13 @@ def create_delta_aci_chart(record: ExperimentRecord) -> Optional[go.Figure]:
         yaxis=dict(showgrid=True, gridcolor="#eeeeee"),
         transition_duration=500,
     )
+    if undefined_solvers:
+        fig.add_annotation(
+            text=f"Non défini (J_CCI = 0) : {', '.join(undefined_solvers)}",
+            x=0.99, y=0.98, xref="paper", yref="paper", xanchor="right", yanchor="top",
+            showarrow=False, bgcolor="rgba(255,255,255,0.9)",
+            font=dict(size=11, color="#b45309"),
+        )
     return fig
 
 
@@ -474,13 +488,13 @@ def build_metrics_dataframe(record: ExperimentRecord):
                 "Conflits ACI (C_ACI)": int(mr.n_conflicts_aci),
                 "Conflits Totaux (C_total)": int(mr.n_conflicts_total),
                 "Canaux utilises": int(mr.used_channels),
-                "Temps t_exec (s)": round(mr.wall_time_seconds, 4),
+                "Temps t_exec (ms)": round(mr.wall_time_seconds * 1e3, 4),
                 "Sweeps de convergence": int(mr.n_sweeps) if mr.n_sweeps > 0 else "N/A",
             })
     if not rows:
         return pd.DataFrame(columns=[
             "Solveur", "Mode", "Cout J(x)", "Conflits CCI (C_CCI)",
             "Conflits ACI (C_ACI)", "Conflits Totaux (C_total)",
-            "Canaux utilises", "Temps t_exec (s)", "Sweeps de convergence"
+            "Canaux utilises", "Temps t_exec (ms)", "Sweeps de convergence"
         ])
     return pd.DataFrame(rows)

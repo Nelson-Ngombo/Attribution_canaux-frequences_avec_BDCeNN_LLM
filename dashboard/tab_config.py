@@ -28,6 +28,7 @@ from dashboard.components import (
     render_scenario_summary,
     divider_with_label,
     empty_state,
+    topology_fingerprint,
 )
 
 
@@ -137,6 +138,43 @@ def _heuristic_extraction(description: str, result: dict):
 # UI panels
 # ---------------------------------------------------------------------------
 
+def _init_widget_state(key: str, value):
+    """
+    Initialise la valeur d'un widget une seule fois. Le widget est ensuite créé
+    sans argument value, ce qui évite l'avertissement Streamlit émis lorsqu'une
+    valeur par défaut coexiste avec une écriture via st.session_state.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _clear_nl_callback():
+    """Vide la zone de saisie et la traduction avant la réexécution du script."""
+    st.session_state["nl_text_area"] = ""
+    sm.set_value("nl_input_text", "")
+    sm.set_value("nl_translated_params", None)
+
+
+def _render_seed_input():
+    """Graine de topologie, commune aux scénarios prédéfinis et personnalisés."""
+    _init_widget_state("input_seed", sm.get("custom_seed", 1))
+    seed = st.number_input(
+        "Graine de topologie (seed)", min_value=1, max_value=10000, step=1, key="input_seed",
+        help="Les seeds 1 à 30 reproduisent les topologies officielles des campagnes E1 à E10.",
+    )
+    sm.set_value("custom_seed", int(seed))
+
+
+def _requested_topology_params() -> tuple:
+    """Paramètres (scénario, N, K, area, threshold, seed) actuellement saisis."""
+    if sm.get("use_custom_params"):
+        return ("CUSTOM", sm.get("custom_N"), sm.get("custom_K"), sm.get("custom_area"),
+                sm.get("custom_threshold"), sm.get("custom_seed"))
+    params = get_scenario(sm.get("selected_scenario"))
+    return (sm.get("selected_scenario"), params["N"], params["K"], params["area"],
+            params["threshold"], sm.get("custom_seed"))
+
+
 def _render_scenario_selector():
     """Preset scenario dropdown with description panel."""
     st.markdown("#### Choisir un scenario predefini (S1 a S7)")
@@ -167,25 +205,23 @@ def _render_custom_params():
     """Sliders for manual parameter definition."""
     st.markdown("#### Parametres personnalises")
 
+    _init_widget_state("slider_N", sm.get("custom_N", 30))
+    _init_widget_state("slider_K", sm.get("custom_K", 4))
+    _init_widget_state("slider_area", sm.get("custom_area", 150))
+    _init_widget_state("slider_thr", sm.get("custom_threshold", 35))
+
     col1, col2 = st.columns(2)
     with col1:
-        n = st.slider("Nombre de cellules N", 5, 200,
-                      sm.get("custom_N", 30), step=5, key="slider_N")
-        k = st.slider("Nombre de canaux K", 2, 20,
-                      sm.get("custom_K", 4), key="slider_K")
-        area = st.slider("Taille de la zone (area)", 50, 500,
-                         sm.get("custom_area", 150), step=10, key="slider_area")
+        n = st.slider("Nombre de cellules N", 5, 200, step=5, key="slider_N")
+        k = st.slider("Nombre de canaux K", 2, 20, key="slider_K")
     with col2:
-        threshold = st.slider("Seuil d'interference (threshold)", 10, 150,
-                              sm.get("custom_threshold", 35), key="slider_thr")
-        seed = st.number_input("Seed", 1, 10000,
-                               sm.get("custom_seed", 1), key="input_seed")
+        area = st.slider("Taille de la zone (area)", 50, 500, step=10, key="slider_area")
+        threshold = st.slider("Seuil d'interference (threshold)", 10, 150, key="slider_thr")
 
     sm.set_value("custom_N", n)
     sm.set_value("custom_K", k)
     sm.set_value("custom_area", area)
     sm.set_value("custom_threshold", threshold)
-    sm.set_value("custom_seed", int(seed))
 
 def _apply_nl_to_custom_callback(translated: dict):
     """
@@ -233,9 +269,9 @@ def _render_nl_translation():
         "d'interference de 45 metres."
     )
 
+    _init_widget_state("nl_text_area", sm.get("nl_input_text", ""))
     nl_text = st.text_area(
         "Description",
-        value=sm.get("nl_input_text", ""),
         placeholder=example_placeholder,
         height=120,
         key="nl_text_area",
@@ -253,15 +289,12 @@ def _render_nl_translation():
             disabled=(not nl_text.strip()),
         )
     with col2:
-        clear_clicked = st.button(
+        st.button(
             "Effacer",
             use_container_width=True,
             key="btn_clear_nl",
+            on_click=_clear_nl_callback,
         )
-        if clear_clicked:
-            sm.set_value("nl_input_text", "")
-            sm.set_value("nl_translated_params", None)
-            st.rerun()
 
     if translate_clicked and nl_text.strip():
         with st.spinner("Interrogation du LLM en cours..."):
@@ -322,7 +355,7 @@ def _render_bdcenn_hyperparams():
         )
     with col2:
         mi = st.slider(
-            "Iterations max par redemarrage",
+            "Sweeps max par restart (max_sweeps)",
             10, 200,
             sm.get("max_iter", 50),
             step=10,
@@ -358,6 +391,9 @@ def _render_mode_toggles():
 
     sm.set_value("run_mode_cci", run_cci)
     sm.set_value("run_mode_cci_aci", run_aci)
+    if not (run_cci or run_aci):
+        info_banner("Aucun régime sélectionné. Cochez au moins un mode avant de lancer les solveurs.",
+                    kind="warning")
 
 
 def _generate_topology_action():
@@ -405,9 +441,9 @@ def render():
     )
 
     # Toggle: preset vs custom
+    _init_widget_state("toggle_custom", sm.get("use_custom_params", False))
     use_custom = st.toggle(
         "Utiliser des parametres personnalises",
-        value=sm.get("use_custom_params", False),
         key="toggle_custom",
     )
     sm.set_value("use_custom_params", use_custom)
@@ -424,6 +460,7 @@ def render():
             _render_custom_params()
         else:
             _render_scenario_selector()
+        _render_seed_input()
 
         divider_with_label("Assistance LLM")
         _render_nl_translation()
@@ -469,6 +506,18 @@ def render():
         else:
             render_scenario_summary(topology)
 
+            # Paramètres modifiés mais pas encore appliqués
+            requested = _requested_topology_params()
+            active = (topology.scenario_name or "CUSTOM", topology.N, topology.K,
+                      topology.area, topology.threshold, topology.seed)
+            if requested[0] != active[0] or any(
+                    float(a) != float(b) for a, b in zip(requested[1:], active[1:])):
+                info_banner(
+                    "Les paramètres saisis diffèrent de la topologie affichée. Cliquez sur "
+                    "'Generer la topologie' pour mettre à jour le graphe et les matrices W et M.",
+                    kind="warning",
+                )
+
             st.markdown("---")
 
             with st.expander("Matrice d'interference W", expanded=False):
@@ -477,18 +526,20 @@ def render():
                 st.plotly_chart(
                     fig,
                     use_container_width=True,
-                    key=f"heatmap_{topology.scenario_name}_{topology.seed}",
+                    key=f"heatmap_W_{topology_fingerprint(topology)}",
                 )
 
             with st.expander("Matrice d'interference inter-canaux M", expanded=False):
                 from metrics import create_channel_interference_matrix
 
-                M = create_channel_interference_matrix(topology.K, decay=0.5, cutoff=2)
+                M = create_channel_interference_matrix(
+                    topology.K, decay=config.ALPHA, cutoff=config.CUTOFF
+                )
                 fig_M = create_channel_matrix_heatmap(M)
                 st.plotly_chart(
                     fig_M,
                     use_container_width=True,
-                    key=f"heatmap_M_{topology.scenario_name}_{topology.seed}_{topology.K}",
+                    key=f"heatmap_M_{topology_fingerprint(topology)}",
                 )
                 st.caption(
                     f"Cette matrice est construite pour K = {topology.K} canaux. "

@@ -25,6 +25,8 @@ def generate_llm_pdf(
     verification_final: dict,
     output_path: Optional[Path] = None,
     model_name: Optional[str] = None,
+    verification_struct: Optional[dict] = None,
+    semantic: Optional[dict] = None,
 ) -> Optional[bytes]:
     """
     Generates a professional PDF audit report for a single interference mode.
@@ -116,13 +118,27 @@ def generate_llm_pdf(
     # -------------------------------------------------------------------
     # Header
     # -------------------------------------------------------------------
+    from llm_assistant import get_llm_inference_params, numeric_certification
+
+    run_meta = case_data.get("run_metadata", {})
+    llm_params = get_llm_inference_params()
     header_data = [
         ["Cas", case_data.get("case_id", "-")],
         ["Scenario", case_data.get("scenario", "-")],
         ["Configuration", f"N={case_data.get('N')}, K={case_data.get('K')}, seed={case_data.get('seed')}"],
+        ["Graines", f"topology_seed = {case_data.get('seed')}, "
+                    f"algorithm_seed = {run_meta.get('algorithm_seed', '-')}"],
+        ["Solveur", f"num_restarts = {run_meta.get('num_restarts', '-')}, "
+                    f"patience_sweeps = {run_meta.get('patience_sweeps', '-')}, "
+                    f"max_sweeps = {run_meta.get('max_sweeps', '-')}"],
         ["Mode d'interference", model_label],
         ["Contexte", case_data.get("context", "-")],
+        ["Version du code", run_meta.get("code_version", "-")],
         ["Modele LLM", model_name if model_name else "Non specifie"],
+        ["Inference", f"temperature = {llm_params['temperature']}, top_p = {llm_params['top_p']}, "
+                      f"top_k = {llm_params['top_k']}, max_output_tokens = "
+                      f"{llm_params['max_output_tokens']}"],
+        ["Directive", llm_params["directive_version"]],
         ["Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ]
     header_table = Table(header_data, colWidths=[4*cm, 12*cm])
@@ -139,17 +155,28 @@ def generate_llm_pdf(
     # -------------------------------------------------------------------
     # Certification badge
     # -------------------------------------------------------------------
-    if verification_final["has_hallucination"]:
+    # Statut numérique combiné (whitelist + quadruplets), puis statut sémantique
+    numeric = numeric_certification(verification_final, verification_struct)
+    if numeric["status"] == "NON_CERTIFIE":
         badge = (
-            f'<font color="#b30000"><b>RAPPORT NON CERTIFIE</b></font> - '
-            f'{len(verification_final["invented_numbers"])} valeur(s) non conforme(s) detectee(s).'
+            f'<font color="#b30000"><b>AUDIT NUMERIQUE : NON CERTIFIE</b></font> - '
+            f'{numeric["invented_count"]} valeur(s) hors whitelist, '
+            f'{numeric["invalid_quadruplets"]} quadruplet(s) mal attribue(s).'
         )
+    elif numeric["status"] == "AVERTISSEMENT":
+        badge = ('<font color="#b45309"><b>AUDIT NUMERIQUE : AVERTISSEMENT</b></font> - '
+                 'aucune valeur numerique a verifier.')
     else:
         badge = (
-            f'<font color="#006600"><b>RAPPORT CERTIFIE - 0 hallucination numerique</b></font> '
-            f'(taux d\'exactitude : {verification_final["accuracy_rate"]:.1f}%).'
+            f'<font color="#006600"><b>AUDIT NUMERIQUE : CERTIFIE</b></font> '
+            f'(taux d\'exactitude : {numeric["accuracy_rate"]:.1f}%, '
+            f'{numeric["checked_quadruplets"]} quadruplet(s) conforme(s)).'
         )
     story.append(Paragraph(badge, style_body))
+    if semantic:
+        story.append(Paragraph(
+            f'<b>AUDIT SEMANTIQUE : {semantic["status"]}</b> - score {semantic["score"]:.1f}% '
+            f'({semantic["version"]}, non bloquant).', style_body))
     story.append(Spacer(1, 0.4*cm))
 
     # -------------------------------------------------------------------
@@ -161,9 +188,9 @@ def generate_llm_pdf(
         ["Metrique", "Valeur"],
         ["Cout initial J_0", _fmt(m.get("cost_initial"))],
         ["Cout final J(x)", _fmt(m.get("cost_final"))],
-        [conflicts_label, _fmt(m.get("conflicts"))],
-        ["Temps d'execution (s)", _fmt(m.get("time_seconds"), 6)],
-        ["Iterations (BD-CeNN)", _fmt(m.get("iterations"))],
+        *_conflict_rows(model_label, m),
+        ["Temps d'execution (ms)", _fmt_us(m.get("time_seconds"))],
+        ["Sweeps (BD-CeNN)", _fmt(m.get("sweeps"))],
         ["Canaux utilises", _fmt(m.get("used_channels"))],
     ]
     sim_table = Table(sim_data, colWidths=[7*cm, 5*cm])
@@ -289,7 +316,24 @@ def _fmt(value, ndigits=2):
 
 
 def _conflicts_label(model_label: str) -> str:
-    """Returns conflict label based on interference mode."""
+    """Libellé officiel du compteur principal selon le régime."""
     if model_label == "CCI+ACI":
-        return "Conflits totaux (CCI+ACI)"
-    return "Conflits co-canal (CCI)"
+        return "C_tot"
+    return "C_CCI"
+
+
+def _conflict_rows(model_label: str, m: dict) -> list:
+    """Lignes de compteurs discrets, distinctes du coût J(x)."""
+    rows = [["C_CCI", _fmt(m.get("conflicts_cci"))]]
+    if model_label == "CCI+ACI":
+        rows.append(["C_ACI", _fmt(m.get("conflicts_aci"))])
+        rows.append(["C_tot", _fmt(m.get("conflicts"))])
+    return rows
+
+
+def _fmt_us(seconds) -> str:
+    """Durée stockée en secondes, restituée en millisecondes (4 décimales)."""
+    try:
+        return f"{float(seconds) * 1e3:.4f}"
+    except (TypeError, ValueError):
+        return str(seconds)

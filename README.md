@@ -28,10 +28,11 @@ regex independant.
   3. Convergence (courbes forward-filled BD-CeNN)
   4. Comparaison (BD-CeNN vs baselines, tableaux et graphiques)
   5. Rapport LLM (analyse qualitative + badge de certification)
-  6. Campagnes E1-E10 (execution batch en tache de fond avec logs live)
-  7. Export (CSV, JSON, ZIP)
+  6. Export (CSV, JSON, ZIP)
+  7. Campagnes E1-E10 (execution batch en tache de fond avec logs live)
 - **Auto-sauvegarde** dans `outputs/interactive_runs/{cochannel|adjacent}/`
-- **10 campagnes d'experiences** reproductibles sur 30 seeds fixes
+- **10 campagnes d'experiences** reproductibles : 30 graines de topologie (1 a 30)
+  et graines algorithmiques appariees (10001 a 10030), strictement decouplees
 
 ## Architecture
 

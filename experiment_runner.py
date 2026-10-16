@@ -108,7 +108,7 @@ def _run_bdcenn(graph: InterferenceGraph, mode: str,
         graph.N, graph.K, graph.W, M=M,
         num_restarts=num_restarts,
         max_sweeps=max_sweeps,
-        random_order=True,
+        random_order=config.RANDOM_ORDER,
         seed=seed,
         verbose=False,
     )
@@ -143,7 +143,9 @@ def _run_bdcenn(graph: InterferenceGraph, mode: str,
         best_sweep_index=best_sweep,
         energy_history=history,
         initial_assignment=initial_assignment,
-        metadata={"num_restarts": num_restarts, "max_sweeps": max_sweeps},
+        metadata={"num_restarts": num_restarts, "max_sweeps": max_sweeps,
+                  "patience_sweeps": config.PATIENCE_SWEEPS,
+                  "algorithm_seed": int(seed)},
     )
 
 
@@ -169,12 +171,12 @@ def _run_baseline(name: str, graph: InterferenceGraph, mode: str,
     """
     M = graph.M if mode == "cci_aci" else None
 
+    # Graine algorithmique appliquée avant la mesure de temps
+    np.random.seed(seed)
     start = time.perf_counter()
     if name == "Random":
-        np.random.seed(seed)
         x = random_allocation(graph.N, graph.K)
     elif name == "Greedy":
-        np.random.seed(seed)
         order = np.random.permutation(graph.N).tolist()
         x = greedy_allocation(graph.N, graph.K, graph.W, order=order, M=M)
     elif name == "DSATUR":
@@ -209,7 +211,7 @@ def _run_baseline(name: str, graph: InterferenceGraph, mode: str,
         best_sweep_index=0,
         energy_history=[],
         initial_assignment=None,
-        metadata={},
+        metadata={"algorithm_seed": int(seed)},
     )
 
 
@@ -293,15 +295,18 @@ class ExperimentRunner:
             mode_label = "CCI-only" if mode == "cci" else "CCI+ACI"
             for solver in solvers:
                 _report(f"Execution de {solver} ({mode_label})...")
+                # topology.seed reste la graine de topologie ; les solveurs
+                # reçoivent la graine algorithmique appariée.
+                algo_seed = config.algorithm_seed(topology.seed)
                 if solver == "BD-CeNN":
                     result = _run_bdcenn(
                         graph, mode,
                         num_restarts=self.num_restarts,
                         max_sweeps=self.max_sweeps,
-                        seed=topology.seed,
+                        seed=algo_seed,
                     )
                 else:
-                    result = _run_baseline(solver, graph, mode, seed=topology.seed)
+                    result = _run_baseline(solver, graph, mode, seed=algo_seed)
                 record.add_solver_result(result)
                 current_step += 1
                 _report(f"Termine : {solver} ({mode_label}).")

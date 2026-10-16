@@ -25,6 +25,7 @@ from dashboard.components import (
     mode_selector,
     solver_selector,
     render_scenario_summary,
+    topology_fingerprint,
 )
 
 
@@ -181,7 +182,7 @@ def render():
             # Il ecrasait les ajustements de domaine et de legende definis
             # dans render_topology_plotly(), et re-injectait des valeurs
             # par defaut qui reduisaient la zone de trace.
-            stable_key = f"graph_plot_{topology.scenario_name}_{topology.seed}"
+            stable_key = f"graph_plot_{topology_fingerprint(topology)}"
             st.plotly_chart(
                 fig,
                 use_container_width=True,

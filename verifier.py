@@ -76,12 +76,17 @@ class ResponseVerifier:
                     "num_restarts"]:
             if key in m:
                 add(m[key])
+        # Durées admises aussi en millisecondes (unité d'affichage)
+        if "time_seconds" in m:
+            add(float(m["time_seconds"]) * 1e3)
 
         # Baselines
         for base_data in case_data.get("baselines", {}).values():
             for k in ["cost", "conflicts_cci", "conflicts_aci", "conflicts_total", "time"]:
                 if k in base_data:
                     add(base_data[k])
+        if "time" in base_data:
+            add(float(base_data["time"]) * 1e3)
 
         # Cellules en conflit direct
         for c in case_data.get("conflicting_cells", []):
@@ -101,7 +106,7 @@ class ResponseVerifier:
         for (i, j, w) in case_data.get("topology_edges", []):
             add(int(i))
             add(int(j))
-            add(int(w))
+            add(w)
 
         if "total_edges" in case_data:
             add(case_data["total_edges"])
@@ -187,3 +192,13 @@ class ResponseVerifier:
             verifications=verifications,
             tolerance=self.tolerance,
         )
+
+
+def combine_numeric_status(audit_report: AuditReport, structured: dict = None) -> str:
+    """
+    Statut numérique final : la whitelist (AuditReport) ET les quadruplets
+    (scénario, méthode, métrique, valeur) doivent être conformes.
+    """
+    if structured and structured.get("invalid_claims"):
+        return "FAILED"
+    return audit_report.status

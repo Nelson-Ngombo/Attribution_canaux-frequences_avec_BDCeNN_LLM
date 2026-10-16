@@ -64,7 +64,7 @@ def render():
             "conflicts_aci": "Conflits adjacents C_ACI",
             "conflicts_total": "Conflits totaux C_total",
             "used_channels": "Canaux distincts utilises",
-            "wall_time_seconds": "Temps d'execution t_exec (s)",
+            "wall_time_seconds": "Temps d'execution t_exec (ms)",
             "n_sweeps": "Nombre de balayages (sweeps)",
         }[m],
         key="cmp_metric_select",
@@ -80,8 +80,8 @@ def render():
     if fig_delta is not None:
         st.plotly_chart(fig_delta, use_container_width=True, key=f"delta_{record.experiment_id}")
         info_banner(
-            "Le Delta_ACI mesure l'impact d'une evaluation sous contrainte adjacente sur le "
-            "cout obtenu sous contrainte co-canal simple.",
+            "Le Delta_ACI compare, pour chaque solveur, le coût obtenu en régime CCI+ACI au "
+            "coût obtenu en régime CCI-only. Il est non défini lorsque J_CCI = 0.",
             kind="info",
         )
     else:

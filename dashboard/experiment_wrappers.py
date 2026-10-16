@@ -88,10 +88,10 @@ EXPERIMENTS_METADATA = {
         "title": "Dynamique de convergence BD-CeNN (Forward Fill)",
         "description": (
             "Analyse la trajectoire interne de minimisation d'energie J(x) du "
-            "solveur BD-CeNN au fil des iterations sur S2 (N=30, K=4) et "
+            "solveur BD-CeNN au fil des sweeps sur S2 (N=30, K=4) et "
             "S3 (N=50, K=6). Utilise l'agregation Forward Fill pour eviter le "
             "biais des instances lentes. Calcule courbe moyenne, ecart-type, et "
-            "histogramme des iterations moyennes."
+            "histogramme des sweeps moyens."
         ),
         "scenario": "S2 et S3",
         "seeds_used": "30 seeds fixes (1 a 30)",
@@ -102,9 +102,9 @@ EXPERIMENTS_METADATA = {
     },
     "E6": {
         "code": "E6",
-        "title": "Scalabilite (temps, cout, iterations vs N)",
+        "title": "Scalabilite (temps, cout, sweeps vs N)",
         "description": (
-            "Etudie N dans {20, 30, 50, 100, 200} avec K=8 fixe. Genere les "
+            "Etudie N dans {8, 30, 50, 100, 200} avec K=8 fixe. Genere les "
             "topologies a la volee (area=300, threshold=50). 30 seeds par N. "
             "Attention : N=200 est le plus lourd."
         ),

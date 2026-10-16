@@ -34,6 +34,8 @@ from dashboard.components import (
 )
 from dashboard.pdf_export import generate_llm_pdf
 from export_manager import (
+    record_to_traceable_dict,
+    annotate_with_metadata,
     export_record_json,
     export_metrics_csv,
     export_metrics_split_csv,
@@ -78,9 +80,11 @@ def _generate_llm_pdf_bytes(record, mode: str):
         return None
 
     try:
-        from llm_assistant import build_prompt, get_active_model
+        from llm_assistant import build_prompt, get_llm_inference_params
         prompt = build_prompt(case_data)
-        model_name = get_active_model().replace("models/", "") if get_active_model() else None
+        # Modèle ayant effectivement produit le rapport, figé lors de la génération
+        params = sm.get(f"llm_params_{mode}") or get_llm_inference_params()
+        model_name = params["model"]
     except Exception:
         prompt = "(prompt indisponible)"
         model_name = None
@@ -98,6 +102,8 @@ def _generate_llm_pdf_bytes(record, mode: str):
             verification_final=verification_initial,
             output_path=None,
             model_name=model_name,
+            verification_struct=sm.get(f"audit_struct_{mode}"),
+            semantic=sm.get(f"audit_semantic_{mode}"),
         )
         return pdf_bytes
     except Exception as e:
@@ -131,105 +137,9 @@ def _audit_to_verification_dict(audit) -> dict:
 
 
 def _build_case_data(record, mode: str) -> dict:
-    from graph_model import InterferenceGraph
-
-    topology = record.topology
-    bd_result = record.solver_results.get("BD-CeNN", {}).get(mode)
-    if bd_result is None:
-        return None
-
-    baselines = {}
-    for name in ["Random", "Greedy", "DSATUR"]:
-        bres = record.solver_results.get(name, {}).get(mode)
-        if bres:
-            baselines[name] = {
-                "cost": float(bres.cost),
-                "conflicts_cci": int(bres.n_conflicts_cci),
-                "conflicts_aci": int(bres.n_conflicts_aci),
-                "conflicts_total": int(bres.n_conflicts_total),
-                "time": float(bres.wall_time_seconds),
-            }
-
-    graph = InterferenceGraph(topology)
-    if bd_result.initial_assignment is not None:
-        cost_init = graph.compute_cost(bd_result.initial_assignment, mode)
-    else:
-        cost_init = 0.0
-
-    conflict_edges = graph.get_conflict_edges_cci(bd_result.assignment)
-    if mode == "cci_aci":
-        conflict_edges += graph.get_conflict_edges_aci(bd_result.assignment)
-    conflicting_cells = sorted(set(c for edge in conflict_edges for c in edge))
-
-    allocations = {}
-    for name, modes_dict in record.solver_results.items():
-        if mode in modes_dict:
-            allocations[name] = [int(c) for c in modes_dict[mode].assignment]
-
-    cell_positions = {
-        int(i): [float(topology.positions[i, 0]), float(topology.positions[i, 1])]
-        for i in range(topology.N)
-    }
-
-    edges_all = []
-    for i in range(topology.N):
-        for j in range(i + 1, topology.N):
-            if topology.W[i, j] > 0:
-                edges_all.append((int(i), int(j), int(topology.W[i, j])))
-    edges_all.sort(key=lambda e: -e[2])
-    total_edges = len(edges_all)
-    topology_edges = edges_all[:80]
-
-    N = topology.N
-    cell_degree = np.zeros(N, dtype=int)
-    cell_strength = np.zeros(N, dtype=int)
-    for (i, j, w) in edges_all:
-        cell_degree[i] += 1
-        cell_degree[j] += 1
-        cell_strength[i] += w
-        cell_strength[j] += w
-    top_idx = np.argsort(-cell_strength)[:10]
-    cell_summary = [
-        {"cell": int(idx), "degree": int(cell_degree[idx]), "strength": int(cell_strength[idx])}
-        for idx in top_idx
-    ]
-
-    topology_meta = {
-        "seed": int(topology.seed),
-        "threshold": float(topology.threshold),
-        "N": int(topology.N),
-        "K": int(topology.K),
-    }
-
-    model_label = "CCI-only" if mode == "cci" else "CCI+ACI"
-
-    return {
-        "case_id": f"DASHBOARD_{record.experiment_id}",
-        "scenario": topology.scenario_name or "CUSTOM",
-        "N": topology.N,
-        "K": topology.K,
-        "seed": topology.seed,
-        "context": f"Analyse interactive depuis le dashboard [{model_label}]",
-        "model_label": model_label,
-        "metrics": {
-            "cost_initial": float(cost_init),
-            "cost_final": float(bd_result.cost),
-            "conflicts": int(bd_result.n_conflicts_total),
-            "conflicts_cci": int(bd_result.n_conflicts_cci),
-            "conflicts_aci": int(bd_result.n_conflicts_aci),
-            "time_seconds": float(bd_result.wall_time_seconds),
-            "sweeps": int(bd_result.n_sweeps),
-            "used_channels": int(bd_result.used_channels),
-        },
-        "baselines": baselines,
-        "conflicting_cells": conflicting_cells,
-        "allocations": allocations,
-        "cell_positions": cell_positions,
-        "topology_edges": topology_edges,
-        "total_edges": total_edges,
-        "cell_summary": cell_summary,
-        "topology_meta": topology_meta,
-    }
+    # Source unique : dossier identique à celui transmis au LLM, traçabilité incluse
+    from dashboard.tab_llm_report import _build_case_data as build_llm_case_data
+    return build_llm_case_data(record, mode)
 
 
 def render():
@@ -259,7 +169,7 @@ def render():
     # 1. Aperçu
     section_title("Tableau recapitulatif de controle")
     try:
-        df = build_metrics_dataframe(record)
+        df = annotate_with_metadata(build_metrics_dataframe(record), record)
         st.dataframe(df, use_container_width=True, height=300)
     except Exception as e:
         toast.error(f"Echec d'affichage du tableau : {e}")
@@ -274,7 +184,8 @@ def render():
 
     with dl_col1:
         try:
-            json_bytes = json.dumps(record.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
+            json_bytes = json.dumps(record_to_traceable_dict(record), indent=2,
+                                    ensure_ascii=False).encode("utf-8")
             st.download_button(
                 label="JSON complet",
                 data=json_bytes,
