@@ -45,10 +45,8 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 def _run_dashboard():
     from dashboard.theme import (apply_theme, render_app_header, render_sidebar_status_card,
-                                 render_sidebar_llm_params, render_sidebar_footer,
-                                 install_plotly_resize_fix)
+                                 render_sidebar_llm_params, render_sidebar_footer)
     apply_theme()
-    install_plotly_resize_fix()
 
     from dashboard import session_manager as sm
     sm.initialize_state()
@@ -152,16 +150,19 @@ def _run_dashboard():
     from dashboard import tab_experiments
 
     tab_labels = [
-        "Configuration",
-        "Graphe reseau",
-        "Convergence",
-        "Comparaison",
-        "Rapport LLM",
-        "Export",
-        "Campagnes E1-E10",
+        ":material/tune: Configuration",
+        ":material/hub: Graphe reseau",
+        ":material/show_chart: Convergence",
+        ":material/leaderboard: Comparaison",
+        ":material/psychology: Rapport LLM",
+        ":material/download: Export",
+        ":material/science: Campagnes E1-E10",
     ]
 
-    tabs = st.tabs(tab_labels)
+    # Onglets avec état : un changement d'onglet relance le script, onglet actif visible
+    tabs = st.tabs(tab_labels, key="main_tabs", on_change="rerun")
+    # Le graphe n'est tracé que dans un onglet affiché (largeur réelle disponible)
+    st.session_state["graph_tab_open"] = bool(tabs[1].open)
 
     with tabs[0]:
         tab_config.render()

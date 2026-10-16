@@ -67,27 +67,43 @@ p, span, div {
 }
 
 /* ============ Main container ============ */
-.main .block-container {
-    padding-top: 1.5rem;
+/* Sélecteurs Streamlit 1.64 : en-tête réduit, contenu remonté sous la barre d'outils */
+[data-testid="stHeader"] {
+    height: 2.5rem !important;
+    min-height: 2.5rem !important;
+    background: transparent !important;
+}
+[data-testid="stMainBlockContainer"] {
+    padding-top: 2.75rem !important;
     padding-bottom: 3rem;
     max-width: 1400px;
+}
+/* Conteneurs vides des blocs <style> : aucun espacement parasite en tête de page */
+[data-testid="stMainBlockContainer"] [data-testid="stElementContainer"]:has([data-testid="stMarkdownContainer"] > style:first-child) {
+    display: none;
 }
 
 /* ============ App header ============ */
 .app-header {
     background: linear-gradient(135deg, #1e3a5f 0%, #2a5285 100%);
-    padding: 1.4rem 2rem;
+    padding: 1rem 1.6rem;
     border-radius: 12px;
-    margin-bottom: 1.5rem;
+    margin-bottom: 1rem;
     box-shadow: 0 4px 12px rgba(30, 58, 95, 0.15);
     color: white;
 }
-.app-header h1 {
+/* Le titre Markdown hérite des marges des en-têtes Streamlit : neutralisées ici */
+.app-header h1,
+.app-header h1 * {
     color: white !important;
-    font-size: 1.9rem;
+    font-size: 1.65rem !important;
     font-weight: 700;
-    margin: 0;
+    line-height: 1.25;
     letter-spacing: -0.02em;
+}
+.app-header h1 {
+    margin: 0 !important;
+    padding: 0 !important;
 }
 .app-header .subtitle {
     color: #cbd5e1;
@@ -306,26 +322,64 @@ section[data-testid="stSidebar"] .sidebar-status-value {
     50% { opacity: 0.5; }
 }
 
-/* ============ Tabs ============ */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 6px;
-    background: transparent;
-    border-bottom: 2px solid #e2e8f0;
+/* ============ Onglets (react-aria, Streamlit 1.64) ============ */
+.stTabs [role="tablist"] {
+    flex-wrap: wrap;
+    gap: 0.2rem !important;
+    padding: 0.35rem;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 14px rgba(30, 58, 95, 0.06);
 }
-.stTabs [data-baseweb="tab"] {
-    height: 48px;
-    padding: 0 1.3rem;
-    background: transparent;
-    border-radius: 8px 8px 0 0;
-    font-weight: 500;
-    font-size: 1rem;
-    color: #64748b;
+.stTabs [role="tablist"]::after {
+    display: none !important;
 }
-.stTabs [aria-selected="true"] {
-    background: white !important;
-    color: #1e3a5f !important;
-    border-bottom: 3px solid #4a9eff !important;
+.stTabs [data-testid="stTab"] {
+    height: 2.75rem !important;
+    padding: 0 0.8rem !important;
+    border-radius: 9px;
+    color: #475569 !important;
+    transition: background-color 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+.stTabs [data-testid="stTab"] [data-testid="stMarkdownContainer"] p {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 0;
+    font-size: 0.98rem !important;
     font-weight: 600;
+    letter-spacing: 0.005em;
+    color: inherit !important;
+}
+.stTabs [data-testid="stTab"] [data-testid="stIconMaterial"] {
+    font-size: 1.15rem !important;
+    color: #64748b !important;
+    transition: transform 0.2s ease, color 0.18s ease;
+}
+.stTabs [data-testid="stTab"][data-hovered]:not([data-selected]) {
+    background: #eef4ff;
+    color: #1e3a5f !important;
+    transform: translateY(-1px);
+}
+.stTabs [data-testid="stTab"][data-hovered] [data-testid="stIconMaterial"] {
+    transform: scale(1.12);
+    color: #4a9eff !important;
+}
+.stTabs [data-testid="stTab"][data-selected],
+.stTabs [data-testid="stTab"][data-selected] [data-testid="stIconMaterial"] {
+    color: #ffffff !important;
+}
+/* Indicateur natif étendu en pastille : il glisse d'un onglet à l'autre */
+.stTabs [data-testid="stTab"] .react-aria-SelectionIndicator {
+    top: 0;
+    height: 100% !important;
+    border-radius: 9px !important;
+    z-index: -1;
+}
+.stTabs [data-testid="stTab"][data-selected] .react-aria-SelectionIndicator {
+    background: linear-gradient(135deg, #1e3a5f 0%, #2a5285 100%) !important;
+    box-shadow: 0 4px 12px rgba(30, 58, 95, 0.28);
 }
 
 /* ============ Expander ============ */

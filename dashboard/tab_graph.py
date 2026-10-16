@@ -37,17 +37,9 @@ def _get_assignment_for_view(record, solver_name, mode):
         return None
     return modes_dict[mode].assignment
 
-def _bump_graph_refresh_nonce():
-    """Nouvelle clé de figure : remontage du graphe à la largeur de l'onglet visible."""
-    st.session_state["graph_refresh_nonce"] = st.session_state.get("graph_refresh_nonce", 0) + 1
-
-
 @st.fragment
 def _render_graph_canvas(graph, assignment, mode, show_only_conflicts,
                          show_labels, title, topology):
-    # Bouton masqué en CSS, actionné par le script d'onglet : seul ce fragment est réexécuté
-    st.button("graph_refresh", key="graph_tab_refresh", on_click=_bump_graph_refresh_nonce)
-
     render_cols = st.columns([4, 1])
     with render_cols[1]:
         backend = st.radio(
@@ -59,6 +51,11 @@ def _render_graph_canvas(graph, assignment, mode, show_only_conflicts,
 
     graph_container = st.container()
 
+    # Tracé différé tant que l'onglet est masqué : une figure Plotly rendue
+    # hors écran reçoit une largeur nulle et reste compressée
+    if not st.session_state.get("graph_tab_open", True):
+        return
+
     with graph_container:
         if backend == "Plotly":
             fig = render_topology_plotly(
@@ -69,10 +66,7 @@ def _render_graph_canvas(graph, assignment, mode, show_only_conflicts,
                 show_labels=show_labels,
                 title=title,
             )
-            stable_key = (
-                f"graph_plot_{topology_fingerprint(topology)}_"
-                f"{st.session_state.get('graph_refresh_nonce', 0)}"
-            )
+            stable_key = f"graph_plot_{topology_fingerprint(topology)}"
             st.plotly_chart(
                 fig,
                 use_container_width=True,
