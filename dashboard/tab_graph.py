@@ -14,6 +14,8 @@ import streamlit.components.v1 as components
 
 from graph_model import InterferenceGraph
 from dashboard import session_manager as sm
+from dashboard import toast
+from dashboard.interactive_save import save_interactive_run
 from dashboard.graph_renderer import (
     render_topology_plotly,
     render_topology_pyvis_html,
@@ -36,6 +38,99 @@ def _get_assignment_for_view(record, solver_name, mode):
     if mode not in modes_dict:
         return None
     return modes_dict[mode].assignment
+
+def _run_full_experiment():
+    topology = sm.get("topology")
+    if topology is None:
+        toast.error("Aucune topologie disponible.")
+        return
+
+    runner = sm.get("runner")
+    if runner is None:
+        toast.error("Orchestrateur de run absent.")
+        return
+
+    modes = []
+    if sm.get("run_mode_cci"):
+        modes.append("cci")
+    if sm.get("run_mode_cci_aci"):
+        modes.append("cci_aci")
+
+    if not modes:
+        toast.warning("Veuillez selectionner au moins un mode spectral.")
+        return
+
+    sm.set_value("experiment_running", True)
+
+    progress_bar = st.progress(0.0, text="Preparation du run...")
+    status_placeholder = st.empty()
+
+    def progress_callback(msg: str, ratio: float):
+        try:
+            status_placeholder.info(msg)
+            progress_bar.progress(min(1.0, max(0.0, ratio)), text=msg)
+        except Exception:
+            pass
+
+    try:
+        record = runner.run_single(
+            topology,
+            modes=modes,
+            progress_callback=progress_callback,
+        )
+        sm.set_value("experiment_record", record)
+        progress_bar.progress(1.0, text="Run accompli")
+        status_placeholder.success("Simulation terminee avec succes.")
+
+        # Sauvegarde automatique sur disque
+        try:
+            saved = save_interactive_run(record, save_figures=True)
+            n_files = len(saved.get("json", [])) + len(saved.get("csv", [])) + len(saved.get("figures", []))
+            if n_files > 0:
+                toast.success(f"Sauvegarde reussie : {n_files} fichiers ecrits dans outputs/")
+        except Exception as e:
+            toast.warning(f"Sauvegarde partielle : {e}")
+
+    except Exception as e:
+        import traceback
+        sm.set_value("last_error_message", str(e))
+        status_placeholder.error(f"Echec critique : {e}")
+        with st.expander("Details techniques (traceback)"):
+            st.code(traceback.format_exc(), language="python")
+    finally:
+        sm.set_value("experiment_running", False)
+
+
+def _render_solver_launch_panel():
+    """Lancement des solveurs : le graphe affiché en dessous reflète aussitôt le run."""
+    section_title("Parametrage et exécution du solveur")
+
+    exec_cols = st.columns([1.2, 1, 1.8])
+    with exec_cols[0]:
+        launch = st.button(
+            "Lancer les solveurs",
+            type="primary",
+            use_container_width=True,
+            disabled=sm.get("experiment_running", False),
+            key="btn_launch_convergence",
+        )
+    with exec_cols[1]:
+        st.caption(f"**Restarts multistart** : {sm.get('num_restarts')}")
+        st.caption(f"**Sweeps max (T_max)** : {sm.get('max_iter')}")
+    with exec_cols[2]:
+        modes_active = []
+        if sm.get("run_mode_cci"):
+            modes_active.append("CCI-only")
+        if sm.get("run_mode_cci_aci"):
+            modes_active.append("CCI+ACI")
+        st.caption(f"**Regimes evalues** : {', '.join(modes_active) if modes_active else 'aucun'}")
+
+    if launch:
+        _run_full_experiment()
+        # L'onglet actif est conservé (onglets à clé) : le graphe se redessine ici
+        st.rerun()
+
+    st.divider()
 
 @st.fragment
 def _render_graph_canvas(graph, assignment, mode, show_only_conflicts,
@@ -105,6 +200,8 @@ def render():
 
     render_scenario_summary(topology)
     st.divider()
+
+    _render_solver_launch_panel()
 
     record = sm.get("experiment_record")
 

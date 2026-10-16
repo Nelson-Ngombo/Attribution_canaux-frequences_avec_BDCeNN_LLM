@@ -158,6 +158,13 @@ def _generate_llm_report(mode: str):
 
         sm.set_value(f"llm_response_{mode}", response)
 
+        # Échec d'appel : aucun audit sur un message d'erreur
+        if response.startswith("[ERREUR LLM]"):
+            for stale_key in ("audit_report", "audit_struct", "numeric_status", "audit_semantic"):
+                sm.set_value(f"{stale_key}_{mode}", None)
+            toast.error("Le LLM n'a pas produit de rapport (voir le detail).")
+            return
+
         from llm_assistant import (verify_structured_claims, semantic_audit,
                                    get_llm_inference_params)
         from verifier import combine_numeric_status

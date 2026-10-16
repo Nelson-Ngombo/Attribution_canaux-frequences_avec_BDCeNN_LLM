@@ -142,11 +142,8 @@ def _probe_single_model(client, model_name: str, types_module) -> bool:
 
     def _ping():
         try:
-            client.models.generate_content(
-                model=model_name,
-                contents="ping",
-                config=types_module.GenerateContentConfig(max_output_tokens=5),
-            )
+            # Lecture des métadonnées du modèle : vérifie l'accès sans consommer le quota de génération
+            client.models.get(model=model_name)
             result["ok"] = True
         except Exception:
             result["ok"] = False
@@ -725,6 +722,13 @@ def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
         if error_type == "SDK_ERROR":
             last_error = error_msg
             error_str = error_msg.upper()
+            # Quota journalier épuisé : toute relance échouerait jusqu'à la réinitialisation
+            if "PERDAY" in error_str:
+                retry_match = re.search(r"retry in ((?:\d+h)?(?:\d+m)?\d+)", error_msg)
+                retry_text = (f" Nouvel essai possible dans {retry_match.group(1)}s."
+                              if retry_match else "")
+                return (f"[ERREUR LLM] Quota journalier gratuit du modele "
+                        f"{model_to_try.replace('models/', '')} epuise.{retry_text}")
             is_transient = any(
                 code in error_str
                 for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
