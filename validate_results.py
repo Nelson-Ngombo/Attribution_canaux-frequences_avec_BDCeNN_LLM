@@ -1135,8 +1135,18 @@ def _e2_metric_groups(mode: str, method_name: str):
 
     return groups
 
+def _format_counter_stat(v: float, stat: str = None) -> str:
+    """
+    Compteur agrégé : moy. et é.t. à une décimale, méd. entière si elle l'est
+    (sinon une décimale), min et max entiers.
+    """
+    if stat in ("mean", "std"):
+        return f"{v:.1f}".replace(".", ",")
+    if stat == "median" and not float(v).is_integer():
+        return f"{v:.1f}".replace(".", ",")
+    return str(int(round(v)))
 
-def _e2_format_value(val, prefix: str) -> str:
+def _e2_format_value(val, prefix: str, stat: str = None) -> str:
     """Formate une valeur pour affichage francais (virgule decimale)."""
     if pd.isna(val):
         return "-"
@@ -1152,8 +1162,8 @@ def _e2_format_value(val, prefix: str) -> str:
         return f"{v:.2f}".replace(".", ",")
     if prefix == "n_sweeps":
         return f"{v:.1f}".replace(".", ",")
-    # Metriques entieres (conflits, canaux)
-    return str(int(round(v)))
+    # Compteurs (conflits, canaux) : précision selon la statistique
+    return _format_counter_stat(v, stat)
 
 
 def _build_e2_standalone_table_pdf(
@@ -1286,7 +1296,7 @@ def _build_e2_standalone_table_pdf(
                         col_name = f"{prefix}_{suffix}"
                         val = r.get(col_name, None)
                         row_k.append(
-                            Paragraph(_e2_format_value(val, prefix), style_cell)
+                            Paragraph(_e2_format_value(val, prefix, suffix), style_cell)
                         )
             table_data.append(row_k)
 
@@ -1518,7 +1528,7 @@ def _build_e3_standalone_table_pdf(
                         col_name = f"{prefix}_{suffix}"
                         val = r.get(col_name, None)
                         row_k.append(
-                            Paragraph(_e2_format_value(val, prefix), cell_style)
+                            Paragraph(_e2_format_value(val, prefix, suffix), cell_style)
                         )
             table_data.append(row_k)
 
@@ -1727,7 +1737,7 @@ def _build_e4_standalone_table_pdf(
         )
 
     # Helper de formatage local : "—" pour les cellules non applicables
-    def _fmt(val, prefix):
+    def _fmt(val, prefix, stat=None):
         if pd.isna(val):
             return "—"
         try:
@@ -1740,7 +1750,7 @@ def _build_e4_standalone_table_pdf(
             return f"{v:.2f}".replace(".", ",")
         if prefix == "n_sweeps":
             return f"{v:.1f}".replace(".", ",")
-        return str(int(round(v)))
+        return _format_counter_stat(v, stat)
 
     # Construction du tableau plat
     table_data = []
@@ -1783,7 +1793,7 @@ def _build_e4_standalone_table_pdf(
                     for suffix, _ in _E4_STAT_DISPLAY:
                         col_name = f"{prefix}_{suffix}"
                         val = r.get(col_name, None)
-                        row_d.append(Paragraph(_fmt(val, prefix), cell_style))
+                        row_d.append(Paragraph(_fmt(val, prefix, suffix), cell_style))
             table_data.append(row_d)
 
     if not table_data:
@@ -1981,7 +1991,7 @@ def _build_e6_standalone_table_pdf(
         )
 
     # Helper de formatage local : "—" pour les cellules non applicables
-    def _fmt(val, prefix):
+    def _fmt(val, prefix, stat=None):
         if pd.isna(val):
             return "—"
         try:
@@ -1995,7 +2005,7 @@ def _build_e6_standalone_table_pdf(
             return f"{v:.2f}".replace(".", ",")
         if prefix == "n_sweeps":
             return f"{v:.1f}".replace(".", ",")
-        return str(int(round(v)))
+        return _format_counter_stat(v, stat)
 
     # Construction du tableau plat
     table_data = []
@@ -2038,7 +2048,7 @@ def _build_e6_standalone_table_pdf(
                     for suffix, _ in _E6_STAT_DISPLAY:
                         col_name = f"{prefix}_{suffix}"
                         val = r.get(col_name, None)
-                        row_n.append(Paragraph(_fmt(val, prefix), cell_style))
+                        row_n.append(Paragraph(_fmt(val, prefix, suffix), cell_style))
             table_data.append(row_n)
 
     if not table_data:
@@ -2449,7 +2459,7 @@ def _build_e9_standalone_table_pdf(
         hdr_style = style_hdr
 
     # Helper de formatage
-    def _fmt(val, prefix):
+    def _fmt(val, prefix, stat=None):
         if pd.isna(val):
             return "—"
         try:
@@ -2464,7 +2474,7 @@ def _build_e9_standalone_table_pdf(
             return f"{v:.1f}".replace(".", ",")
         if prefix == "cost_ratio":
             return f"{v:.2f}".replace(".", ",")
-        return str(int(round(v)))
+        return _format_counter_stat(v, stat)
 
     # Construction du tableau
     table_data = []
@@ -2512,7 +2522,7 @@ def _build_e9_standalone_table_pdf(
                         for suffix, _ in _E9_STANDALONE_STAT_DISPLAY:
                             col_name = f"{prefix}_{suffix}"
                             val = r.get(col_name, None)
-                            row.append(Paragraph(_fmt(val, prefix), cell_style))
+                            row.append(Paragraph(_fmt(val, prefix, suffix), cell_style))
                     else:
                         val = r.get(prefix, None)
                         row.append(Paragraph(_fmt(val, prefix), cell_style))
@@ -2949,6 +2959,7 @@ def _e6_metric_groups(mode: str):
             ("used_channels",   "Canaux utilisés"),
             ("time",            _LBL_TIME_US),
             ("n_sweeps",        "Nombre de sweeps"),
+            ("total_sweeps_all_restarts", "Sweeps totaux (R restarts)"),
         ]
     else:
         # CCI-only : compteur discret co-canal, distinct de J(x)
@@ -2958,6 +2969,7 @@ def _e6_metric_groups(mode: str):
             ("used_channels",   "Canaux utilisés"),
             ("time",            _LBL_TIME_US),
             ("n_sweeps",        "Nombre de sweeps"),
+            ("total_sweeps_all_restarts", "Sweeps totaux (R restarts)"),
         ]
 
 # ============================================================================

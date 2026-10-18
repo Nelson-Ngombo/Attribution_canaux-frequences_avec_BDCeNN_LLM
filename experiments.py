@@ -292,6 +292,27 @@ def _timed_method_run(method_name, method_func, N, K, W, M, algo_seed,
         durations.append(duration)
     return x, n_sweeps, total_sweeps, float(np.median(durations))
 
+# Compteurs entiers par configuration (conflits, canaux utilisés)
+_COUNTER_PREFIXES = ("conflicts_cci", "conflicts_aci", "conflicts_total", "used_channels")
+
+
+def _round_counter_stats(summary):
+    """
+    Statistiques des compteurs entiers : min et max entiers, moyenne à deux
+    décimales, médiane et écart-type à une décimale (médiane x,5 possible sur 30 valeurs).
+    """
+    for col in summary.columns:
+        if not col.startswith(_COUNTER_PREFIXES):
+            continue
+        stat = col.rsplit("_", 1)[-1]
+        if stat in ("min", "max"):
+            summary[col] = summary[col].fillna(0).round(0).astype(int)
+        elif stat == "mean":
+            summary[col] = summary[col].round(2)
+        elif stat in ("median", "std"):
+            summary[col] = summary[col].round(1)
+    return summary
+
 def _validate_if_available(experiment_id: str, modes: list = None):
     try:
         from validate_results import validate_experiment
@@ -686,15 +707,11 @@ def run_experiment_E2(verbose=False):
             'total_sweeps_all_restarts_median'
         ]
 
-        # Durées conservées en secondes pleine précision ; conversion en ms au PDF
+        # Durées en secondes pleine précision (ms au PDF) ; compteurs traités à part
         for col in summary.columns[5:]:
-            if not col.startswith("time_"):
+            if not col.startswith("time_") and not col.startswith(_COUNTER_PREFIXES):
                 summary[col] = summary[col].round(1)
-
-        # n_sweeps est exclu pour preserver NaN sur les baselines
-        for col in summary.columns:
-            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
-                summary[col] = summary[col].fillna(0).round(0).astype(int)
+        summary = _round_counter_stats(summary)
 
         summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E2/{folder}/summary_metrics.csv saved.")
@@ -920,12 +937,11 @@ def run_experiment_E3(verbose=False):
         ]
         summary = summary.reset_index()
 
+        # Coûts au dixième ; compteurs traités à part
         for col in summary.columns[2:]:
-            summary[col] = summary[col].round(1)
-
-        for col in summary.columns:
-            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
-                summary[col] = summary[col].round(0).astype(int)
+            if not col.startswith(_COUNTER_PREFIXES):
+                summary[col] = summary[col].round(1)
+        summary = _round_counter_stats(summary)
 
         summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E3/{folder}/summary_metrics.csv saved.")
@@ -1129,12 +1145,11 @@ def run_experiment_E4(verbose=False):
             'total_sweeps_all_restarts_median'
         ]
 
+        # Durées en secondes pleine précision (ms au PDF) ; compteurs traités à part
         for col in summary.columns[3:]:
-            # Durées conservées en secondes pleine précision ; conversion en µs au PDF
-            if not col.startswith("time_"):
+            if not col.startswith("time_") and not col.startswith(_COUNTER_PREFIXES):
                 summary[col] = summary[col].round(1)
-            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
-                summary[col] = summary[col].fillna(0).round(0).astype(int)
+        summary = _round_counter_stats(summary)
 
         summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E4/{folder}/summary_metrics.csv saved.")
@@ -1474,7 +1489,9 @@ def run_experiment_E6(verbose=False):
                             w = 0
                         W[i, j] = w
                         W[j, i] = w
-                sum_weights = np.sum(W)
+                # Même convention que J (somme sur i < j) : triangle supérieur strict,
+                # sinon chaque paire est comptée deux fois au dénominateur
+                sum_weights = np.sum(np.triu(W, k=1))
 
                 for method_name, method_func in methods.items():
                     # Graine appariée ; temps = médiane de TIMING_REPEATS
@@ -1550,16 +1567,13 @@ def run_experiment_E6(verbose=False):
         # Durées en secondes pleine précision (conversion en ms au PDF) ;
         # coût normalisé de l'ordre de 1e-2 : six décimales conservées
         for col in summary.columns[2:]:
-            if col.startswith("time_"):
+            if col.startswith("time_") or col.startswith(_COUNTER_PREFIXES):
                 continue
             if col.startswith("normalized_cost_"):
                 summary[col] = summary[col].round(6)
             else:
                 summary[col] = summary[col].round(1)
-
-        for col in summary.columns:
-            if any(k in col for k in ['conflicts', 'used_channels']) and 'std' not in col:
-                summary[col] = summary[col].fillna(0).round(0).astype(int)
+        summary = _round_counter_stats(summary)
 
         summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E6/{folder}/summary_metrics.csv saved.")
