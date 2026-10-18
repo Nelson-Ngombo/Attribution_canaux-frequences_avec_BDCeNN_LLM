@@ -490,7 +490,9 @@ _STAT_SUFFIX_LABELS = {
 # "Nb. réaffectations canaux" et "Coût final".
 _GROUP_HEADER_LABELS = {
     "cost_rel": "Coût relatif (%)",
-    "change": "Taux de changement (%)",
+    "change": "Taux de changement invariant (%)",
+    "change_raw": "Taux brut sur étiquettes (%)",
+    "cost_ref": "J(x_ref, W_ref)",
     "changes": "Nb. réaffectations canaux",  # [FIX-E8] libelle enrichi
     "reassign_rate": "Taux de réaffectation (%)",
     "cost": "Coût J(x)",

@@ -31,6 +31,7 @@ from matplotlib.ticker import MaxNLocator
 import os
 import time
 import json
+import itertools
 import networkx as nx
 from matplotlib.patches import Patch
 
@@ -312,6 +313,33 @@ def _round_counter_stats(summary):
         elif stat in ("median", "std"):
             summary[col] = summary[col].round(1)
     return summary
+
+def _invariant_change_rate(x_ref, x_new, K, mode):
+    """
+    Taux de réaffectation (%) invariant par les symétries de J : permutation
+    quelconque des canaux en CCI-only (K! renommages), réflexion c -> K-1-c
+    en CCI+ACI (M ne dépend que de |k - l|).
+    """
+    x_ref = np.asarray(x_ref, dtype=int)
+    x_new = np.asarray(x_new, dtype=int)
+    n_cells = len(x_ref)
+    if mode == "cochannel":
+        # confusion[a, b] : cellules de canal a dans x_ref et b dans x_new
+        confusion = np.zeros((K, K), dtype=int)
+        np.add.at(confusion, (x_ref, x_new), 1)
+        try:
+            from scipy.optimize import linear_sum_assignment
+            rows, cols = linear_sum_assignment(-confusion)
+            matches = int(confusion[rows, cols].sum())
+        except ImportError:
+            # Repli exhaustif, suffisant pour K <= 6 (720 permutations)
+            matches = max(int(confusion[np.arange(K), list(perm)].sum())
+                          for perm in itertools.permutations(range(K)))
+        return 100.0 * (1.0 - matches / n_cells)
+    # CCI+ACI : seules l'identité et la réflexion laissent J invariant
+    rate_identity = np.mean(x_new != x_ref)
+    rate_reflected = np.mean((K - 1 - x_new) != x_ref)
+    return 100.0 * float(min(rate_identity, rate_reflected))
 
 def _validate_if_available(experiment_id: str, modes: list = None):
     try:
@@ -1770,8 +1798,11 @@ def run_experiment_E7(verbose=False):
                     cost_relatif = (cost_noisy - ref_cost[seed]) / ref_cost[seed] * 100
                 else:
                     cost_relatif = np.nan
+                # Taux brut sur les étiquettes, conservé pour traçabilité
                 changes = np.sum(x_noisy != ref_x[seed])
-                change_rate = (changes / N) * 100
+                change_rate_raw = (changes / N) * 100
+                # Taux invariant par les symétries de J : seul comparable entre solutions
+                change_rate = _invariant_change_rate(ref_x[seed], x_noisy, K, model_name)
 
                 raw_data.append({
                     "noise_level": b_noise * 100,
@@ -1781,6 +1812,7 @@ def run_experiment_E7(verbose=False):
                     "cost_noisy_on_w_noisy": cost_noisy_on_w_noisy,
                     "cost_relatif": cost_relatif,
                     "change_rate": change_rate,
+                    "change_rate_raw": change_rate_raw,
                     # Preuve que le bruit agit réellement sur W
                     "perturbed_edges": int(np.sum(W_noisy[upper] != W_clean[upper])),
                     "assignment_ref": _assignment_json(ref_x[seed]),
@@ -1798,22 +1830,38 @@ def run_experiment_E7(verbose=False):
         # moyenne -> ecart-type -> mediane -> minimum -> maximum
         summary = df_raw.groupby("noise_level").agg({
             "cost_relatif": ["mean", "std", "median", "min", "max"],
-            "change_rate": ["mean", "std", "median", "min", "max"]
+            "change_rate": ["mean", "std", "median", "min", "max"],
+            "change_rate_raw": ["mean", "std", "median", "min", "max"],
+            "cost_ref": ["mean", "median", "min", "max"]
         }).reset_index()
         summary.columns = ['noise_level',
                            'cost_rel_mean', 'cost_rel_std', 'cost_rel_median',
                            'cost_rel_min', 'cost_rel_max',
+                           # change_* : taux invariant par renommage des canaux
                            'change_mean', 'change_std', 'change_median',
-                           'change_min', 'change_max']
+                           'change_min', 'change_max',
+                           # change_raw_* : taux brut sur étiquettes (traçabilité)
+                           'change_raw_mean', 'change_raw_std', 'change_raw_median',
+                           'change_raw_min', 'change_raw_max',
+                           # J(x_ref, W_ref) : dénominateur du coût relatif
+                           'cost_ref_mean', 'cost_ref_median',
+                           'cost_ref_min', 'cost_ref_max']
+        # Pourcentages au dixième ; J_ref au centième (poids M de 0,25 en CCI+ACI)
         for col in summary.columns[1:]:
-            summary[col] = summary[col].round(1)
+            summary[col] = summary[col].round(2 if col.startswith("cost_ref_") else 1)
         # Delta_Bruit non défini (J_ref = 0) : décompte explicite, exclu des moyennes
         summary["n_delta_undefined"] = (
             df_raw.groupby("noise_level")["cost_relatif"]
             .apply(lambda s: int(s.isna().sum())).values
         )
+        # Topologies dont x_bruit coïncide avec x_ref à un renommage près
+        summary["n_identical_invariant"] = (
+            df_raw.groupby("noise_level")["change_rate"]
+            .apply(lambda s: int(np.isclose(s, 0.0).sum())).values
+        )
 
-        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.1f')
+        # Sans float_format global : J_ref garde ses deux décimales
+        summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False)
         print(f"[SUCCESS] CSV E7/{folder}/summary_metrics.csv saved.")
 
         # [FIX] Pattern robuste + correction du bug : 'change_rate_std' -> 'change_std'
