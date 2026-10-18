@@ -3346,6 +3346,155 @@ def _generate_e1_standalone_tables(mode: str):
 
     print(f"[INFO] E1/{mode} : {n_ok}/2 tables standalone generees dans {out_dir}")
 
+# ============================================================================
+# [FIX-E7-TABLES] Table standalone de l'experience E7 (robustesse au bruit, S6)
+# ============================================================================
+# Un PDF par regime, page ajustee au tableau, format booktabs des tables E1 :
+# niveau de bruit | cout relatif (5 stats) | taux de changement (5 stats).
+
+_E7_STAT_DISPLAY = [
+    ("mean",   "moy."),
+    ("std",    "é.t."),
+    ("median", "méd."),
+    ("min",    "min"),
+    ("max",    "max"),
+]
+
+# (prefixe des colonnes de summary_metrics.csv, libelle du groupe)
+_E7_METRIC_GROUPS = [
+    ("cost_rel", "Coût relatif (%)"),
+    ("change",   "Taux de changement (%)"),
+]
+
+# Niveaux de bruit b (en %), identiques a experiments.run_experiment_E7
+_E7_NOISE_LEVELS = [5, 10, 20]
+
+
+def _build_e7_standalone_table_pdf(mode: str, df_summary: pd.DataFrame,
+                                   output_path: Path) -> bool:
+    """
+    [FIX-E7-TABLES] Table de robustesse au bruit : en-tete a deux niveaux,
+    filets booktabs, separateurs verticaux entre les blocs de metriques.
+    """
+    if not REPORTLAB_AVAILABLE or df_summary.empty:
+        return False
+    required = ["noise_level"] + [f"{prefix}_{suffix}"
+                                  for prefix, _ in _E7_METRIC_GROUPS
+                                  for suffix, _ in _E7_STAT_DISPLAY]
+    missing = [col for col in required if col not in df_summary.columns]
+    if missing:
+        print(f"[WARNING] E7/{mode} summary_metrics.csv : colonnes absentes {missing}")
+        return False
+
+    st = _e1_styles()
+    n_stats = len(_E7_STAT_DISPLAY)
+    n_cols = 1 + n_stats * len(_E7_METRIC_GROUPS)
+
+    # En-tete niveau 1 : identifiant fusionne verticalement, groupes fusionnes horizontalement
+    row_top = [Paragraph("<b>Niveau de<br/>bruit (%)</b>", st["header_bold"])]
+    for _, label in _E7_METRIC_GROUPS:
+        row_top += [Paragraph(f"<b>{label}</b>", st["header_bold"])] + [""] * (n_stats - 1)
+    # En-tete niveau 2 : suffixes statistiques
+    row_sub = [""] + [Paragraph(stat_label, st["header"])
+                      for _ in _E7_METRIC_GROUPS
+                      for _, stat_label in _E7_STAT_DISPLAY]
+
+    table_data = [row_top, row_sub]
+    by_level = df_summary.set_index(df_summary["noise_level"].round().astype(int))
+    for level in _E7_NOISE_LEVELS:
+        if level not in by_level.index:
+            continue
+        row = by_level.loc[level]
+        cells = [Paragraph(str(level), st["cell"])]
+        for prefix, _ in _E7_METRIC_GROUPS:
+            for suffix, _ in _E7_STAT_DISPLAY:
+                value = row[f"{prefix}_{suffix}"]
+                text = "-" if pd.isna(value) else f"{float(value):.1f}".replace(".", ",")
+                cells.append(Paragraph(text, st["cell"]))
+        table_data.append(cells)
+    if len(table_data) == 2:
+        return False
+
+    col_widths = [2.3 * cm] + [1.62 * cm] * (n_cols - 1)
+    tbl = Table(table_data, colWidths=col_widths, repeatRows=2)
+
+    cmds = _e1_booktabs_commands(n_header_rows=2)
+    # Marges internes réduites : « -100,0 » tient sur une ligne
+    cmds.append(("LEFTPADDING", (0, 0), (-1, -1), 3))
+    cmds.append(("RIGHTPADDING", (0, 0), (-1, -1), 3))
+    cmds.append(("SPAN", (0, 0), (0, 1)))
+    for group_idx in range(len(_E7_METRIC_GROUPS)):
+        first = 1 + group_idx * n_stats
+        last = first + n_stats - 1
+        cmds.append(("SPAN", (first, 0), (last, 0)))
+        # Equivalent du \cmidrule sous chaque groupe
+        cmds.append(("LINEBELOW", (first, 0), (last, 0), _E1_RULE_LIGHT, colors.black))
+    # Separateurs verticaux : apres l'identifiant et entre les deux blocs
+    cmds.append(("LINEAFTER", (0, 0), (0, -1), _E1_RULE_LIGHT, colors.black))
+    cmds.append(("LINEAFTER", (n_stats, 0), (n_stats, -1), _E1_RULE_LIGHT, colors.black))
+    tbl.setStyle(TableStyle(cmds))
+
+    note_parts = [
+        "<i>Note.</i> moy. = moyenne, é.t. = écart-type, méd. = médiane.",
+        "Coût relatif = 100 × (J(x<sub>bruit</sub>, W<sub>ref</sub>) - "
+        "J(x<sub>ref</sub>, W<sub>ref</sub>)) / J(x<sub>ref</sub>, W<sub>ref</sub>) : "
+        "l'allocation obtenue sur la matrice bruitée est réévaluée sur la matrice "
+        "de référence. Taux de changement = part des cellules dont le canal "
+        "diffère de l'allocation de référence.",
+    ]
+    # Graines exclues du coût relatif lorsque J(x_ref, W_ref) = 0
+    if "n_delta_undefined" in df_summary.columns:
+        undefined = by_level.reindex(_E7_NOISE_LEVELS)["n_delta_undefined"].fillna(0).astype(int)
+        if undefined.sum() > 0:
+            per_level = ", ".join(f"{n} à {lvl} %" for lvl, n in undefined.items())
+            note_parts.append(
+                "Coût relatif non défini lorsque J(x<sub>ref</sub>, W<sub>ref</sub>) = 0 ; "
+                f"graines exclues de ses statistiques : {per_level}."
+            )
+    note_txt = " ".join(note_parts) + _traceability_note("E7", mode)
+
+    # Légende portée par \caption dans LaTeX (numérotation et label du rapport) :
+    # le PDF ne contient que le tableau et sa note
+    note_box = Table([[Paragraph(note_txt, st["note"])]], colWidths=[sum(col_widths)])
+    note_box.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                  ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    story = [tbl, Spacer(1, 0.25 * cm), note_box]
+    # Page ajustée au contenu : inclusion directe par \includegraphics, sans rognage
+    # (12 pt : marges internes du cadre ReportLab)
+    margin = 0.4 * cm
+    page_width = sum(col_widths) + 2 * margin + 12
+    content_height = sum(flow.wrap(page_width - 2 * margin, A4[1])[1] for flow in story)
+    SimpleDocTemplate(
+        str(output_path), pagesize=(page_width, content_height + 2 * margin + 24),
+        leftMargin=margin, rightMargin=margin, topMargin=margin, bottomMargin=margin,
+    ).build(story)
+    return True
+
+
+def _generate_e7_standalone_tables(mode: str):
+    """
+    [FIX-E7-TABLES] Genere le PDF standalone de E7 sous un regime, dans
+    results/validation/E7/{mode}/tables/table_e7_{mode}.pdf.
+    """
+    if not REPORTLAB_AVAILABLE:
+        print("[WARNING] ReportLab indisponible : table E7 standalone ignoree.")
+        return
+
+    summary_path = config.CSV_DIR / "E7" / mode / "summary_metrics.csv"
+    if not summary_path.exists():
+        print(f"[INFO] Pas de summary_metrics.csv pour E7/{mode} : table E7 ignoree.")
+        return
+
+    out_dir = config.VALIDATION_DIR / "E7" / mode / "tables"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"table_e7_{mode}.pdf"
+    try:
+        if _build_e7_standalone_table_pdf(mode, pd.read_csv(summary_path), out_path):
+            print(f"[SUCCESS] Table E7 standalone : {out_path.name}")
+        else:
+            print(f"[WARNING] Table E7 vide pour {mode}.")
+    except Exception as e:
+        print(f"[ERROR] Echec generation table E7/{mode} : {e}")
 
 def build_pdf_report(
     experiment_id: str,
@@ -4273,6 +4422,10 @@ def validate_experiment(experiment_id: str, modes: list = None):
         # C_CCI / C_ACI / C_tot en mode adjacent).
         elif experiment_id == "E6":
             _generate_e6_standalone_tables(mode)
+
+        # [FIX-E7-TABLES] Table robustesse au bruit (S6), une par regime
+        elif experiment_id == "E7":
+            _generate_e7_standalone_tables(mode)
 
         # [FIX-E8-TABLES] Generation de la table standalone unique pour E8
         # (A4 paysage, structure warm/cold avec 3 groupes de metriques).
