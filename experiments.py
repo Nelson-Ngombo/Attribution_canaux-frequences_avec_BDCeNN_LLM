@@ -236,6 +236,62 @@ def _warmup_solvers():
     np.random.set_state(rng_state)
     _SOLVERS_WARMED_UP = True
 
+# Répétitions chronométrées par (méthode, topologie) : la médiane écarte les pics
+# ponctuels du système (ordonnanceur, ramasse-miettes, fréquence du processeur)
+TIMING_REPEATS = 3
+
+
+def _run_method_once(method_name, method_func, N, K, W, M, algo_seed):
+    """Une exécution chronométrée ; l'initialisation du générateur reste hors mesure."""
+    total_sweeps = np.nan
+    if method_name == "Random":
+        np.random.seed(algo_seed)
+        start_time = time.perf_counter()
+        x = method_func(N, K)
+        n_sweeps = np.nan
+    elif method_name == "Greedy":
+        np.random.seed(algo_seed)
+        start_time = time.perf_counter()
+        order = np.random.permutation(N).tolist()
+        x = method_func(N, K, W, order=order, M=M)
+        n_sweeps = np.nan
+    elif method_name == "DSATUR":
+        start_time = time.perf_counter()
+        x = method_func(N, K, W, M=M)
+        n_sweeps = np.nan
+    else:
+        start_time = time.perf_counter()
+        x, _, _, _, _, n_sweeps, total_sweeps = method_func(
+            N, K, W, M=M,
+            num_restarts=config.NUM_RESTARTS,
+            max_sweeps=config.MAX_SWEEPS_BD,
+            random_order=config.RANDOM_ORDER,
+            seed=algo_seed,
+            verbose=False,
+            return_sweep_stats=True,
+        )
+    return x, n_sweeps, total_sweeps, time.perf_counter() - start_time
+
+
+def _timed_method_run(method_name, method_func, N, K, W, M, algo_seed,
+                      n_repeats=TIMING_REPEATS):
+    """
+    Allocation de la première exécution et médiane des temps de n_repeats
+    exécutions identiques (même graine algorithmique).
+    """
+    x, n_sweeps, total_sweeps, first_time = _run_method_once(
+        method_name, method_func, N, K, W, M, algo_seed)
+    durations = [first_time]
+    for _ in range(n_repeats - 1):
+        x_repeat, _, _, duration = _run_method_once(
+            method_name, method_func, N, K, W, M, algo_seed)
+        # Une répétition divergente invaliderait la médiane
+        if not np.array_equal(np.asarray(x_repeat), np.asarray(x)):
+            raise RuntimeError(
+                f"{method_name} non deterministe a graine fixee ({algo_seed})")
+        durations.append(duration)
+    return x, n_sweeps, total_sweeps, float(np.median(durations))
+
 def _validate_if_available(experiment_id: str, modes: list = None):
     try:
         from validate_results import validate_experiment
@@ -566,36 +622,12 @@ def run_experiment_E2(verbose=False):
                             W[j, i] = w
 
                     for method_name, method_func in methods.items():
-                        # Graine algorithmique appariée ; l'initialisation du
-                        # générateur est exclue de la mesure de temps.
+                        # Graine appariée ; temps = médiane de TIMING_REPEATS
+                        # exécutions identiques, allocation de la première
                         algo_seed = config.algorithm_seed(seed)
-                        if method_name == "Random":
-                            np.random.seed(algo_seed)
-                            start_time = time.perf_counter()
-                            x = method_func(N, K)
-                            n_sweeps = np.nan
-                        elif method_name == "Greedy":
-                            np.random.seed(algo_seed)
-                            start_time = time.perf_counter()
-                            order = np.random.permutation(N).tolist()
-                            x = method_func(N, K, W, order=order, M=M)
-                            n_sweeps = np.nan
-                        elif method_name == "DSATUR":
-                            start_time = time.perf_counter()
-                            x = method_func(N, K, W, M=M)
-                            n_sweeps = np.nan
-                        else:
-                            start_time = time.perf_counter()
-                            x, _, _, _, _, best_sweep = method_func(
-                                N, K, W, M=M,
-                                num_restarts=config.NUM_RESTARTS,
-                                max_sweeps=config.MAX_SWEEPS_BD,
-                                random_order=config.RANDOM_ORDER,
-                                seed=algo_seed,
-                                verbose=False
-                            )
-                            n_sweeps = best_sweep
-                        elapsed = time.perf_counter() - start_time
+                        x, n_sweeps, total_sweeps, elapsed = _timed_method_run(
+                        method_name, method_func, N, K, W, M, algo_seed
+                        )
 
                         cost = _compute_cost(x, W, M)
                         c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
@@ -614,7 +646,10 @@ def run_experiment_E2(verbose=False):
                             "conflicts_total": c_tot,
                             "used_channels": len(set(x)),
                             "time": elapsed,
+                            "time_repeats": TIMING_REPEATS,
                             "n_sweeps": n_sweeps,
+                            # Sweeps cumulés des R restarts : travail total couvert par la mesure de temps
+                            "total_sweeps_all_restarts": total_sweeps,
                             "assignment": _assignment_json(x),
                             **_w_provenance(sc_name, N, K, seed, source="positions",
                                             threshold=th),
@@ -622,7 +657,8 @@ def run_experiment_E2(verbose=False):
 
         df_raw = _annotate_metadata(pd.DataFrame(raw_data), "S2/S3", model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
-        _write_run_metadata(model_csv_dir, "E2", "S2/S3", model_name)
+        _write_run_metadata(model_csv_dir, "E2", "S2/S3", model_name,
+                            timing_repeats=TIMING_REPEATS)
         print(f"[SUCCESS] CSV E2/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["N", "K", "density_label", "threshold", "method"]).agg({
@@ -632,7 +668,8 @@ def run_experiment_E2(verbose=False):
             "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"],
             "time": ["mean", "std", "min", "max", "median"],
-            "n_sweeps": ["mean", "std", "min", "max", "median"]
+            "n_sweeps": ["mean", "std", "min", "max", "median"],
+            "total_sweeps_all_restarts": ["mean", "std", "min", "max", "median"]
         }).reset_index()
 
         summary.columns = [
@@ -643,7 +680,10 @@ def run_experiment_E2(verbose=False):
             'conflicts_total_mean', 'conflicts_total_std', 'conflicts_total_min', 'conflicts_total_max', 'conflicts_total_median',
             'used_channels_mean', 'used_channels_std', 'used_channels_min', 'used_channels_max', 'used_channels_median',
             'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
+            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median',
+            'total_sweeps_all_restarts_mean', 'total_sweeps_all_restarts_std',
+            'total_sweeps_all_restarts_min', 'total_sweeps_all_restarts_max',
+            'total_sweeps_all_restarts_median'
         ]
 
         # Durées conservées en secondes pleine précision ; conversion en ms au PDF
@@ -664,8 +704,12 @@ def run_experiment_E2(verbose=False):
             ('cost', 'Mean Global Cost J(x)'),
             ('conflicts_total', 'Mean Conflicted Links'),
             ('used_channels', 'Mean Channels Used'),
-            ('time', "Temps d'exécution (ms)")
+            ('time', "Temps d'exécution médian (ms, échelle log)")
         ]
+
+        # Quartiles des temps par configuration, sur les médianes par topologie
+        time_quartiles = (df_raw.groupby(["N", "K", "density_label", "method"])["time"]
+                          .quantile([0.25, 0.75]).unstack())
 
         subplots_config = [
             (30, 4, "N=30, K=4"),
@@ -702,9 +746,11 @@ def run_experiment_E2(verbose=False):
                     continue
 
                 density_order = ["Low", "Medium", "High"]
+                # Temps : médiane et intervalle interquartile, robustes aux pics isolés
+                center_stat = 'median' if metric_col == 'time' else 'mean'
                 pivot_mean = sub.pivot(
                     index='density_label', columns='method',
-                    values=f'{metric_col}_mean'
+                    values=f'{metric_col}_{center_stat}'
                 ).reindex(density_order)
                 pivot_std = sub.pivot(
                     index='density_label', columns='method',
@@ -719,9 +765,17 @@ def run_experiment_E2(verbose=False):
                     # Durées en secondes dans le CSV, tracées en ms
                     scale = 1e3 if metric_col == 'time' else 1.0
                     means = pivot_mean[method].fillna(0).values * scale
-                    stds = pivot_std[method].fillna(0).values * scale
+                    if metric_col == 'time':
+                        quartiles = time_quartiles.reindex(
+                            [(N, K, d, method) for d in density_order])
+                        q_low = quartiles[0.25].fillna(0).values * scale
+                        q_high = quartiles[0.75].fillna(0).values * scale
+                        errors = [np.clip(means - q_low, 0, None),
+                                  np.clip(q_high - means, 0, None)]
+                    else:
+                        errors = pivot_std[method].fillna(0).values * scale
                     offset = (i - 1.5) * width
-                    ax.bar(x + offset, means, width, yerr=stds,
+                    ax.bar(x + offset, means, width, yerr=errors,
                            capsize=3, label=method,
                            color=method_colors[method], alpha=0.8)
 
@@ -732,6 +786,9 @@ def run_experiment_E2(verbose=False):
                 ax.grid(axis='y', linestyle='--', alpha=0.3)
                 if metric_col == 'used_channels':
                     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                if metric_col == 'time':
+                    # Baselines et BD-CeNN séparés de plusieurs ordres de grandeur
+                    ax.set_yscale('log')
 
             handles, labels = axes_flat[0].get_legend_handles_labels()
             fig.legend(
@@ -1007,36 +1064,12 @@ def run_experiment_E4(verbose=False):
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
 
                 for method_name, method_func in methods.items():
-                    # Graine algorithmique appariée ; l'initialisation du
-                    # générateur est exclue de la mesure de temps.
+                    # Graine appariée ; temps = médiane de TIMING_REPEATS
+                    # exécutions identiques, allocation de la première
                     algo_seed = config.algorithm_seed(seed)
-                    if method_name == "Random":
-                        np.random.seed(algo_seed)
-                        start_time = time.perf_counter()
-                        x = method_func(N, K)
-                        n_sweeps = np.nan
-                    elif method_name == "Greedy":
-                        np.random.seed(algo_seed)
-                        start_time = time.perf_counter()
-                        order = np.random.permutation(N).tolist()
-                        x = method_func(N, K, W, order=order, M=M)
-                        n_sweeps = np.nan
-                    elif method_name == "DSATUR":
-                        start_time = time.perf_counter()
-                        x = method_func(N, K, W, M=M)
-                        n_sweeps = np.nan
-                    else:
-                        start_time = time.perf_counter()
-                        x, _, _, _, _, best_sweep = method_func(
-                            N, K, W, M=M,
-                            num_restarts=config.NUM_RESTARTS,
-                            max_sweeps=config.MAX_SWEEPS_BD,
-                            random_order=config.RANDOM_ORDER,
-                            seed=algo_seed,
-                            verbose=False
-                        )
-                        n_sweeps = best_sweep
-                    elapsed = time.perf_counter() - start_time
+                    x, n_sweeps, total_sweeps, elapsed = _timed_method_run(
+                    method_name, method_func, N, K, W, M, algo_seed
+                    )
 
                     cost = _compute_cost(x, W, M)
                     c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
@@ -1052,7 +1085,10 @@ def run_experiment_E4(verbose=False):
                         "conflicts_total": c_tot,
                         "used_channels": len(set(x)),
                         "time": elapsed,
+                        "time_repeats": TIMING_REPEATS,
                         "n_sweeps": n_sweeps,
+                        # Sweeps cumulés des R restarts : travail total couvert par la mesure de temps
+                        "total_sweeps_all_restarts": total_sweeps,
                         "assignment": _assignment_json(x),
                         **_w_provenance(scenario_name, N, K, seed, source="positions",
                                         threshold=th),
@@ -1060,7 +1096,8 @@ def run_experiment_E4(verbose=False):
 
         df_raw = _annotate_metadata(pd.DataFrame(raw_data), scenario_name, model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
-        _write_run_metadata(model_csv_dir, "E4", scenario_name, model_name)
+        _write_run_metadata(model_csv_dir, "E4", scenario_name, model_name,
+                            timing_repeats=TIMING_REPEATS)
         print(f"[SUCCESS] CSV E4/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["density_label", "threshold", "method"]).agg({
@@ -1070,7 +1107,8 @@ def run_experiment_E4(verbose=False):
             "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"],
             "time": ["mean", "std", "min", "max", "median"],
-            "n_sweeps": ["mean", "std", "min", "max", "median"]
+            "n_sweeps": ["mean", "std", "min", "max", "median"],
+            "total_sweeps_all_restarts": ["mean", "std", "min", "max", "median"]
         }).reset_index()
 
         summary.columns = [
@@ -1085,7 +1123,10 @@ def run_experiment_E4(verbose=False):
             'used_channels_mean', 'used_channels_std', 'used_channels_min',
             'used_channels_max', 'used_channels_median',
             'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
+            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median',
+            'total_sweeps_all_restarts_mean', 'total_sweeps_all_restarts_std',
+            'total_sweeps_all_restarts_min', 'total_sweeps_all_restarts_max',
+            'total_sweeps_all_restarts_median'
         ]
 
         for col in summary.columns[3:]:
@@ -1141,6 +1182,34 @@ def run_experiment_E4(verbose=False):
         ax.grid(True, linestyle='--', alpha=0.3)
         # [FIX-LAYOUT] subplots_adjust supprime : position deja fixee par add_axes.
         fig.savefig(str(model_fig_dir / f"cost_vs_density_{model_name}.png"), dpi=300)
+
+        # ---- Figure 2 : temps d'exécution vs densité (médiane, IQR, échelle log) ----
+        time_quartiles = (df_raw.groupby(["threshold", "method"])["time"]
+                          .quantile([0.25, 0.75]).unstack())
+        fig, canvas = _new_figure((10, 6))
+        ax = fig.add_axes([0.10, 0.14, 0.87, 0.76])
+        for method in methods.keys():
+            sub = summary[summary['method'] == method].set_index('threshold').reindex(x_vals)
+            centers = sub['time_median'].values * 1e3
+            quartiles = time_quartiles.reindex([(th, method) for th in x_vals])
+            yerr = [np.clip(centers - quartiles[0.25].values * 1e3, 0, None),
+                    np.clip(quartiles[0.75].values * 1e3 - centers, 0, None)]
+            ax.errorbar(x_vals, centers, yerr=yerr, label=method,
+                        color=method_colors[method], marker=method_markers[method],
+                        capsize=5, linewidth=2, markersize=8)
+        # Baselines et BD-CeNN séparés de plusieurs ordres de grandeur
+        ax.set_yscale('log')
+        ax.set_xticks(x_vals)
+        ax.set_xticklabels([f"{th}\n({lbl})" for th, lbl in zip(x_vals, density_labels)])
+        ax.set_xlabel("Seuil d'interférence (threshold) - Densité croissante", fontsize=12)
+        ax.set_ylabel("Temps d'exécution médian (ms, échelle log)", fontsize=12)
+        ax.set_title(f"E4 - Impact de la densité sur le temps d'exécution - {model_name}",
+                     fontsize=14, fontweight='bold')
+        ax.legend(loc='best')
+        ax.grid(True, linestyle='--', alpha=0.3)
+        fname = f"time_vs_density_{model_name}.png"
+        fig.savefig(str(model_fig_dir / fname), dpi=300)
+        print(f"[INFO] Figure E4/{folder}/{fname} saved.")
 
     _validate_if_available("E4")
     print("[SUCCESS] Experiment E4 completed.")
@@ -1408,36 +1477,12 @@ def run_experiment_E6(verbose=False):
                 sum_weights = np.sum(W)
 
                 for method_name, method_func in methods.items():
-                    # Graine algorithmique appariée ; l'initialisation du
-                    # générateur est exclue de la mesure de temps.
+                    # Graine appariée ; temps = médiane de TIMING_REPEATS
+                    # exécutions identiques, allocation de la première
                     algo_seed = config.algorithm_seed(seed)
-                    if method_name == "Random":
-                        np.random.seed(algo_seed)
-                        start_time = time.perf_counter()
-                        x = method_func(N, K)
-                        n_sweeps = np.nan
-                    elif method_name == "Greedy":
-                        np.random.seed(algo_seed)
-                        start_time = time.perf_counter()
-                        order = np.random.permutation(N).tolist()
-                        x = method_func(N, K, W, order=order, M=M)
-                        n_sweeps = np.nan
-                    elif method_name == "DSATUR":
-                        start_time = time.perf_counter()
-                        x = method_func(N, K, W, M=M)
-                        n_sweeps = np.nan
-                    else:
-                        start_time = time.perf_counter()
-                        x, _, _, _, _, best_sweep = method_func(
-                            N, K, W, M=M,
-                            num_restarts=config.NUM_RESTARTS,
-                            max_sweeps=config.MAX_SWEEPS_BD,
-                            random_order=config.RANDOM_ORDER,
-                            seed=algo_seed,
-                            verbose=False
-                        )
-                        n_sweeps = best_sweep
-                    elapsed = time.perf_counter() - start_time
+                    x, n_sweeps, total_sweeps, elapsed = _timed_method_run(
+                    method_name, method_func, N, K, W, M, algo_seed
+                    )
 
                     cost = _compute_cost(x, W, M)
                     c_cci, c_aci, c_tot = _compute_all_conflicts(x, W, M)
@@ -1454,7 +1499,10 @@ def run_experiment_E6(verbose=False):
                         "conflicts_total": c_tot,
                         "used_channels": len(set(x)),
                         "time": elapsed,
+                        "time_repeats": TIMING_REPEATS,
                         "n_sweeps": n_sweeps,
+                        # Sweeps cumulés des R restarts : travail total couvert par la mesure de temps
+                        "total_sweeps_all_restarts": total_sweeps,
                         "assignment": _assignment_json(x),
                         # Topologie générée à la volée : (area, threshold) suffisent au validateur
                         **_w_provenance("E6", N, K, seed, source="generated",
@@ -1464,7 +1512,7 @@ def run_experiment_E6(verbose=False):
         df_raw = _annotate_metadata(pd.DataFrame(raw_data), "E6 (généré)", model_name)
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False)
         _write_run_metadata(model_csv_dir, "E6", "E6 (généré, area=300, threshold=50)",
-                            model_name)
+                            model_name, timing_repeats=TIMING_REPEATS)
         print(f"[SUCCESS] CSV E6/{folder}/raw_metrics.csv saved.")
 
         summary = df_raw.groupby(["N", "method"]).agg({
@@ -1475,7 +1523,8 @@ def run_experiment_E6(verbose=False):
             "conflicts_total": ["mean", "std", "min", "max", "median"],
             "used_channels": ["mean", "std", "min", "max", "median"],
             "time": ["mean", "std", "min", "max", "median"],
-            "n_sweeps": ["mean", "std", "min", "max", "median"]
+            "n_sweeps": ["mean", "std", "min", "max", "median"],
+            "total_sweeps_all_restarts": ["mean", "std", "min", "max", "median"]
         }).reset_index()
 
         summary.columns = [
@@ -1492,7 +1541,10 @@ def run_experiment_E6(verbose=False):
             'used_channels_mean', 'used_channels_std', 'used_channels_min',
             'used_channels_max', 'used_channels_median',
             'time_mean', 'time_std', 'time_min', 'time_max', 'time_median',
-            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
+            'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median',
+            'total_sweeps_all_restarts_mean', 'total_sweeps_all_restarts_std',
+            'total_sweeps_all_restarts_min', 'total_sweeps_all_restarts_max',
+            'total_sweeps_all_restarts_median'
         ]
 
         # Durées en secondes pleine précision (conversion en ms au PDF) ;
@@ -1514,13 +1566,17 @@ def run_experiment_E6(verbose=False):
 
         metrics_to_plot = [
             ('cost_mean', 'cost_std', 'Cout global moyen J(x)'),
-            ('time_mean', 'time_std', "Temps d'execution moyen (ms)"),
+            ('time_median', 'time_std', "Temps d'execution median (ms)"),
             ('n_sweeps_mean', 'n_sweeps_std', "Sweeps moyens (BD-CeNN)")
         ]
 
         method_colors = {'Random': 'royalblue', 'Greedy': 'forestgreen',
                          'DSATUR': 'darkorange', 'BD-CeNN': 'firebrick'}
         method_markers = {'Random': 'o', 'Greedy': 's', 'DSATUR': '^', 'BD-CeNN': 'D'}
+
+        # Quartiles des temps par (N, méthode), sur les médianes par topologie
+        time_quartiles = (df_raw.groupby(["N", "method"])["time"]
+                          .quantile([0.25, 0.75]).unstack())
 
         for metric_col, std_col, ylabel in metrics_to_plot:
             # [FIX-LAYOUT] Figure() au lieu de plt.figure().
@@ -1535,26 +1591,31 @@ def run_experiment_E6(verbose=False):
                 ax.set_title(f"E6 - Complexite dynamique - {ylabel} (BD-CeNN)")
             else:
                 # Durées en secondes dans le CSV, tracées en ms
-                scale = 1e3 if metric_col == 'time_mean' else 1.0
+                is_time = metric_col == 'time_median'
+                scale = 1e3 if is_time else 1.0
                 for method in methods.keys():
                     sub = summary[summary['method'] == method].set_index('N').reindex(N_values).reset_index()
-                    means = sub[metric_col].values * scale
-                    stds = sub[std_col].values * scale
-                    # Échelle log : borne basse de la barre d'erreur maintenue positive
-                    yerr = ([np.minimum(stds, 0.9 * means), stds]
-                            if metric_col == 'time_mean' else stds)
-                    ax.errorbar(sub['N'].values, means, yerr=yerr,
+                    centers = sub[metric_col].values * scale
+                    if is_time:
+                        # Intervalle interquartile asymétrique autour de la médiane
+                        quartiles = time_quartiles.reindex([(n, method) for n in N_values])
+                        yerr = [np.clip(centers - quartiles[0.25].values * scale, 0, None),
+                                np.clip(quartiles[0.75].values * scale - centers, 0, None)]
+                    else:
+                        yerr = sub[std_col].values * scale
+                    ax.errorbar(sub['N'].values, centers, yerr=yerr,
                                 fmt=method_markers[method]+'-', capsize=5,
                                 color=method_colors[method], label=method,
                                 linewidth=2, markersize=8)
-                if metric_col == 'time_mean':
+                if is_time:
                     # Plusieurs ordres de grandeur entre baselines et BD-CeNN
                     ax.set_xscale('log')
                     ax.set_yscale('log')
                     ax.set_xticks(N_values)
                     ax.set_xticklabels([str(n) for n in N_values])
                     ax.minorticks_off()
-                    ax.set_title(f"E6 - Complexite structurelle - {ylabel} (echelle log-log)")
+                    ax.set_title(f"E6 - Complexite structurelle - {ylabel} "
+                                 f"(IQR, echelle log-log)")
                 else:
                     ax.set_title(f"E6 - Complexite structurelle - {ylabel}")
 
@@ -1564,7 +1625,8 @@ def run_experiment_E6(verbose=False):
             ax.grid(True, linestyle='--', alpha=0.3)
             fig.subplots_adjust(top=0.92, bottom=0.10, left=0.09, right=0.97)
 
-            fname = f"{metric_col.replace('_mean','')}_vs_N_{model_name}.png"
+            # Nom inchangé (time_vs_N, cost_vs_N...) quelle que soit la statistique tracée
+            fname = f"{metric_col.replace('_mean','').replace('_median','')}_vs_N_{model_name}.png"
             fig.savefig(str(model_fig_dir / fname), dpi=300)
             print(f"[INFO] Figure E6/{folder}/{fname} saved.")
 

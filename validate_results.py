@@ -451,6 +451,22 @@ def _traceability_note(experiment_id: str, mode: str) -> str:
         f"LLM : {meta.get('llm_model')}."
     )
 
+def _time_protocol_note(experiment_id: str, mode: str) -> str:
+    """Protocole de chronométrage lu dans run_metadata.json (médiane de répétitions)."""
+    try:
+        with open(config.CSV_DIR / experiment_id / mode / "run_metadata.json",
+                  "r", encoding="utf-8") as f:
+            repeats = json.load(f).get("timing_repeats")
+    except (OSError, ValueError):
+        return ""
+    # Absent des anciens CSV : aucune mention d'un protocole non appliqué
+    if not repeats:
+        return ""
+    return (
+        f" Pour chaque topologie, le temps retenu est la médiane de {int(repeats)} "
+        f"exécutions identiques (même graine algorithmique) ; moy., é.t., méd., "
+        f"min et max portent ensuite sur ces médianes."
+    )
 
 def _format_time_us(seconds, decimal_comma: bool = False) -> str:
     """Durée stockée en secondes, restituée en millisecondes à quatre décimales."""
@@ -487,6 +503,7 @@ _GROUP_HEADER_LABELS = {
     "used_channels": "Canaux utilisés",
     "time": _LBL_TIME_US,
     "n_sweeps": "Sweeps",
+    "total_sweeps_all_restarts": "Sweeps totaux (R restarts)",
 }
 
 
@@ -1341,7 +1358,8 @@ def _build_e2_standalone_table_pdf(
             "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
     note_parts.append(_NOTE_TIME_US)
-    note_txt = " ".join(note_parts) + _traceability_note("E2", mode)
+    note_txt = (" ".join(note_parts) + _time_protocol_note("E2", mode)
+                + _traceability_note("E2", mode))
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -1833,7 +1851,8 @@ def _build_e4_standalone_table_pdf(
             "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
     note_parts.append(_NOTE_TIME_US)
-    note_txt = " ".join(note_parts) + _traceability_note("E4", mode)
+    note_txt = (" ".join(note_parts) + _time_protocol_note("E4", mode)
+                + _traceability_note("E4", mode))
 
     story = [
         Paragraph(caption_txt, style_caption),
@@ -2087,7 +2106,8 @@ def _build_e6_standalone_table_pdf(
             "C<sub>tot</sub> = C<sub>CCI</sub> + C<sub>ACI</sub>."
         )
     note_parts.append(_NOTE_TIME_US)
-    note_txt = " ".join(note_parts) + _traceability_note("E6", mode)
+    note_txt = (" ".join(note_parts) + _time_protocol_note("E6", mode)
+                + _traceability_note("E6", mode))
 
     story = [
         Paragraph(caption_txt, style_caption),

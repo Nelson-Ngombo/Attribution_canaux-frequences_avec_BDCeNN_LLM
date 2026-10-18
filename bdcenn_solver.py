@@ -176,7 +176,8 @@ def restart_seed_sequence(seed, num_restarts):
 def bdcenn_allocation(N, K, W, M=None, num_restarts=config.NUM_RESTARTS,
                       max_sweeps=config.MAX_SWEEPS_BD,
                       random_order=config.RANDOM_ORDER, seed=None,
-                      verbose=False, initial_assignment=None, **kwargs):
+                      verbose=False, initial_assignment=None,
+                      return_sweep_stats=False, **kwargs):
     """
     Solveur BD-CeNN multistart (spécification v1.0, §10).
 
@@ -205,6 +206,8 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=config.NUM_RESTARTS,
     best_conflicts_cci = 0
     best_conflicts_aci = 0
     best_sweep_index = 0
+    # Travail global : sweeps exécutés par l'ensemble des restarts
+    total_sweeps_all_restarts = 0
 
     # Graines de restart indépendantes dérivées de la graine algorithmique.
     # Remplace seed + r, qui faisait coïncider le restart r de l'instance s
@@ -219,6 +222,9 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=config.NUM_RESTARTS,
             verbose=verbose if r == 0 else False,
             initial_assignment=initial_assignment if r == 0 else None,
         )
+
+        # Sweeps réellement exécutés par ce restart (history inclut l'état initial)
+        total_sweeps_all_restarts += len(hist) - 1
 
         # Évaluation du coût final pour comparaison entre restarts
         if M is not None:
@@ -235,8 +241,12 @@ def bdcenn_allocation(N, K, W, M=None, num_restarts=config.NUM_RESTARTS,
             best_conflicts_aci = n_aci
             best_sweep_index = sweep_idx
 
-    return (best_x, best_history, best_time,
-            best_conflicts_cci, best_conflicts_aci, best_sweep_index)
+    result = (best_x, best_history, best_time,
+              best_conflicts_cci, best_conflicts_aci, best_sweep_index)
+    # Septième élément uniquement sur demande : appels existants inchangés
+    if return_sweep_stats:
+        return result + (total_sweeps_all_restarts,)
+    return result
 
 
 def bdcenn_restart_trace(N, K, W, M=None, num_restarts=config.NUM_RESTARTS,
