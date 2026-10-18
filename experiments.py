@@ -37,7 +37,8 @@ from matplotlib.patches import Patch
 import config
 from baselines import greedy_allocation, dsatur_allocation, random_allocation
 from bdcenn_solver import bdcenn_allocation, bdcenn_restart_trace
-from data_generator import apply_measurement_noise, apply_dynamic_modification
+from data_generator import (apply_measurement_noise, apply_dynamic_modification,
+                            build_weight_matrix)
 from metrics import (
     create_channel_interference_matrix,
     compute_cost_cci,
@@ -205,6 +206,35 @@ def _write_run_metadata(model_csv_dir, experiment_id, scenario, mode_name,
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     return metadata
 
+# Chauffe unique par processus : la première mesure chronométrée ne doit pas
+# supporter le coût des premiers appels (chemins de code, caches, allocations NumPy)
+_SOLVERS_WARMED_UP = False
+
+
+def _warmup_solvers():
+    """Appel non chronométré de chaque méthode sur une petite instance, en CCI et CCI+ACI."""
+    global _SOLVERS_WARMED_UP
+    if _SOLVERS_WARMED_UP:
+        return
+    # État du générateur global restauré : aucune graine des campagnes n'est décalée
+    rng_state = np.random.get_state()
+    n_cells, n_channels = 12, 3
+    positions = np.random.RandomState(0).rand(n_cells, 2) * 100
+    W = build_weight_matrix(positions, 50.0)
+    order = list(range(n_cells))
+    for M in (None, create_channel_interference_matrix(n_channels)):
+        random_allocation(n_cells, n_channels)
+        greedy_allocation(n_cells, n_channels, W, order=order, M=M)
+        dsatur_allocation(n_cells, n_channels, W, M=M)
+        bdcenn_allocation(n_cells, n_channels, W, M=M, num_restarts=1,
+                          max_sweeps=config.MAX_SWEEPS_BD,
+                          random_order=config.RANDOM_ORDER, seed=0, verbose=False)
+        # Chemin chronométré par E9
+        bdcenn_restart_trace(n_cells, n_channels, W, M=M, num_restarts=1,
+                             max_sweeps=config.MAX_SWEEPS_BD,
+                             random_order=config.RANDOM_ORDER, seed=0)
+    np.random.set_state(rng_state)
+    _SOLVERS_WARMED_UP = True
 
 def _validate_if_available(experiment_id: str, modes: list = None):
     try:
@@ -480,6 +510,7 @@ def run_experiment_E2(verbose=False):
     e2_csv_dir = config.CSV_DIR / "E2"
     os.makedirs(e2_fig_dir, exist_ok=True)
     os.makedirs(e2_csv_dir, exist_ok=True)
+    _warmup_solvers()
 
     models = [
         {"name": "cochannel", "M": None, "folder": "cochannel"},
@@ -925,6 +956,7 @@ def run_experiment_E4(verbose=False):
     e4_csv_dir = config.CSV_DIR / "E4"
     os.makedirs(e4_fig_dir, exist_ok=True)
     os.makedirs(e4_csv_dir, exist_ok=True)
+    _warmup_solvers()
 
     models = [
         {"name": "cochannel", "M": None, "folder": "cochannel"},
@@ -1329,6 +1361,7 @@ def run_experiment_E6(verbose=False):
     e6_csv_dir = config.CSV_DIR / "E6"
     os.makedirs(e6_fig_dir, exist_ok=True)
     os.makedirs(e6_csv_dir, exist_ok=True)
+    _warmup_solvers()
 
     models = [
         {"name": "cochannel", "M": None, "folder": "cochannel"},
@@ -1462,9 +1495,14 @@ def run_experiment_E6(verbose=False):
             'n_sweeps_mean', 'n_sweeps_std', 'n_sweeps_min', 'n_sweeps_max', 'n_sweeps_median'
         ]
 
-        # Durées conservées en secondes pleine précision ; conversion en µs au PDF
+        # Durées en secondes pleine précision (conversion en ms au PDF) ;
+        # coût normalisé de l'ordre de 1e-2 : six décimales conservées
         for col in summary.columns[2:]:
-            if not col.startswith("time_"):
+            if col.startswith("time_"):
+                continue
+            if col.startswith("normalized_cost_"):
+                summary[col] = summary[col].round(6)
+            else:
                 summary[col] = summary[col].round(1)
 
         for col in summary.columns:
@@ -1500,12 +1538,25 @@ def run_experiment_E6(verbose=False):
                 scale = 1e3 if metric_col == 'time_mean' else 1.0
                 for method in methods.keys():
                     sub = summary[summary['method'] == method].set_index('N').reindex(N_values).reset_index()
-                    ax.errorbar(sub['N'].values, sub[metric_col].values * scale,
-                                yerr=sub[std_col].values * scale,
+                    means = sub[metric_col].values * scale
+                    stds = sub[std_col].values * scale
+                    # Échelle log : borne basse de la barre d'erreur maintenue positive
+                    yerr = ([np.minimum(stds, 0.9 * means), stds]
+                            if metric_col == 'time_mean' else stds)
+                    ax.errorbar(sub['N'].values, means, yerr=yerr,
                                 fmt=method_markers[method]+'-', capsize=5,
                                 color=method_colors[method], label=method,
                                 linewidth=2, markersize=8)
-                ax.set_title(f"E6 - Complexite structurelle - {ylabel}")
+                if metric_col == 'time_mean':
+                    # Plusieurs ordres de grandeur entre baselines et BD-CeNN
+                    ax.set_xscale('log')
+                    ax.set_yscale('log')
+                    ax.set_xticks(N_values)
+                    ax.set_xticklabels([str(n) for n in N_values])
+                    ax.minorticks_off()
+                    ax.set_title(f"E6 - Complexite structurelle - {ylabel} (echelle log-log)")
+                else:
+                    ax.set_title(f"E6 - Complexite structurelle - {ylabel}")
 
             ax.set_xlabel("Nombre de cellules N", fontsize=12)
             ax.set_ylabel(ylabel, fontsize=12)
@@ -1747,6 +1798,7 @@ def run_experiment_E8(verbose=False):
     e8_csv_dir = config.CSV_DIR / "E8"
     os.makedirs(e8_fig_dir, exist_ok=True)
     os.makedirs(e8_csv_dir, exist_ok=True)
+    _warmup_solvers()
 
     models = [
         {"name": "cochannel", "M": None, "folder": "cochannel"},
@@ -1941,6 +1993,7 @@ def run_experiment_E9(verbose=False):
     e9_csv_dir = config.CSV_DIR / "E9"
     os.makedirs(e9_fig_dir, exist_ok=True)
     os.makedirs(e9_csv_dir, exist_ok=True)
+    _warmup_solvers()
 
     models = [
         {"name": "cochannel", "M": None, "folder": "cochannel"},
@@ -2209,6 +2262,7 @@ def run_experiment_E9(verbose=False):
 def run_experiment_E10(verbose=False):
     e10_csv_dir = config.CSV_DIR / "E10"
     os.makedirs(e10_csv_dir, exist_ok=True)
+    _warmup_solvers()
 
     cases_def = [
         {"case_id": "#1",  "scenario": "S1", "N": 8,   "K": 3, "seed": 1, "context": "Visual verification simple layout"},

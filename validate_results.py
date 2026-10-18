@@ -569,6 +569,9 @@ def _format_cell_value(val, col_name: str) -> str:
             return str(val)
 
     if isinstance(val, float):
+        # Testé avant « cost », qui absorberait normalized_cost_* en deux décimales
+        if "normalized" in col_name.lower():
+            return f"{val:.4f}"
         if "cost" in col_name.lower() or "cout" in col_name.lower():
             return f"{val:.2f}"
         elif "time" in col_name.lower():
