@@ -495,6 +495,10 @@ _GROUP_HEADER_LABELS = {
     "cost_ref": "J(x_ref, W_ref)",
     "changes": "Nb. réaffectations canaux",  # [FIX-E8] libelle enrichi
     "reassign_rate": "Taux de réaffectation (%)",
+    "changes_raw": "Réaffectations brutes",
+    "reassign_rate_raw": "Taux brut (%)",
+    "cost_prev_on_dyn": "J(x_prev, W_dyn)",
+    "n_edges_modified": "Arêtes modifiées",
     "cost": "Coût J(x)",
     "cost_initial": "J_init",
     "cost_final": "J_final",
@@ -2356,7 +2360,10 @@ def _build_e8_standalone_table_pdf(
         "<i>Note.</i> moy. = moyenne, é.t. = écart-type, méd. = médiane. "
         + _NOTE_TIME_US
         + " Warm Start : un restart depuis l'allocation précédente ; Cold Start : "
-        "dix restarts depuis des initialisations aléatoires."
+        "dix restarts depuis des initialisations aléatoires ; Cold Start R = 1 : "
+        "premier restart du Cold Start seul (même graine). Réaffectations comptées "
+        "à un renommage des canaux près (invariance de J)."
+        + _time_protocol_note("E8", mode)
         + _traceability_note("E8", mode)
     )
 
@@ -2994,12 +3001,13 @@ _E8_STAT_DISPLAY = [
 _E8_MOD_LEVELS = [5, 10, 20]
 
 # Ordre d'affichage des modes (warm avant cold)
-_E8_MODE_ORDER = ["warm", "cold"]
+_E8_MODE_ORDER = ["warm", "cold", "cold_r1"]
 
 # Libelles d'affichage des modes
 _E8_MODE_LABELS = {
     "warm": "Réoptimisation à chaud (Warm start)",
     "cold": "Réoptimisation à froid (Cold start)",
+    "cold_r1": "Réoptimisation à froid, un restart (Cold start R = 1)",
 }
 
 
@@ -3810,17 +3818,14 @@ def build_pdf_report(
             mode_splits = None
             if "mode" in df.columns:
                 unique_modes = set(df["mode"].dropna().unique())
-                if unique_modes and unique_modes <= {"warm", "cold"}:
+                if unique_modes and unique_modes <= set(_E8_MODE_ORDER):
                     mode_splits = []
-                    for mode_val in ["warm", "cold"]:
+                    # Un sous-tableau par stratégie présente (warm, cold, cold_r1)
+                    for mode_val in [m for m in _E8_MODE_ORDER if m in unique_modes]:
                         mode_df = (df[df["mode"] == mode_val]
                                    .drop(columns=["mode"])
                                    .reset_index(drop=True))
-                        if mode_val == "warm":
-                            mode_label_split = "Réoptimisation à chaud (Warm start)"
-                        else:
-                            mode_label_split = "Réoptimisation à froid (Cold start)"
-                        mode_splits.append((mode_df, mode_label_split))
+                        mode_splits.append((mode_df, _E8_MODE_LABELS[mode_val]))
 
             dfs_to_render = mode_splits if mode_splits else [(df, None)]
 

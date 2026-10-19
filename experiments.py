@@ -293,6 +293,33 @@ def _timed_method_run(method_name, method_func, N, K, W, M, algo_seed,
         durations.append(duration)
     return x, n_sweeps, total_sweeps, float(np.median(durations))
 
+def _timed_bdcenn_run(N, K, W, M, seed, num_restarts, initial_assignment=None,
+                      n_repeats=TIMING_REPEATS):
+    """
+    BD-CeNN chronométré n_repeats fois avec la même graine : allocation et
+    historique de la première exécution, médiane des durées.
+    """
+    durations = []
+    first_x, first_history = None, None
+    for _ in range(n_repeats):
+        start = time.perf_counter()
+        x, history, _, _, _, _ = bdcenn_allocation(
+            N, K, W, M=M,
+            num_restarts=num_restarts,
+            max_sweeps=config.MAX_SWEEPS_BD,
+            random_order=config.RANDOM_ORDER,
+            seed=seed,
+            initial_assignment=initial_assignment,
+            verbose=False
+        )
+        durations.append(time.perf_counter() - start)
+        if first_x is None:
+            first_x, first_history = x, history
+        # Une répétition divergente invaliderait la médiane
+        elif not np.array_equal(np.asarray(x), np.asarray(first_x)):
+            raise RuntimeError(f"BD-CeNN non deterministe a graine fixee ({seed})")
+    return first_x, first_history, float(np.median(durations))
+
 # Compteurs entiers par configuration (conflits, canaux utilisés)
 _COUNTER_PREFIXES = ("conflicts_cci", "conflicts_aci", "conflicts_total", "used_channels")
 
@@ -1973,84 +2000,81 @@ def run_experiment_E8(verbose=False):
                 M = create_channel_interference_matrix(K) if model_name == "adjacent" else None
                 x_prev = ref_x[seed]
 
-                # Warm Start : un unique restart qui part exactement de x_prev
+                # Dégradation à corriger : ancienne solution sur la matrice modifiée,
+                # avant toute réoptimisation
+                cost_prev_on_dyn = _compute_cost(x_prev, W_dyn, M)
+                upper = np.triu_indices(N, k=1)
+                n_edges_modified = int(np.sum(W_dyn[upper] != W_orig[upper]))
+
                 warm_seed = config.algorithm_seed(seed)
-                start = time.perf_counter()
-                x_warm, history_warm, _, _, _, _ = method_func(
-                    N, K, W_dyn, M=M,
-                    num_restarts=1,
-                    max_sweeps=config.MAX_SWEEPS_BD,
-                    random_order=config.RANDOM_ORDER,
-                    seed=warm_seed,
-                    initial_assignment=x_prev,
-                    verbose=False
-                )
-                time_warm = time.perf_counter() - start
-                warm_from_prev = bool(np.array_equal(history_warm[0][2], x_prev))
-
-                # Cold Start : multistart complet depuis des initialisations aléatoires
                 cold_seed = config.algorithm_seed(seed) + int(b_mod * 1000) + 400
-                start = time.perf_counter()
-                x_cold, _, _, _, _, _ = method_func(
-                    N, K, W_dyn, M=M,
-                    num_restarts=config.NUM_RESTARTS,
-                    max_sweeps=config.MAX_SWEEPS_BD,
-                    random_order=config.RANDOM_ORDER,
-                    seed=cold_seed,
-                    verbose=False
-                )
-                time_cold = time.perf_counter() - start
-
-                changes_warm = int(np.sum(x_warm != x_prev))
-                changes_cold = int(np.sum(x_cold != x_prev))
-
-                cost_warm = _compute_cost(x_warm, W_dyn, M)
-                cost_cold = _compute_cost(x_cold, W_dyn, M)
+                # (mode, graine, restarts, allocation initiale imposée)
+                strategies = [
+                    # Warm Start : un unique restart qui part exactement de x_prev
+                    ("warm", warm_seed, 1, x_prev),
+                    # Cold Start : multistart complet depuis des initialisations aléatoires
+                    ("cold", cold_seed, config.NUM_RESTARTS, None),
+                    # Cold Start à un restart, même graine : son unique restart est le
+                    # premier du Cold Start, ce qui isole l'effet du nombre de restarts
+                    ("cold_r1", cold_seed, 1, None),
+                ]
 
                 provenance = _w_provenance("S7", N, K, seed, perturbation_kind="dynamic",
                                            perturbation_level=b_mod)
-                raw_data.append({
-                    "mod_level": b_mod * 100, "seed": seed, "mode": "warm",
-                    "time": time_warm, "changes": changes_warm, "cost": cost_warm,
-                    "reassign_rate": changes_warm / N * 100,
-                    "num_restarts": 1, "algorithm_seed": warm_seed,
-                    "warm_from_prev": warm_from_prev,
-                    "assignment": _assignment_json(x_warm), **provenance,
-                })
-                raw_data.append({
-                    "mod_level": b_mod * 100, "seed": seed, "mode": "cold",
-                    "time": time_cold, "changes": changes_cold, "cost": cost_cold,
-                    "reassign_rate": changes_cold / N * 100,
-                    "num_restarts": config.NUM_RESTARTS, "algorithm_seed": cold_seed,
-                    "warm_from_prev": False,
-                    "assignment": _assignment_json(x_cold), **provenance,
-                })
+                for strategy, run_seed, n_restarts, init in strategies:
+                    x_new, history, elapsed = _timed_bdcenn_run(
+                        N, K, W_dyn, M, run_seed, n_restarts, initial_assignment=init
+                    )
+                    # Réaffectations invariantes par les symétries de J (taux puis cellules)
+                    reassign_rate = _invariant_change_rate(x_prev, x_new, K, model_name)
+                    changes_raw = int(np.sum(x_new != x_prev))
+                    raw_data.append({
+                        "mod_level": b_mod * 100, "seed": seed, "mode": strategy,
+                        "time": elapsed, "time_repeats": TIMING_REPEATS,
+                        "changes": int(round(reassign_rate * N / 100.0)),
+                        "reassign_rate": reassign_rate,
+                        # Comptes bruts sur étiquettes, conservés pour traçabilité
+                        "changes_raw": changes_raw,
+                        "reassign_rate_raw": changes_raw / N * 100,
+                        "cost": _compute_cost(x_new, W_dyn, M),
+                        "cost_prev_on_dyn": cost_prev_on_dyn,
+                        "n_edges_modified": n_edges_modified,
+                        "num_restarts": n_restarts, "algorithm_seed": run_seed,
+                        "warm_from_prev": (bool(np.array_equal(history[0][2], x_prev))
+                                           if init is not None else False),
+                        "assignment": _assignment_json(x_new), **provenance,
+                    })
 
         df_raw = _annotate_metadata(pd.DataFrame(raw_data), "S7", model_name)
         # Résolution nanoseconde : pleine précision conservée avant l'affichage en ms
         df_raw.to_csv(str(model_csv_dir / "raw_metrics.csv"), index=False, float_format='%.9f')
-        _write_run_metadata(model_csv_dir, "E8", "S7", model_name)
+        _write_run_metadata(model_csv_dir, "E8", "S7", model_name,
+                            timing_repeats=TIMING_REPEATS)
         print(f"[SUCCESS] CSV E8/{folder}/raw_metrics.csv saved.")
 
         # [FIX-E8] Ordre des statistiques aligne sur la convention du memoire :
         # moyenne -> ecart-type -> mediane -> minimum -> maximum
+        stats = ["mean", "std", "median", "min", "max"]
         summary = df_raw.groupby(["mod_level", "mode"]).agg({
-            "time": ["mean", "std", "median", "min", "max"],
-            "changes": ["mean", "std", "median", "min", "max"],
-            "cost": ["mean", "std", "median", "min", "max"],
-            "reassign_rate": ["mean", "std", "median", "min", "max"]
-        }).reset_index()
-        summary.columns = ['mod_level', 'mode',
-                           'time_mean', 'time_std', 'time_median', 'time_min', 'time_max',
-                           'changes_mean', 'changes_std', 'changes_median', 'changes_min', 'changes_max',
-                           'cost_mean', 'cost_std', 'cost_median', 'cost_min', 'cost_max',
-                           'reassign_rate_mean', 'reassign_rate_std', 'reassign_rate_median',
-                           'reassign_rate_min', 'reassign_rate_max']
+            "time": stats,
+            "changes": stats,
+            "cost": stats,
+            "reassign_rate": stats,
+            # Taux bruts sur étiquettes (traçabilité)
+            "changes_raw": stats,
+            "reassign_rate_raw": stats,
+            # Dégradation subie avant réoptimisation, commune aux trois stratégies
+            "cost_prev_on_dyn": stats,
+            "n_edges_modified": stats,
+        })
+        # Noms aplatis identiques aux précédents (time_mean, changes_std, ...)
+        summary.columns = [f"{col}_{stat}" for col, stat in summary.columns]
+        summary = summary.reset_index()
         for col in summary.columns:
             if col not in ['mod_level', 'mode']:
-                summary[col] = (summary[col].round(1)
-                                if ('changes' in col or 'cost' in col or 'reassign' in col)
-                                else summary[col].round(9))
+                # Durées en secondes à la nanoseconde ; comptes, coûts et taux au dixième
+                summary[col] = (summary[col].round(9) if col.startswith("time_")
+                                else summary[col].round(1))
 
         summary.to_csv(str(model_csv_dir / "summary_metrics.csv"), index=False, float_format='%.9f')
         print(f"[SUCCESS] CSV E8/{folder}/summary_metrics.csv saved.")
