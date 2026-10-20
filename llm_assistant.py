@@ -58,7 +58,7 @@ LLM_SEED = 2026
 LLM_CAMPAIGN_FIXED_MODEL = True
 LLM_CAMPAIGN_MODEL = GOOGLE_MODEL_PREFERRED
 # Version de la directive, archivée hors prompt pour ne pas polluer la whitelist
-ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.2"
+ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.3"
 
 from config import LLM_LOGS_DIR, FIGURES_DIR, CSV_DIR
 
@@ -380,13 +380,15 @@ RÈGLES DE CONDUITE MATHEMATIQUE :
 - Ne cite jamais l'identifiant du run.
 - Redige un rapport technique sobre, sans qualificatif emphatique ni formule creuse
   ("il convient de", "il est important de noter", "en conclusion").
+- Rapporte uniquement les resultats obtenus : ne t'attribue aucune note, aucun
+  score de confiance et aucune auto-evaluation de ton analyse.
 
 === FORMAT DE SORTIE (OBLIGATOIRE) ===
-- Exactement six rubriques, dans l'ordre A), B), C), D), E), F), chacune commencant
+- Exactement cinq rubriques, dans l'ordre A), B), C), D), E), chacune commencant
   en debut de ligne par sa lettre suivie d'une parenthese fermante.
 - N'emploie jamais de listes numerotees qui fausseraient le parsing automatique.
 - Entre quatre-vingts et cent cinquante mots par rubrique ; la reponse complete reste
-  sous neuf cents mots et se termine toujours par la rubrique F.
+  sous sept cent cinquante mots et se termine par la rubrique E.
 - Ne recopie ni la liste des aretes, ni les vecteurs d'affectation, ni les positions ;
   cite au plus cinq cellules a titre d'exemple.
 
@@ -401,7 +403,7 @@ Un parseur regex externe audite tous les chiffres de ta reponse.
 
   REGLE 2 - COMPTEURS DE DISCOURS : EN TOUTES LETTRES.
   Seuls les denombrements absents des donnees s'ecrivent en lettres :
-  "trois algorithmes de reference", "deux regimes d'interference", "six rubriques".
+  "trois algorithmes de reference", "deux regimes d'interference", "cinq rubriques".
   La regle 1 prime toujours sur la regle 2.
 """
 
@@ -562,7 +564,7 @@ def build_prompt(case_data: dict) -> str:
 === CELLULES EN CONFLIT APRES OPTIMISATION ===
 {conflicting_str}
 
-=== TACHES D'AUDIT DEMANDEES (Enumerer par A), B), C), D), E), F)) ===
+=== TACHES D'AUDIT DEMANDEES (Enumerer par A), B), C), D), E)) ===
 A) Compare l'intensite du cout final J(x*) du BD-CeNN face aux trois baselines.
    Analyse le vecteur d'allocation de canal pour expliquer les ecarts de performance.
    Discute specifiquement de la repartition spectrale obtenue.
@@ -1114,15 +1116,19 @@ def numeric_certification(verification: dict, structured: dict = None) -> dict:
 # -----------------------------------------------------------------------------
 # C-ter. AUDIT SÉMANTIQUE (séparé de l'audit numérique)
 # -----------------------------------------------------------------------------
-SEMANTIC_AUDIT_VERSION = "SEM-1.0"
+SEMANTIC_AUDIT_VERSION = "SEM-1.1"
 
-_SECTION_LETTERS = ("A", "B", "C", "D", "E", "F")
+_SECTION_LETTERS = ("A", "B", "C", "D", "E")
 _NUMBERED_LIST = re.compile(r"(?m)^\s*\d+[.)]\s")
 _OVERCLAIM = re.compile(
     r"optimum\s+global\s+(?:est\s+)?(?:garanti|certain)|fiable\s+[àa]\s+100"
     r"|garanti[t]?\s+l['’]optim|parfaitement\s+optimal",
     re.IGNORECASE)
-_CONFIDENCE_WORDS = ("un", "une", "deux", "trois", "quatre", "cinq")
+# Le rapport restitue des résultats : toute note ou auto-évaluation est proscrite
+_SELF_ASSESSMENT = re.compile(
+    r"note\s+de\s+confiance|niveau\s+de\s+confiance|auto-?[ée]valuation"
+    r"|\b(?:sur|/)\s*(?:5|cinq|10|dix)\b\s*[.)]?\s*$",
+    re.IGNORECASE | re.MULTILINE)
 
 
 def _section_pattern(letter: str):
@@ -1131,7 +1137,7 @@ def _section_pattern(letter: str):
 
 def semantic_audit(text: str, case_data: dict) -> dict:
     """
-    Audit sémantique déterministe : structure A) à F), style imposé, cohérence
+    Audit sémantique déterministe : structure A) à E), style imposé, cohérence
     avec le régime spectral et honnêteté des comparaisons (règle R5). Il
     n'intervient jamais dans le badge numérique et ne remplace pas la grille
     de notation manuelle de E10.
@@ -1143,7 +1149,7 @@ def semantic_audit(text: str, case_data: dict) -> dict:
                        "passed": bool(passed), "detail": detail})
 
     missing = [s for s in _SECTION_LETTERS if not _section_pattern(s).search(text)]
-    record("S1", "Rubriques A) à F) présentes", not missing, ", ".join(missing))
+    record("S1", "Rubriques A) à E) présentes", not missing, ", ".join(missing))
     record("S2", "Aucune liste numérotée", _NUMBERED_LIST.search(text) is None)
 
     if case_data.get("model_label", "CCI-only") == "CCI-only":
@@ -1177,11 +1183,9 @@ def semantic_audit(text: str, case_data: dict) -> dict:
     record("S7", "Aucune sur-affirmation (optimum garanti, fiabilité totale)",
            _OVERCLAIM.search(text) is None)
 
-    section_f = re.search(r"(?ms)^[\s#>*_-]*F\)(.*)", text)
-    note_in_letters = bool(section_f) and any(
-        re.search(rf"\b{w}\b", section_f.group(1), re.IGNORECASE)
-        for w in _CONFIDENCE_WORDS)
-    record("S8", "Note de confiance en toutes lettres (F)", note_in_letters)
+    self_rating = _SELF_ASSESSMENT.search(text)
+    record("S8", "Aucune note ni auto-évaluation du modèle",
+           self_rating is None, self_rating.group(0) if self_rating else "")
 
     passed = sum(c["passed"] for c in checks)
     score = 100.0 * passed / len(checks) if checks else 0.0
@@ -1242,7 +1246,7 @@ Erreurs numeriques detectees :
 Donnees physiques valides :
 {allowed_summary}
 
-Redige a nouveau la reponse complete, rubriques A) a F), en remplacant chaque valeur
+Redige a nouveau la reponse complete, rubriques A) a E), en remplacant chaque valeur
 erronee par la valeur exacte des donnees ou par une formulation qualitative.
 """
     return ask_llm(correction_prompt, inter_request_delay=INTER_REQUEST_DELAY,
