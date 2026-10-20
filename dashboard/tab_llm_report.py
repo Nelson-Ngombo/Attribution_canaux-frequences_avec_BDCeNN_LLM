@@ -364,7 +364,7 @@ def render():
         empty_state(
             icon_text="[?]",
             title="Aucun resultat a analyser",
-            description="Exécutez d'abord les solveurs dans l'onglet 'Convergence' pour auditer les rèsultats.",
+            description="Exécutez d'abord les solveurs dans l'onglet 'Graphe réseau' pour auditer les rèsultats.",
         )
         return
 
