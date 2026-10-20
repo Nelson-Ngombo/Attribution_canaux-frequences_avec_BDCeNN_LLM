@@ -32,6 +32,8 @@ import os
 import time
 import json
 import itertools
+import shutil
+from datetime import datetime, timedelta
 import networkx as nx
 from matplotlib.patches import Patch
 
@@ -48,7 +50,9 @@ from metrics import (
     count_conflicts_aci,
     count_conflicts_total
 )
-from llm_assistant import audit_case, get_llm_inference_params
+from llm_assistant import (audit_case, get_llm_inference_params, make_audit_record,
+                           seconds_until_quota_reset, format_duration,
+                           _get_mode_folders, AUDIT_RECORD_SUFFIX)
 
 # --- Database Scenario Initialization ---
 try:
@@ -2407,7 +2411,183 @@ def run_experiment_E9(verbose=False):
 # ============================================================================
 # E10 - AUDIT DE FIDELITE NEURO-SYMBOLIQUE
 # ============================================================================
-def run_experiment_E10(verbose=False):
+# Statuts d'un cas E10 ; seuls les cas OK sont réutilisés lors d'une reprise
+E10_STATUSES = ("OK", "TRONQUE", "LLM_FAILED", "NOT_RUN")
+# Résidus d'une campagne LLM dans raw_responses/<régime> et reports_pdf/<régime>
+E10_ARTIFACT_PATTERNS = ("*_prompt.txt", "*_raw_response.txt", "*_corrected_v*.txt",
+                         "*_error.txt", f"*{AUDIT_RECORD_SUFFIX}", "*.pdf")
+
+
+def _archive_e10_artifacts(model_label):
+    """resume=False : déplace les fichiers de la campagne précédente vers archive_<date>/."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    moved = 0
+    for folder in _get_mode_folders(model_label):
+        archive_dir = folder / f"archive_{stamp}"
+        for pattern in E10_ARTIFACT_PATTERNS:
+            for path in folder.glob(pattern):
+                if path.is_file():
+                    archive_dir.mkdir(exist_ok=True)
+                    shutil.move(str(path), str(archive_dir / path.name))
+                    moved += 1
+    return moved
+
+
+def _load_reusable_e10_records(model_csv_dir, model_label):
+    """
+    resume=True : cas déjà audités avec Status OK, même directive et même
+    version du code, dont le JSON d'audit et la ligne solveur sont archivés.
+    La ligne solveur est reprise pour que les temps restent ceux cités par le rapport.
+    """
+    eval_path = model_csv_dir / "llm_fidelity_evaluation.csv"
+    solver_path = model_csv_dir / "solver_metrics_e10.csv"
+    if not eval_path.exists() or not solver_path.exists():
+        return {}
+    df_prev = pd.read_csv(eval_path, dtype=str, keep_default_na=False)
+    if not {"Case", "Status", "Directive Version", "Code Version"}.issubset(df_prev.columns):
+        return {}
+    df_solver_prev = pd.read_csv(solver_path)
+    directive = get_llm_inference_params()["directive_version"]
+    raw_dir, _ = _get_mode_folders(model_label)
+    reusable = {}
+    for _, row in df_prev.iterrows():
+        if (row["Status"] != "OK" or row["Directive Version"] != directive
+                or row["Code Version"] != str(config.CODE_VERSION)):
+            continue
+        record_path = raw_dir / f"{row['Case']}{AUDIT_RECORD_SUFFIX}"
+        solver_rows = df_solver_prev[df_solver_prev["case_id"].astype(str) == row["Case"]]
+        if not record_path.exists() or solver_rows.empty:
+            continue
+        with open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        if record.get("status") == "OK":
+            reusable[row["Case"]] = (record, solver_rows.iloc[0].to_dict())
+    return reusable
+
+
+def _e10_not_run_record(case, model_label, quota_state):
+    """Cas non tenté après un QUOTA_DAILY : aucun appel API, aucune valeur fabriquée."""
+    case_info = dict(case, model_label=model_label,
+                     context=case["context"] + f" [{model_label}]")
+    return make_audit_record(
+        case_info, "NOT_RUN", error_code="QUOTA_DAILY",
+        error_message=(f"Non tente : quota journalier epuise au cas "
+                       f"{quota_state['case_id']} ({quota_state['regime']})"),
+        code_version=config.CODE_VERSION)
+
+
+def _report_quota_stop(quota_state):
+    """Arrêt de campagne et délai estimé avant la réinitialisation du quota gratuit."""
+    reset_s = quota_state.get("reset_s")
+    if reset_s is None:
+        reset_s = seconds_until_quota_reset()
+    quota_state["reset_s"] = reset_s
+    if reset_s is not None:
+        reset_local = datetime.now() + timedelta(seconds=reset_s)
+        quota_state["reset_at"] = reset_local.isoformat(timespec="minutes")
+        when = f"dans {format_duration(reset_s)} (vers {reset_local:%Y-%m-%d %H:%M}, heure locale)"
+    else:
+        when = "a minuit, heure du Pacifique (fuseau indisponible : installer tzdata)"
+    print(f"[QUOTA] Quota journalier epuise au cas {quota_state['case_id']} "
+          f"({quota_state['regime']}). Aucun nouvel appel API : cas restants marques NOT_RUN. "
+          f"Reinitialisation estimee {when}. Relancer run_experiment_E10(resume=True).")
+
+
+def _short_message(message, limit=120):
+    message = " ".join(str(message or "").split())
+    return message if len(message) <= limit else message[:limit - 3] + "..."
+
+
+def _e10_fidelity_row(record):
+    """Ligne du CSV de fidélité ; un cas sans rapport porte NaN, jamais 0."""
+    status = record["status"]
+    has_report = status in ("OK", "TRONQUE")
+    params = record.get("llm_params") or {}
+
+    def report_value(key):
+        value = record.get(key)
+        return value if has_report and value is not None else np.nan
+
+    if has_report:
+        if record.get("hallucination_initial"):
+            error_type = "Hallucination: " + ", ".join(record.get("invented_initial") or [])
+            error_type += (" (uncorrected)" if record.get("hallucination_final")
+                           else f" (corrected in {record.get('correction_attempts', 0)} attempt(s))")
+        else:
+            error_type = "None"
+        if status == "TRONQUE":
+            reasons = "; ".join(record.get("truncation_reasons") or [])
+            error_type = (f"TRUNCATED: {reasons}"
+                          + ("" if error_type == "None" else f" | {error_type}"))
+        if record.get("correction_error_code"):
+            error_type += f" | correction interrompue: {record['correction_error_code']}"
+    else:
+        error_type = (f"{record.get('error_code') or 'OTHER'}: "
+                      f"{_short_message(record.get('error_message'))}")
+
+    truncated = record.get("truncated")
+    return {
+        "Case": record["case_id"],
+        "Scenario (N, K, seed)": (f"{record['scenario']} (N={record['N']}, "
+                                  f"K={record['K']}, seed={record['seed']})"),
+        "Context": record.get("context"),
+        "Status": status,
+        "Error Code": record.get("error_code") or np.nan,
+        "Hallucination Detected": (("Yes" if record.get("hallucination_initial") else "No")
+                                   if has_report else "N/A"),
+        "Correction / Error Type": error_type,
+        "Initial Accuracy Rate": report_value("accuracy_initial"),
+        "Final Accuracy Rate": report_value("accuracy_final"),
+        "Numeric Status": report_value("numeric_status"),
+        "Quadruplets Checked": report_value("quadruplets_checked"),
+        "Quadruplets Invalid": report_value("quadruplets_invalid"),
+        "Semantic Status": report_value("semantic_status"),
+        "Semantic Score": report_value("semantic_score"),
+        "Finish Reason": record.get("finish_reason") or np.nan,
+        "Truncated": ("Yes" if truncated else "No") if has_report else np.nan,
+        "Response Words": report_value("response_words"),
+        "Run Date": record.get("run_date"),
+        "LLM Model": params.get("model", "N/A"),
+        "Temperature": params.get("temperature", np.nan),
+        "Top-p": params.get("top_p", np.nan),
+        "Top-k": params.get("top_k", np.nan),
+        "Max Output Tokens": params.get("max_output_tokens", np.nan),
+        "Directive Version": (record.get("directive_version")
+                              or params.get("directive_version", "N/A")),
+        "Code Version": record.get("code_version") or config.CODE_VERSION,
+    }
+
+
+def _write_e10_campaign_summary(model_csv_dir, model_label, records, quota_state,
+                                n_reused, campaign_date):
+    """Bilan e10_campaign_summary.json du régime : comptes par statut et cas à relancer."""
+    counts = {status: 0 for status in E10_STATUSES}
+    for rec in records:
+        counts[rec["status"]] = counts.get(rec["status"], 0) + 1
+    params = get_llm_inference_params()
+    summary = {
+        "regime": model_label,
+        "campaign_date": campaign_date,
+        "written_at": datetime.now().isoformat(timespec="seconds"),
+        "llm_model": params["campaign_model"],
+        "directive_version": params["directive_version"],
+        "semantic_audit_version": params["semantic_audit_version"],
+        "code_version": config.CODE_VERSION,
+        "n_cases": len(records),
+        "counts": counts,
+        "n_reused_without_api_call": n_reused,
+        "cases_to_rerun": [rec["case_id"] for rec in records if rec["status"] != "OK"],
+        "quota_exhausted": quota_state["exhausted"],
+        "quota_exhausted_at_case": quota_state.get("case_id"),
+        "quota_reset_estimate_local": quota_state.get("reset_at"),
+    }
+    with open(model_csv_dir / "e10_campaign_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"[SUMMARY] E10/{model_csv_dir.name} : "
+          + ", ".join(f"{k} = {v}" for k, v in counts.items()))
+
+
+def run_experiment_E10(verbose=False, resume=True):
     e10_csv_dir = config.CSV_DIR / "E10"
     os.makedirs(e10_csv_dir, exist_ok=True)
     _warmup_solvers()
@@ -2441,6 +2621,10 @@ def run_experiment_E10(verbose=False):
     ]
 
     all_results = {}
+    # État partagé par les deux régimes : aucun appel API après un QUOTA_DAILY
+    quota_state = {"exhausted": False, "case_id": None, "regime": None,
+                   "reset_s": None, "reset_at": None}
+    campaign_date = datetime.now().isoformat(timespec="seconds")
 
     for model in models:
         model_name = model["name"]
@@ -2455,8 +2639,29 @@ def run_experiment_E10(verbose=False):
         # validate_results.py, qui ne doit verifier que les donnees
         # numeriques produites par le solveur et non celles du LLM.
         solver_metrics_rows = []
+        model_label = "CCI-only" if model_name == "cochannel" else "CCI+ACI"
+        raw_dir_llm, _ = _get_mode_folders(model_label)
+        # Reprise : cas OK réutilisés sans appel API ; sinon, résidus archivés
+        if resume:
+            reusable = _load_reusable_e10_records(model_csv_dir, model_label)
+            print(f"[RESUME] E10/{folder} : {len(reusable)} cas valides reutilises sans appel API.")
+        else:
+            reusable = {}
+            n_moved = _archive_e10_artifacts(model_label)
+            print(f"[ARCHIVE] E10/{folder} : {n_moved} fichier(s) de la campagne precedente archive(s).")
+        audit_records = []
 
         for case in cases_def:
+            if case["case_id"] in reusable:
+                record, solver_row = reusable[case["case_id"]]
+                audit_records.append(record)
+                solver_metrics_rows.append(solver_row)
+                print(f"[RESUME] Case {case['case_id']} ({model_name}) : rapport du "
+                      f"{record['run_date']} reutilise.")
+                continue
+            if quota_state["exhausted"]:
+                audit_records.append(_e10_not_run_record(case, model_label, quota_state))
+                continue
             print(f"[AUDIT] Running LLM analysis on case {case['case_id']} under model {model_name}...")
 
             sc_name = case["scenario"]
@@ -2715,10 +2920,25 @@ def run_experiment_E10(verbose=False):
 
             try:
                 audit_result = audit_case(case_data, max_correction_attempts=2, model_folder=model_name)
-                results_for_model.append(audit_result)
             except Exception as e:
                 print(f"[ERROR] Failed to audit case {case['case_id']} via LLM. Cause: {e}")
+                audit_records.append(make_audit_record(
+                    case_data, "LLM_FAILED", error_code="OTHER",
+                    error_message=f"{type(e).__name__}: {e}"))
                 continue
+            results_for_model.append(audit_result)
+            audit_records.append(audit_result["audit_record"])
+            if audit_result["status"] in ("OK", "TRONQUE"):
+                # Un rapport existe désormais : l'erreur d'un essai antérieur est obsolète
+                (raw_dir_llm / f"{case['case_id']}_error.txt").unlink(missing_ok=True)
+            else:
+                print(f"[LLM_FAILED] Case {case['case_id']} : {audit_result['error_code']}")
+            if "QUOTA_DAILY" in (audit_result.get("error_code"),
+                                 audit_result.get("correction_error_code")):
+                quota_state.update(exhausted=True, case_id=case["case_id"],
+                                   regime=model_label,
+                                   reset_s=audit_result.get("quota_reset_s"))
+                _report_quota_stop(quota_state)
 
         all_results[model_name] = results_for_model
 
@@ -2737,65 +2957,21 @@ def run_experiment_E10(verbose=False):
                                 llm_model=llm_params["model"], llm_inference=llm_params)
             print(f"[SUCCESS] CSV E10/{folder}/solver_metrics_e10.csv saved.")
 
-        # Export du CSV de fidelite LLM (inchange dans sa structure).
-        rows = []
-        for r in results_for_model:
-            status = r.get("status", "OK")
-            if status == "LLM_FAILED":
-                rows.append({
-                    "Case": r["case_id"],
-                    "Scenario (N, K, seed)": f"{r['scenario']} (N={r['N']}, K={r['K']}, seed={r['seed']})",
-                    "Context": r["context"],
-                    "Status": "LLM_FAILED",
-                    "Hallucination Detected": "N/A",
-                    "Correction / Error Type": "LLM Failure (Status 503) - Skip",
-                    "Initial Accuracy Rate": 0.0,
-                    "Final Accuracy Rate": 0.0,
-                })
-            else:
-                inv_detected = "Yes" if r["verification_initial"]["has_hallucination"] else "No"
-                if r["verification_initial"]["has_hallucination"]:
-                    invented_vals = ", ".join(raw for _, raw in r["verification_initial"]["invented_numbers"])
-                    type_err = f"Hallucination: {invented_vals}"
-                    if r["verification_final"]["has_hallucination"]:
-                        type_err += " (uncorrected)"
-                    else:
-                        type_err += f" (corrected in {r['correction_attempts']} attempt(s))"
-                else:
-                    type_err = "None"
-                rows.append({
-                    "Case": r["case_id"],
-                    "Scenario (N, K, seed)": f"{r['scenario']} (N={r['N']}, K={r['K']}, seed={r['seed']})",
-                    "Context": r["context"],
-                    "Status": "OK",
-                    "Hallucination Detected": inv_detected,
-                    "Correction / Error Type": type_err,
-                    "Initial Accuracy Rate": r["verification_initial"]["accuracy_rate"],
-                    "Final Accuracy Rate": r["verification_final"]["accuracy_rate"],
-                })
-        # Deux statuts distincts par cas (audit numérique, audit sémantique) et
-        # paramètres d'inférence exacts (recommandations C et E10)
-        for row, r in zip(rows, results_for_model):
-            numeric = r.get("numeric_final", {})
-            semantic = r.get("semantic_final", {})
-            params = r.get("llm_params", {})
-            row.update({
-                "Numeric Status": numeric.get("status", "N/A"),
-                "Quadruplets Checked": numeric.get("checked_quadruplets", "N/A"),
-                "Quadruplets Invalid": numeric.get("invalid_quadruplets", "N/A"),
-                "Semantic Status": semantic.get("status", "N/A"),
-                "Semantic Score": semantic.get("score", np.nan),
-                "LLM Model": params.get("model", "N/A"),
-                "Temperature": params.get("temperature", np.nan),
-                "Top-p": params.get("top_p", np.nan),
-                "Top-k": params.get("top_k", np.nan),
-                "Max Output Tokens": params.get("max_output_tokens", np.nan),
-                "Directive Version": params.get("directive_version", "N/A"),
-                "Code Version": config.CODE_VERSION,
-            })
-        df_eval = pd.DataFrame(rows)
-        df_eval.to_csv(str(model_csv_dir / "llm_fidelity_evaluation.csv"), index=False, float_format="%.2f")
+        # CSV de fidélité reconstruit sur l'ensemble des cas (réutilisés, audités,
+        # non tentés), dans l'ordre de cases_def
+        case_order = {c["case_id"]: idx for idx, c in enumerate(cases_def)}
+        audit_records.sort(key=lambda rec: case_order.get(rec["case_id"], len(case_order)))
+        df_eval = pd.DataFrame([_e10_fidelity_row(rec) for rec in audit_records])
+        # Compteurs entiers ; cellule vide (NaN) pour un cas sans rapport
+        for col in ("Quadruplets Checked", "Quadruplets Invalid", "Response Words",
+                    "Top-k", "Max Output Tokens"):
+            if col in df_eval.columns:
+                df_eval[col] = pd.to_numeric(df_eval[col], errors="coerce").round().astype("Int64")
+        df_eval.to_csv(str(model_csv_dir / "llm_fidelity_evaluation.csv"), index=False,
+                       float_format="%.2f")
         print(f"[SUCCESS] CSV E10/{folder}/llm_fidelity_evaluation.csv saved.")
+        _write_e10_campaign_summary(model_csv_dir, model_label, audit_records, quota_state,
+                                    len(reusable), campaign_date)
 
     _validate_if_available("E10")
     print("\n" + "=" * 80)

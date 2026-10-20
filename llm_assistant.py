@@ -20,7 +20,7 @@ import time
 import random
 import threading
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from enum import Enum
 import numpy as np
@@ -59,8 +59,16 @@ LLM_CAMPAIGN_FIXED_MODEL = True
 LLM_CAMPAIGN_MODEL = GOOGLE_MODEL_PREFERRED
 # Version de la directive, archivée hors prompt pour ne pas polluer la whitelist
 ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.3"
+# Typologie des échecs d'appel, reportée telle quelle dans le CSV E10
+LLM_ERROR_CODES = ("QUOTA_DAILY", "RATE_LIMIT", "UNAVAILABLE", "TIMEOUT",
+                   "EMPTY_RESPONSE", "TRUNCATED", "OTHER")
+# Quota gratuit Gemini réinitialisé à minuit, heure du Pacifique
+QUOTA_RESET_TIMEZONE = "America/Los_Angeles"
+# Résumé JSON d'un cas E10, relu lors d'une reprise de campagne
+AUDIT_RECORD_SUFFIX = "_audit.json"
 
 from config import LLM_LOGS_DIR, FIGURES_DIR, CSV_DIR
+from verifier import extract_metric_claims, check_channel_claims
 
 LLM_LOGS_DIR = Path(LLM_LOGS_DIR)
 LLM_LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -661,24 +669,95 @@ def _extract_text_from_response(response) -> str:
     return ""
 
 
-def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
-            inter_request_delay: float = INTER_REQUEST_DELAY,
-            allow_fallback: bool = True) -> str:
+def _classify_sdk_error(error_msg: str) -> str:
+    """Code d'échec normalisé à partir du message d'erreur du SDK."""
+    upper = (error_msg or "").upper()
+    if "PERDAY" in upper or "PER_DAY" in upper:
+        return "QUOTA_DAILY"
+    if "429" in upper or "RESOURCE_EXHAUSTED" in upper:
+        return "RATE_LIMIT"
+    if "503" in upper or "UNAVAILABLE" in upper or "OVERLOADED" in upper:
+        return "UNAVAILABLE"
+    if "DEADLINE_EXCEEDED" in upper or "504" in upper:
+        return "TIMEOUT"
+    return "OTHER"
+
+
+def _parse_retry_seconds(error_msg: str):
+    """Délai de relance annoncé par l'API (« retry in 1h2m3.5s » ou retryDelay), en secondes."""
+    match = re.search(r"retry\s+in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(\d+(?:\.\d+)?)s",
+                      error_msg or "", re.IGNORECASE)
+    if match:
+        hours, minutes, seconds = match.groups()
+        return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds)
+    match = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", error_msg or "")
+    return float(match.group(1)) if match else None
+
+
+def seconds_until_quota_reset(now: datetime = None):
+    """Secondes avant le prochain minuit du Pacifique ; None si le fuseau est indisponible."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(QUOTA_RESET_TIMEZONE)
+    except Exception:
+        # Windows sans le paquet tzdata
+        return None
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (next_midnight - now).total_seconds()
+
+
+def format_duration(seconds) -> str:
+    if seconds is None:
+        return "duree inconnue"
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    return f"{minutes} min {secs:02d} s" if minutes else f"{secs} s"
+
+
+def _extract_finish_reason(response):
+    """finish_reason du premier candidat (STOP, MAX_TOKENS, SAFETY...), ou None."""
+    try:
+        reason = response.candidates[0].finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if reason is None:
+        return None
+    return str(getattr(reason, "name", reason)).split(".")[-1].upper()
+
+
+def ask_llm_detailed(prompt: str, timeout: int = 180, max_retries: int = 8,
+                     inter_request_delay: float = INTER_REQUEST_DELAY,
+                     allow_fallback: bool = True) -> dict:
+    """
+    Appel LLM avec typologie explicite des échecs (LLM_ERROR_CODES). Le texte
+    n'est renvoyé qu'en cas de succès ; finish_reason est conservé pour que
+    l'appelant détecte la troncature.
+    """
+    result = {"text": "", "error_code": None, "error_message": "",
+              "finish_reason": None, "retry_after_s": None,
+              "quota_reset_s": None, "model": ""}
+
+    def _fail(code, message, **extra):
+        result.update(error_code=code, error_message=message, **extra)
+        return result
+
     ensure_init_started()
     status = _get_status()
 
     if status == LLMStatus.UNAVAILABLE:
-        err = get_initialization_error()
-        return f"[ERREUR LLM] Assistant indisponible. {err}"
+        return _fail("OTHER", f"Assistant indisponible. {get_initialization_error()}")
 
     if status in (LLMStatus.NOT_STARTED, LLMStatus.INITIALIZING):
         waited = 0.0
         while _get_status() == LLMStatus.INITIALIZING and waited < 30.0:
             time.sleep(1.0)
             waited += 1.0
-
         if _get_status() != LLMStatus.AVAILABLE:
-            return "[ERREUR LLM] Connexion en cours. Reessayez."
+            return _fail("OTHER", "Connexion en cours. Reessayez.")
 
     if inter_request_delay > 0:
         time.sleep(inter_request_delay)
@@ -697,70 +776,76 @@ def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
         candidates = [LLM_CAMPAIGN_MODEL]
 
     tried_models = set()
-    last_error = None
+    last_code, last_error = "OTHER", None
     empty_response_count = 0
-    current_max_tokens = LLM_MAX_OUTPUT_TOKENS
 
     for attempt in range(1, max_retries + 1):
-        model_to_try = next(
-            (c for c in candidates if c not in tried_models),
-            candidates[0]
-        )
+        model_to_try = next((c for c in candidates if c not in tried_models), candidates[0])
+        result["model"] = model_to_try.replace("models/", "")
 
         response, error_type, error_msg = _call_with_timeout(
-            model_to_try=model_to_try,
-            prompt=prompt,
-            max_tokens=current_max_tokens,
-            timeout_seconds=LLM_TIMEOUT_SECONDS,
+            model_to_try=model_to_try, prompt=prompt,
+            max_tokens=LLM_MAX_OUTPUT_TOKENS, timeout_seconds=LLM_TIMEOUT_SECONDS,
         )
 
-        if error_type == "TIMEOUT":
+        if error_type in ("TIMEOUT", "SDK_ERROR"):
             last_error = error_msg
+            last_code = ("TIMEOUT" if error_type == "TIMEOUT"
+                         else _classify_sdk_error(error_msg))
+            retry_after = _parse_retry_seconds(error_msg)
+            # Quota journalier : toute relance échouerait jusqu'à la réinitialisation
+            if last_code == "QUOTA_DAILY":
+                reset_s = seconds_until_quota_reset()
+                return _fail(
+                    "QUOTA_DAILY",
+                    f"Quota journalier gratuit du modele {result['model']} epuise. "
+                    f"Reinitialisation estimee dans {format_duration(reset_s)}.",
+                    retry_after_s=retry_after, quota_reset_s=reset_s)
             tried_models.add(model_to_try)
             if attempt < max_retries:
-                time.sleep(2 + random.uniform(0, 2))
-            continue
-
-        if error_type == "SDK_ERROR":
-            last_error = error_msg
-            error_str = error_msg.upper()
-            # Quota journalier épuisé : toute relance échouerait jusqu'à la réinitialisation
-            if "PERDAY" in error_str:
-                retry_match = re.search(r"retry in ((?:\d+h)?(?:\d+m)?\d+)", error_msg)
-                retry_text = (f" Nouvel essai possible dans {retry_match.group(1)}s."
-                              if retry_match else "")
-                return (f"[ERREUR LLM] Quota journalier gratuit du modele "
-                        f"{model_to_try.replace('models/', '')} epuise.{retry_text}")
-            is_transient = any(
-                code in error_str
-                for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
-                             "404", "NOT_FOUND", "DEADLINE_EXCEEDED"]
-            )
-            tried_models.add(model_to_try)
-
-            if attempt < max_retries:
-                wait = 1 + random.uniform(0, 3) if is_transient else min(30, 2 ** attempt)
+                if last_code == "RATE_LIMIT" and retry_after:
+                    # Limite par minute : attente du délai annoncé plutôt qu'un tirage court
+                    wait = min(retry_after + 1.0, 65.0)
+                elif last_code in ("RATE_LIMIT", "UNAVAILABLE", "TIMEOUT"):
+                    wait = 1 + random.uniform(0, 3)
+                else:
+                    wait = min(30, 2 ** attempt)
                 time.sleep(wait)
             continue
 
+        finish_reason = _extract_finish_reason(response)
+        result["finish_reason"] = finish_reason
         extracted = _extract_text_from_response(response)
-
         if extracted:
             with _state_lock:
                 _state["last_successful_model"] = model_to_try
-            return extracted
+            result["text"] = extracted
+            return result
 
         empty_response_count += 1
-        last_error = f"Reponse vide de '{model_to_try}'"
+        last_code = "EMPTY_RESPONSE"
+        last_error = f"Reponse vide de '{result['model']}' (finish_reason = {finish_reason})"
         tried_models.add(model_to_try)
-
-        if empty_response_count >= 3:
-            return "[ERREUR LLM] Echec reponses vides consecutives."
-
+        # Budget consommé par le raisonnement interne : à température nulle, une
+        # relance reproduirait le même échec et entamerait le quota journalier
+        if finish_reason == "MAX_TOKENS" or empty_response_count >= 3:
+            return _fail("EMPTY_RESPONSE", last_error)
         if attempt < max_retries:
             time.sleep(2 + random.uniform(0, 2))
 
-    return f"[ERREUR LLM] Echec total {max_retries} tentatives. Detail : {last_error}"
+    return _fail(last_code, f"Echec apres {max_retries} tentatives. Detail : {last_error}")
+
+
+def ask_llm(prompt: str, timeout: int = 180, max_retries: int = 8,
+            inter_request_delay: float = INTER_REQUEST_DELAY,
+            allow_fallback: bool = True) -> str:
+    """Interface texte historique : le code d'échec suit le préfixe [ERREUR LLM]."""
+    result = ask_llm_detailed(prompt, timeout=timeout, max_retries=max_retries,
+                              inter_request_delay=inter_request_delay,
+                              allow_fallback=allow_fallback)
+    if result["error_code"]:
+        return f"[ERREUR LLM] {result['error_code']} : {result['error_message']}"
+    return result["text"]
 
 
 # -----------------------------------------------------------------------------
@@ -1019,39 +1104,10 @@ def _claimed_scenario(text: str, position: int):
 def _extract_structured_claims(text: str) -> list:
     """Extrait les quadruplets (scénario, méthode, métrique, valeur) du texte LLM."""
     claims = []
-    for pattern, kind in STRUCTURED_CLAIM_PATTERNS:
-        for match in pattern.finditer(text):
-            groups = match.groups()
-            try:
-                value = float(groups[-1].replace(",", "."))
-            except ValueError:
-                continue
-
-            if kind == "cost":
-                method = groups[0]
-                metric = "cost"
-            elif kind == "time":
-                method = groups[0]
-                metric = "time"
-            elif kind == "conflict_metric":
-                raw = groups[0].upper().replace("\\", "").replace("{", "").replace("}", "")
-                method = groups[1]
-                if raw == "C_CCI":
-                    metric = "C_CCI"
-                elif raw == "C_ACI":
-                    metric = "C_ACI"
-                else:
-                    metric = "C_tot"
-            else:
-                continue
-
-            claims.append({
-                "scenario": _claimed_scenario(text, match.start()),
-                "method": method,
-                "metric": metric,
-                "value":  value,
-                "raw":    match.group(0),
-            })
+    # Motifs élargis : méthode cherchée avant ou après la métrique (verifier.py)
+    for claim in extract_metric_claims(text):
+        claim["scenario"] = _claimed_scenario(text, claim["start"])
+        claims.append(claim)
     return claims
 
 
@@ -1081,30 +1137,44 @@ def verify_structured_claims(text: str, case_data: dict,
         )
         (valid if matched else invalid).append(claim)
 
+    # Attribution « cellule i / canal c » fausse : quadruplet invalide
+    channel_claims = check_channel_claims(text, case_data.get("allocations", {}), case_scenario)
+    for claim in channel_claims:
+        claim["scenario_explicit"] = False
+        (valid if claim.pop("valid") else invalid).append(claim)
+
+    total = len(claims) + len(channel_claims)
     return {
-        "valid_claims":         valid,
-        "invalid_claims":       invalid,
-        "has_structured_error": len(invalid) > 0,
-        "total_claims":         len(claims),
-        "accuracy_rate_struct": (len(valid) / len(claims) * 100.0) if claims else 100.0,
+        "valid_claims":           valid,
+        "invalid_claims":         invalid,
+        "has_structured_error":   len(invalid) > 0,
+        "total_claims":           total,
+        "channel_claims_checked": len(channel_claims),
+        "accuracy_rate_struct":   (len(valid) / total * 100.0) if total else 100.0,
     }
 
 
-def numeric_certification(verification: dict, structured: dict = None) -> dict:
+def numeric_certification(verification: dict, structured: dict = None,
+                          truncated: bool = False) -> dict:
     """
     Badge de l'audit numérique : la whitelist ET les quadruplets doivent être
-    conformes. Tout chiffre halluciné ou mal attribué bloque la certification.
+    conformes. Un rapport tronqué n'est jamais certifié (motif TRONQUE).
     """
     structured = structured or {}
     invalid = structured.get("invalid_claims", [])
-    if verification.get("has_hallucination") or invalid:
-        status = "NON_CERTIFIE"
+    if truncated:
+        status, reason = "NON_CERTIFIE", "TRONQUE"
+    elif verification.get("has_hallucination") or invalid:
+        status, reason = "NON_CERTIFIE", "VALEURS"
     elif not verification.get("all_numbers"):
-        status = "AVERTISSEMENT"
+        status, reason = "AVERTISSEMENT", "AUCUNE_VALEUR"
     else:
-        status = "CERTIFIE"
+        status, reason = "CERTIFIE", ""
     return {
         "status": status,
+        "reason": reason,
+        # Libellé affiché (PDF, CSV) : le motif TRONQUE reste visible
+        "label": f"{status} (TRONQUE)" if reason == "TRONQUE" else status,
         "certified": status == "CERTIFIE",
         "invented_count": len(verification.get("invented_numbers", [])),
         "checked_quadruplets": int(structured.get("total_claims", 0)),
@@ -1116,7 +1186,7 @@ def numeric_certification(verification: dict, structured: dict = None) -> dict:
 # -----------------------------------------------------------------------------
 # C-ter. AUDIT SÉMANTIQUE (séparé de l'audit numérique)
 # -----------------------------------------------------------------------------
-SEMANTIC_AUDIT_VERSION = "SEM-1.1"
+SEMANTIC_AUDIT_VERSION = "SEM-1.2"
 
 _SECTION_LETTERS = ("A", "B", "C", "D", "E")
 _NUMBERED_LIST = re.compile(r"(?m)^\s*\d+[.)]\s")
@@ -1124,6 +1194,19 @@ _OVERCLAIM = re.compile(
     r"optimum\s+global\s+(?:est\s+)?(?:garanti|certain)|fiable\s+[àa]\s+100"
     r"|garanti[t]?\s+l['’]optim|parfaitement\s+optimal",
     re.IGNORECASE)
+# Primauté face à une baseline, confrontée ensuite au coût réel de cette baseline
+_SUPERIORITY_CLAIM = re.compile(
+    r"BD-CeNN(?P<span>[^.\n]{0,120}?)\b(?P<word>sup[ée]rieure?s?|meilleure?s?"
+    r"|surpass(?:e|ent)|surclass(?:e|ent)|devanc(?:e|ent))\b"
+    r"(?P<tail>[^.\n]{0,80}?)\b(?P<baseline>Random|Greedy|DSATUR)\b",
+    re.IGNORECASE)
+# « coût supérieur à DSATUR » décrit honnêtement un coût plus élevé
+_COST_NOUN_BEFORE = re.compile(
+    r"(?:co[ûu]t|J\s*\(|conflits?|temps|[ée]nergie|C_)[^.\n]{0,15}$", re.IGNORECASE)
+_NEGATION = re.compile(r"\bne\b|\bn['’]|\bpas\b|\bjamais\b|\baucun", re.IGNORECASE)
+_GUARANTEE_WORD = re.compile(
+    r"\b(garantie?s?|garantit|garantissent|assurer?|assurent)\b", re.IGNORECASE)
+_TERMINAL_PUNCTUATION = re.compile(r"[.!?…][\s\"'»)\]*_]*$")
 # Le rapport restitue des résultats : toute note ou auto-évaluation est proscrite
 _SELF_ASSESSMENT = re.compile(
     r"note\s+de\s+confiance|niveau\s+de\s+confiance|auto-?[ée]valuation"
@@ -1132,21 +1215,77 @@ _SELF_ASSESSMENT = re.compile(
 
 
 def _section_pattern(letter: str):
-    return re.compile(rf"(?m)^[\s#>*_-]*{letter}\)")
+    return re.compile(rf"(?m)^[\s#>*_-]*{letter})")
 
 
-def semantic_audit(text: str, case_data: dict) -> dict:
+def _section_text(text: str, letter: str) -> str:
+    """Contenu d'une rubrique, de sa lettre jusqu'à la rubrique suivante présente."""
+    start = _section_pattern(letter).search(text)
+    if not start:
+        return ""
+    following = [m.start() for s in _SECTION_LETTERS[_SECTION_LETTERS.index(letter) + 1:]
+                 for m in [_section_pattern(s).search(text, start.end())] if m]
+    return text[start.end():min(following) if following else len(text)]
+
+
+def detect_truncation(text: str, finish_reason: str = None) -> dict:
+    """
+    Rapport tronqué si l'API signale MAX_TOKENS, si une rubrique A) à E) manque
+    ou si la dernière phrase n'est pas terminée par une ponctuation finale.
+    """
+    reasons = []
+    finish = (finish_reason or "").upper() or None
+    if finish == "MAX_TOKENS":
+        reasons.append("finish_reason = MAX_TOKENS")
+    missing = [s for s in _SECTION_LETTERS if not _section_pattern(s).search(text or "")]
+    if missing:
+        reasons.append("rubrique(s) absente(s) : " + ", ".join(missing))
+    if not _TERMINAL_PUNCTUATION.search((text or "").rstrip()):
+        reasons.append("derniere phrase inachevee")
+    return {"truncated": bool(reasons), "reasons": reasons,
+            "missing_sections": missing, "finish_reason": finish}
+
+
+def _false_superiority(text: str, cheaper: list) -> list:
+    """BD-CeNN déclaré supérieur à une baseline dont le coût est strictement inférieur."""
+    cheaper_upper = {name.upper() for name in cheaper}
+    hits = []
+    for match in _SUPERIORITY_CLAIM.finditer(text):
+        if match.group("baseline").upper() not in cheaper_upper:
+            continue
+        if (match.group("word").lower().startswith("sup")
+                and _COST_NOUN_BEFORE.search(match.group("span"))):
+            continue
+        if _NEGATION.search(match.group("span")[-20:] + " " + match.group("tail")[:12]):
+            continue
+        hits.append(f"{match.group('word')} / {match.group('baseline')}")
+    return hits
+
+
+def _unhedged_guarantees(text: str) -> list:
+    """Garanties affirmées ; les formes niées (« ne garantit pas ») sont admises."""
+    hits = []
+    for match in _GUARANTEE_WORD.finditer(text):
+        context = text[max(0, match.start() - 25):match.start()] + " " + \
+            text[match.end():match.end() + 8]
+        if not _NEGATION.search(context) and "sans" not in context.lower():
+            hits.append(match.group(1))
+    return hits
+
+
+def semantic_audit(text: str, case_data: dict, truncated: bool = False) -> dict:
     """
     Audit sémantique déterministe : structure A) à E), style imposé, cohérence
-    avec le régime spectral et honnêteté des comparaisons (règle R5). Il
-    n'intervient jamais dans le badge numérique et ne remplace pas la grille
-    de notation manuelle de E10.
+    avec le régime spectral et honnêteté des comparaisons (règle R5). Sur un
+    rapport tronqué, S4 à S6 sont NON EVALUABLES et sortent du score. Il
+    n'intervient jamais dans le badge numérique.
     """
     checks = []
 
-    def record(code, label, passed, detail=""):
+    def record(code, label, passed, detail="", evaluable=True):
         checks.append({"code": code, "label": label,
-                       "passed": bool(passed), "detail": detail})
+                       "passed": bool(passed) if evaluable else False,
+                       "evaluable": evaluable, "detail": detail})
 
     missing = [s for s in _SECTION_LETTERS if not _section_pattern(s).search(text)]
     record("S1", "Rubriques A) à E) présentes", not missing, ", ".join(missing))
@@ -1165,38 +1304,54 @@ def semantic_audit(text: str, case_data: dict) -> dict:
     faster = [n for n, b in baselines.items()
               if bd_time is not None and b.get("time", np.inf) < bd_time]
     if faster:
-        record("S4", "Baseline plus rapide reconnue (R5)",
-               any(n in text for n in faster), ", ".join(faster))
+        label_s4 = "Baseline plus rapide reconnue en rubrique C (R5)"
+        if truncated:
+            record("S4", label_s4, False, "rapport tronque", evaluable=False)
+        else:
+            section_c = _section_text(text, "C")
+            record("S4", label_s4,
+                   bool(section_c) and any(n in section_c for n in faster),
+                   ", ".join(faster) if section_c else "rubrique C absente")
 
     bd_cost = metrics.get("cost_final")
     cheaper = [n for n, b in baselines.items()
                if bd_cost is not None and b.get("cost", np.inf) < bd_cost]
     if cheaper:
-        record("S5", "Baseline de coût inférieur reconnue (R5)",
-               all(n in text for n in cheaper), ", ".join(cheaper))
-        false_primacy = re.search(
-            r"BD-CeNN[^.\n]{0,80}(?:co[ûu]t|J\(x)[^.\n]{0,40}le\s+plus\s+(?:bas|faible)",
-            text, re.IGNORECASE)
-        record("S6", "Aucune primauté de coût revendiquée à tort",
-               false_primacy is None, ", ".join(cheaper))
+        label_s5 = "Baseline de coût inférieur reconnue (R5)"
+        label_s6 = "Aucune primauté de coût revendiquée à tort"
+        if truncated:
+            record("S5", label_s5, False, "rapport tronque", evaluable=False)
+            record("S6", label_s6, False, "rapport tronque", evaluable=False)
+        else:
+            record("S5", label_s5, all(n in text for n in cheaper), ", ".join(cheaper))
+            lowest_cost_claim = re.search(
+                r"BD-CeNN[^.\n]{0,80}(?:co[ûu]t|J\(x)[^.\n]{0,40}le\s+plus\s+(?:bas|faible)",
+                text, re.IGNORECASE)
+            violations = _false_superiority(text, cheaper)
+            if lowest_cost_claim:
+                violations.append("cout le plus bas")
+            record("S6", label_s6, not violations, ", ".join(violations))
 
-    record("S7", "Aucune sur-affirmation (optimum garanti, fiabilité totale)",
-           _OVERCLAIM.search(text) is None)
+    overclaims = [m.group(0) for m in _OVERCLAIM.finditer(text)] + _unhedged_guarantees(text)
+    record("S7", "Aucune sur-affirmation (optimum garanti, garantit, assure, fiabilité totale)",
+           not overclaims, ", ".join(overclaims))
 
     self_rating = _SELF_ASSESSMENT.search(text)
     record("S8", "Aucune note ni auto-évaluation du modèle",
            self_rating is None, self_rating.group(0) if self_rating else "")
 
-    passed = sum(c["passed"] for c in checks)
-    score = 100.0 * passed / len(checks) if checks else 0.0
-    if passed == len(checks):
+    evaluated = [c for c in checks if c["evaluable"]]
+    passed = sum(c["passed"] for c in evaluated)
+    score = 100.0 * passed / len(evaluated) if evaluated else 0.0
+    if evaluated and passed == len(evaluated):
         status = "SEMANTIQUE_OK"
     elif score >= 75.0:
         status = "SEMANTIQUE_RESERVES"
     else:
         status = "SEMANTIQUE_ECHEC"
     return {"status": status, "score": score, "checks": checks,
-            "version": SEMANTIC_AUDIT_VERSION}
+            "version": SEMANTIC_AUDIT_VERSION, "truncated": truncated,
+            "n_not_evaluable": len(checks) - len(evaluated)}
 
 def regenerate_with_correction(case_data: dict, original_prompt: str,
                                 llm_response: str, verification: dict,
@@ -1264,6 +1419,7 @@ def generate_pdf_report(
     verification_struct_initial: dict = None,
     verification_struct_final: dict = None,
     semantic_final: dict = None,
+    truncation: dict = None,
 ) -> None:
     """
     [FIX-REPORT] Rapport PDF d'audit LLM enrichi :
@@ -1340,6 +1496,12 @@ def generate_pdf_report(
         ["Directive", f"Zero-Hallucination {llm_params['directive_version']}, "
                       f"audit semantique {llm_params['semantic_audit_version']}"],
         ["Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        # Complétude de la réponse, visible dès l'en-tête
+        ["Reponse LLM", Paragraph(
+            f"<b>TRONQUE</b> ({'; '.join(truncation['reasons'])})"
+            if truncation and truncation.get("truncated")
+            else f"complete (finish_reason = {(truncation or {}).get('finish_reason') or '-'})",
+            style_body)],
     ]
     header_table = Table(header_data, colWidths=[4*cm, 12*cm])
     header_table.setStyle(TableStyle([
@@ -1352,8 +1514,13 @@ def generate_pdf_report(
     story.append(Spacer(1, 0.4*cm))
 
     # Deux statuts distincts : audit numérique (bloquant) et audit sémantique
-    numeric = numeric_certification(verification_final, verification_struct_final)
-    if numeric["status"] == "NON_CERTIFIE":
+    is_truncated = bool(truncation and truncation.get("truncated"))
+    numeric = numeric_certification(verification_final, verification_struct_final,
+                                    truncated=is_truncated)
+    if numeric["reason"] == "TRONQUE":
+        badge = ('<font color="#b30000"><b>AUDIT NUMERIQUE : NON CERTIFIE (TRONQUE)</b></font> - '
+                 'reponse interrompue avant sa fin, conservee telle quelle sans correction.')
+    elif numeric["status"] == "NON_CERTIFIE":
         badge = (f'<font color="#b30000"><b>AUDIT NUMERIQUE : NON CERTIFIE</b></font> - '
                  f'{numeric["invented_count"]} valeur(s) hors whitelist, '
                  f'{numeric["invalid_quadruplets"]} quadruplet(s) mal attribue(s).')
@@ -1368,7 +1535,9 @@ def generate_pdf_report(
     if semantic_final:
         story.append(Paragraph(
             f'<b>AUDIT SEMANTIQUE : {semantic_final["status"]}</b> - score '
-            f'{semantic_final["score"]:.1f}% ({semantic_final["version"]}, non bloquant).',
+            f'{semantic_final["score"]:.1f}% ({semantic_final["version"]}, non bloquant'
+            + (f', {semantic_final["n_not_evaluable"]} controle(s) non evaluable(s)'
+               if semantic_final.get("n_not_evaluable") else "") + ').',
             style_body))
     story.append(Spacer(1, 0.4*cm))
 
@@ -1497,8 +1666,10 @@ def generate_pdf_report(
         ],
         [
             "Statut numerique",
-            numeric_certification(verification_initial, verification_struct_initial)["status"],
-            numeric_certification(verification_final, verification_struct_final)["status"],
+            numeric_certification(verification_initial, verification_struct_initial,
+                                  truncated=is_truncated)["label"],
+            numeric_certification(verification_final, verification_struct_final,
+                                  truncated=is_truncated)["label"],
         ],
     ]
     audit_table = Table(audit_data, colWidths=[7*cm, 4.5*cm, 4.5*cm])
@@ -1537,7 +1708,9 @@ def generate_pdf_report(
         sem_rows = [["Code", "Controle", "Resultat"]]
         for check in semantic_final["checks"]:
             sem_rows.append([check["code"], Paragraph(check["label"], style_body),
-                             "OK" if check["passed"] else f"ECHEC {check['detail']}".strip()])
+                             ("NON EVALUABLE" if not check.get("evaluable", True)
+                              else "OK" if check["passed"]
+                              else f"ECHEC {check['detail']}".strip())])
         sem_table = Table(sem_rows, colWidths=[1.5*cm, 10*cm, 4.5*cm])
         sem_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d6d")),
@@ -1567,6 +1740,48 @@ def generate_pdf_report(
 # E. MASTER AUDIT PIPELINE
 # -----------------------------------------------------------------------------
 
+def make_audit_record(case_data: dict, status: str, error_code: str = None,
+                      error_message: str = "", finish_reason: str = None,
+                      llm_params: dict = None, **fields) -> dict:
+    """
+    Résumé sérialisable d'un cas E10, seule source du CSV de fidélité et de la
+    reprise de campagne. Un cas sans rapport garde ses indicateurs à None.
+    """
+    params = llm_params or get_llm_inference_params()
+    record = {
+        "case_id": case_data.get("case_id"),
+        "scenario": case_data.get("scenario"),
+        "N": case_data.get("N"), "K": case_data.get("K"), "seed": case_data.get("seed"),
+        "context": case_data.get("context"),
+        "model_label": case_data.get("model_label", "CCI-only"),
+        "status": status,
+        "error_code": error_code,
+        "error_message": error_message,
+        "finish_reason": finish_reason,
+        "truncated": None, "truncation_reasons": [],
+        "response_words": None,
+        "run_date": datetime.now().isoformat(timespec="seconds"),
+        "hallucination_initial": None, "invented_initial": [], "hallucination_final": None,
+        "accuracy_initial": None, "accuracy_final": None,
+        "numeric_status": None, "quadruplets_checked": None, "quadruplets_invalid": None,
+        "semantic_status": None, "semantic_score": None,
+        "correction_attempts": 0, "correction_error_code": None,
+        "llm_params": params,
+        "directive_version": params.get("directive_version"),
+        "code_version": (case_data.get("run_metadata") or {}).get("code_version"),
+        "pdf_path": None,
+    }
+    record.update(fields)
+    return record
+
+
+def save_audit_record(record: dict, raw_dir) -> Path:
+    path = Path(raw_dir) / f"{record['case_id']}{AUDIT_RECORD_SUFFIX}"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False, default=str)
+    return path
+
+
 def audit_case(case_data: dict, max_correction_attempts: int = 2,
                model_folder: str = "cochannel") -> dict:
     case_id = case_data.get("case_id", "unknown")
@@ -1580,42 +1795,60 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
     with open(raw_dir / f"{case_id}_prompt.txt", "w", encoding="utf-8") as f:
         f.write(prompt)
 
-    raw_response = ask_llm(prompt, allow_fallback=allow_fallback)
+    call = ask_llm_detailed(prompt, allow_fallback=allow_fallback)
+    llm_params = get_llm_inference_params()
+    base_result = {
+        "case_id": case_id, "scenario": case_data.get("scenario"),
+        "N": case_data.get("N"), "K": case_data.get("K"),
+        "seed": case_data.get("seed"), "context": case_data.get("context"),
+        "model_label": model_label, "llm_params": llm_params,
+        "error_code": call["error_code"], "finish_reason": call["finish_reason"],
+        "retry_after_s": call["retry_after_s"], "quota_reset_s": call["quota_reset_s"],
+    }
 
-    if raw_response.startswith("[ERREUR LLM]"):
+    if call["error_code"]:
+        error_text = f"[ERREUR LLM] {call['error_code']} : {call['error_message']}"
         with open(raw_dir / f"{case_id}_error.txt", "w", encoding="utf-8") as f:
-            f.write(raw_response)
+            f.write(error_text)
+        # Aucun indicateur fabriqué : taux et statuts restent indéfinis (NaN au CSV)
         empty_verif = {
             "all_numbers": [], "allowed_numbers": set(),
             "valid_numbers": [], "invented_numbers": [],
-            "has_hallucination": False, "accuracy_rate": 0.0,
+            "has_hallucination": False, "accuracy_rate": float("nan"),
         }
+        record = make_audit_record(case_data, "LLM_FAILED", call["error_code"],
+                                   call["error_message"], call["finish_reason"], llm_params)
+        save_audit_record(record, raw_dir)
         return {
-            "case_id": case_id, "scenario": case_data.get("scenario"),
-            "N": case_data.get("N"), "K": case_data.get("K"),
-            "seed": case_data.get("seed"), "context": case_data.get("context"),
-            "model_label": model_label,
-            "raw_response": raw_response, "corrected_response": raw_response,
+            **base_result,
+            "raw_response": error_text, "corrected_response": error_text,
             "verification_initial": empty_verif, "verification_final": empty_verif,
-            "correction_attempts": 0, "pdf_path": None, "status": "LLM_FAILED",
-            "llm_params": get_llm_inference_params(),
+            "correction_attempts": 0, "correction_error_code": None,
+            "truncated": None, "pdf_path": None, "status": "LLM_FAILED",
+            "audit_record": record,
         }
 
+    raw_response = call["text"]
     with open(raw_dir / f"{case_id}_raw_response.txt", "w", encoding="utf-8") as f:
         f.write(raw_response)
+
+    truncation = detect_truncation(raw_response, call["finish_reason"])
+    truncated = truncation["truncated"]
     verification_initial = verify_numbers(raw_response, case_data)
     verification_struct_initial = verify_structured_claims(raw_response, case_data)
-    numeric_initial = numeric_certification(verification_initial, verification_struct_initial)
+    numeric_initial = numeric_certification(verification_initial, verification_struct_initial,
+                                            truncated=truncated)
 
     corrected_response = raw_response
     verification_final = verification_initial
     verification_struct_final = verification_struct_initial
     numeric_final = numeric_initial
     correction_attempts = 0
+    correction_error_code = None
 
-    # La boucle porte sur la certification numérique combinée : un chiffre
+    # Rapport tronqué : conservé tel quel, sans correction. Sinon, un chiffre
     # inventé OU un quadruplet mal attribué déclenche la régénération.
-    while (numeric_final["status"] == "NON_CERTIFIE"
+    while (not truncated and numeric_final["status"] == "NON_CERTIFIE"
            and correction_attempts < max_correction_attempts):
         correction_attempts += 1
         candidate = regenerate_with_correction(
@@ -1623,21 +1856,24 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
             structured_verification=verification_struct_final,
         )
         if candidate.startswith("[ERREUR LLM]"):
+            code_match = re.match(r"\[ERREUR LLM\] ([A-Z_]+)", candidate)
+            correction_error_code = code_match.group(1) if code_match else "OTHER"
+            break
+        with open(raw_dir / f"{case_id}_corrected_v{correction_attempts}.txt", "w",
+                  encoding="utf-8") as f:
+            f.write(candidate)
+        # Correction elle-même tronquée : la version précédente, complète, est conservée
+        if detect_truncation(candidate)["truncated"]:
+            correction_error_code = "TRUNCATED"
             break
         corrected_response = candidate
         verification_final = verify_numbers(corrected_response, case_data)
         verification_struct_final = verify_structured_claims(corrected_response, case_data)
         numeric_final = numeric_certification(verification_final, verification_struct_final)
-        with open(raw_dir / f"{case_id}_corrected_v{correction_attempts}.txt", "w", encoding="utf-8") as f:
-            f.write(corrected_response)
 
-    semantic_final = semantic_audit(corrected_response, case_data)
-    llm_params = get_llm_inference_params()
-
+    semantic_final = semantic_audit(corrected_response, case_data, truncated=truncated)
     pdf_path = reports_dir / f"rapport_{case_id}_{case_data.get('scenario')}.pdf"
 
-    # [FIX-REPORT] Enrichissement du case_data avec le compteur de tentatives
-    # pour que generate_pdf_report puisse l'afficher.
     case_data_with_attempts = dict(case_data)
     case_data_with_attempts["correction_attempts"] = correction_attempts
 
@@ -1649,13 +1885,35 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
         verification_struct_initial=verification_struct_initial,
         verification_struct_final=verification_struct_final,
         semantic_final=semantic_final,
+        truncation=truncation,
     )
 
+    status = "TRONQUE" if truncated else "OK"
+    record = make_audit_record(
+        case_data, status, "TRUNCATED" if truncated else None,
+        "; ".join(truncation["reasons"]), call["finish_reason"], llm_params,
+        truncated=truncated,
+        truncation_reasons=truncation["reasons"],
+        response_words=len(raw_response.split()),
+        hallucination_initial=bool(verification_initial["has_hallucination"]),
+        invented_initial=[raw for _, raw in verification_initial["invented_numbers"]],
+        hallucination_final=bool(verification_final["has_hallucination"]),
+        accuracy_initial=float(verification_initial["accuracy_rate"]),
+        accuracy_final=float(verification_final["accuracy_rate"]),
+        numeric_status=numeric_final["label"],
+        quadruplets_checked=int(numeric_final["checked_quadruplets"]),
+        quadruplets_invalid=int(numeric_final["invalid_quadruplets"]),
+        semantic_status=semantic_final["status"],
+        semantic_score=float(semantic_final["score"]),
+        correction_attempts=correction_attempts,
+        correction_error_code=correction_error_code,
+        pdf_path=str(pdf_path),
+    )
+    save_audit_record(record, raw_dir)
+
     return {
-        "case_id": case_id, "scenario": case_data.get("scenario"),
-        "N": case_data.get("N"), "K": case_data.get("K"),
-        "seed": case_data.get("seed"), "context": case_data.get("context"),
-        "model_label": model_label,
+        **base_result,
+        "error_code": record["error_code"],
         "raw_response": raw_response, "corrected_response": corrected_response,
         "verification_initial": verification_initial,
         "verification_final": verification_final,
@@ -1664,7 +1922,9 @@ def audit_case(case_data: dict, max_correction_attempts: int = 2,
         "numeric_initial": numeric_initial,
         "numeric_final": numeric_final,
         "semantic_final": semantic_final,
-        "llm_params": llm_params,
         "correction_attempts": correction_attempts,
-        "pdf_path": str(pdf_path), "status": "OK",
+        "correction_error_code": correction_error_code,
+        "truncated": truncated, "truncation": truncation,
+        "pdf_path": str(pdf_path), "status": status,
+        "audit_record": record,
     }

@@ -150,20 +150,29 @@ def _generate_llm_report(mode: str):
     sm.set_value(f"llm_case_data_{mode}", case_data)
 
     try:
-        from llm_assistant import build_prompt, ask_llm
+        from llm_assistant import build_prompt, ask_llm_detailed, detect_truncation
         prompt = build_prompt(case_data)
 
         with st.spinner(f"Interrogation du LLM pour {MODE_LABELS[mode]}..."):
-            response = ask_llm(prompt)
+            call = ask_llm_detailed(prompt)
 
+        # Même typologie d'échec que la campagne E10 (QUOTA_DAILY, UNAVAILABLE...)
+        sm.set_value(f"llm_error_code_{mode}", call["error_code"])
+        response = (f"[ERREUR LLM] {call['error_code']} : {call['error_message']}"
+                    if call["error_code"] else call["text"])
         sm.set_value(f"llm_response_{mode}", response)
 
         # Échec d'appel : aucun audit sur un message d'erreur
-        if response.startswith("[ERREUR LLM]"):
-            for stale_key in ("audit_report", "audit_struct", "numeric_status", "audit_semantic"):
+        if call["error_code"]:
+            for stale_key in ("audit_report", "audit_struct", "numeric_status",
+                              "audit_semantic", "llm_truncation"):
                 sm.set_value(f"{stale_key}_{mode}", None)
-            toast.error("Le LLM n'a pas produit de rapport (voir le detail).")
+            toast.error(f"Le LLM n'a pas produit de rapport ({call['error_code']}).")
             return
+
+        # Rapport interrompu : affiché, jamais certifié
+        truncation = detect_truncation(response, call["finish_reason"])
+        sm.set_value(f"llm_truncation_{mode}", truncation)
 
         from llm_assistant import (verify_structured_claims, semantic_audit,
                                    get_llm_inference_params)
@@ -180,13 +189,17 @@ def _generate_llm_report(mode: str):
         # (scénario, méthode, métrique, valeur)
         audit_struct = verify_structured_claims(response, case_data)
         sm.set_value(f"audit_struct_{mode}", audit_struct)
-        numeric_status = combine_numeric_status(audit, audit_struct)
+        numeric_status = ("TRUNCATED" if truncation["truncated"]
+                          else combine_numeric_status(audit, audit_struct))
         sm.set_value(f"numeric_status_{mode}", numeric_status)
 
         # Audit sémantique séparé, sans effet sur la certification numérique
-        sm.set_value(f"audit_semantic_{mode}", semantic_audit(response, case_data))
+        sm.set_value(f"audit_semantic_{mode}",
+                     semantic_audit(response, case_data, truncated=truncation["truncated"]))
 
-        if numeric_status == "CERTIFIED":
+        if numeric_status == "TRUNCATED":
+            toast.warning("Rapport TRONQUE : affiche sans certification numerique")
+        elif numeric_status == "CERTIFIED":
             toast.success(f"Rapport genere et certifie ({MODE_LABELS[mode]})")
         elif numeric_status == "FAILED":
             toast.warning(
@@ -201,14 +214,32 @@ def _generate_llm_report(mode: str):
         render_error_box(type(e).__name__, str(e), traceback.format_exc())
 
 
-def _render_audit_badge(audit_report, numeric_status=None, n_invalid_quadruplets=0):
+def _render_audit_badge(audit_report, numeric_status=None, n_invalid_quadruplets=0,
+                        truncation=None):
     if audit_report is None:
         info_banner("Aucun audit realise.", kind="info")
         return
 
     # Statut combiné (whitelist + quadruplets) prioritaire sur la seule whitelist
     status = numeric_status or audit_report.status
-    if status == "CERTIFIED":
+    if status == "TRUNCATED":
+        # Un rapport tronqué n'affiche jamais CERTIFIE
+        reasons = "; ".join((truncation or {}).get("reasons", [])) or "reponse incomplete"
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+                        border-left: 4px solid #dc2626; padding: 1rem; border-radius: 8px;">
+                <div style="font-size: 1.1rem; font-weight: 700; color: #991b1b;">
+                    TRONQUE - RAPPORT NON CERTIFIE
+                </div>
+                <div style="color: #b91c1c; font-size: 0.9rem; margin-top: 0.3rem;">
+                    Reponse interrompue ({reasons}). Aucun chiffre n'est certifie.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif status == "CERTIFIED":
         st.markdown(
             f"""
             <div style="background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
@@ -295,7 +326,9 @@ def _render_semantic_badge(semantic):
         f"({semantic['version']}, non bloquant)"
     )
     for check in semantic["checks"]:
-        if not check["passed"]:
+        if not check.get("evaluable", True):
+            st.caption(f"{check['code']} : {check['label']} (NON EVALUABLE, rapport tronque)")
+        elif not check["passed"]:
             st.caption(f"{check['code']} : {check['label']} ({check['detail']})")
 
 
@@ -401,6 +434,10 @@ def render():
         if response.startswith("[ERREUR LLM]") or response.startswith("[LLM_ERROR]"):
             st.error(response)
         else:
+            truncation = sm.get(f"llm_truncation_{mode}")
+            if truncation and truncation.get("truncated"):
+                st.warning("**TRONQUE** : rapport interrompu avant sa fin ("
+                           + "; ".join(truncation["reasons"]) + "). Il n'est pas certifie.")
             if sm.get(f"numeric_status_{mode}") == "FAILED":
                 st.error("Rapport NON CERTIFIE numeriquement : aucun de ses chiffres ne doit "
                          "etre repris (voir le detail des divergences).")
@@ -413,6 +450,7 @@ def render():
             audit_report,
             numeric_status=sm.get(f"numeric_status_{mode}"),
             n_invalid_quadruplets=len(struct_report["invalid_claims"]) if struct_report else 0,
+            truncation=sm.get(f"llm_truncation_{mode}"),
         )
         section_title("Audit semantique (non bloquant)")
         _render_semantic_badge(sm.get(f"audit_semantic_{mode}"))

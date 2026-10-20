@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from verifier import ResponseVerifier
+from verifier import ResponseVerifier, extract_metric_claims, check_channel_claims
 
 
 @pytest.fixture
@@ -137,3 +137,50 @@ class TestAudit:
         assert report.valid_count >= 1
         assert report.invented_count >= 1
         assert 0 < report.accuracy_rate < 100
+
+
+class TestStructuredClaims:
+    """Formulations observées dans la campagne E10 (rapports #1 à #7)."""
+
+    @pytest.mark.parametrize("sentence, method, metric, value", [
+        ("Random affiche un cout J = 66.00", "Random", "cost", 66.0),
+        ("Greedy avec un cout J de 8.00", "Greedy", "cost", 8.0),
+        ("DSATUR obtient un cout de 9.00", "DSATUR", "cost", 9.0),
+        ("C_CCI = 26 pour Greedy", "Greedy", "C_CCI", 26.0),
+        ("Random enregistre un temps t_exec de 0.0379 ms", "Random", "time", 0.0379),
+    ])
+    def test_required_sentences(self, sentence, method, metric, value):
+        claims = extract_metric_claims(sentence)
+        assert len(claims) == 1
+        assert (claims[0]["method"], claims[0]["metric"]) == (method, metric)
+        assert claims[0]["value"] == pytest.approx(value)
+
+    def test_legacy_phrasing_still_recognized(self):
+        claims = extract_metric_claims("le coût du BD-CeNN vaut 19,30")
+        assert [(c["method"], c["value"]) for c in claims] == [("BD-CeNN", 19.3)]
+
+    def test_two_methods_in_one_sentence(self):
+        text = "BD-CeNN atteint un coût de 13.00, contre un coût de 9.00 pour DSATUR."
+        assert [(c["method"], c["value"]) for c in extract_metric_claims(text)] == [
+            ("BD-CeNN", 13.0), ("DSATUR", 9.0)]
+
+    def test_claim_without_method_is_ignored(self):
+        assert extract_metric_claims("Le coût moyen vaut 12.") == []
+
+
+class TestChannelClaims:
+    """Attributions de canaux confrontées au vecteur d'affectation (cas #2)."""
+
+    allocations = {"BD-CeNN": [0, 1, 2, 0, 1], "Greedy": [1, 0, 2, 1, 0]}
+
+    @pytest.mark.parametrize("sentence, expected_valid", [
+        ("La cellule 3 recoit le canal 2.", False),
+        ("La cellule 3 recoit le canal 0.", True),
+        ("Le canal 2 est attribue a la cellule 2.", True),
+        ("Sous Greedy, la cellule 0 occupe le canal 1.", True),
+        ("La cellule 9 est placee sur le canal 0.", False),
+    ])
+    def test_channel_assignment(self, sentence, expected_valid):
+        claims = check_channel_claims(sentence, self.allocations)
+        assert len(claims) == 1
+        assert claims[0]["valid"] is expected_valid

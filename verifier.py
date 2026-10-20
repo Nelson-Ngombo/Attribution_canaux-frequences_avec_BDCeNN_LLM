@@ -12,6 +12,156 @@ from data_structures.audit_report import AuditReport, AuditVerification
 
 NUMBER_REGEX = re.compile(r"-?\d+(?:[.,]\d+)?")
 
+# -----------------------------------------------------------------------------
+# Revendications structurées (méthode, métrique, valeur) et attributions de canaux
+# -----------------------------------------------------------------------------
+METHOD_NAMES = ("BD-CeNN", "Greedy", "DSATUR", "Random")
+_METHOD_ALTERNATION = "|".join(re.escape(name) for name in METHOD_NAMES)
+_METHOD_TOKEN = re.compile(rf"(?<![\w-])({_METHOD_ALTERNATION})(?![\w-])", re.IGNORECASE)
+_CANONICAL_METHOD = {name.lower(): name for name in METHOD_NAMES}
+
+_METRIC_PATTERNS = {
+    "C_CCI": r"C_\{?CCI\}?",
+    "C_ACI": r"C_\{?ACI\}?",
+    "C_tot": r"C_\{?tot(?:al)?\}?",
+    "time": (r"temps(?:\s+d['’]ex[ée]cution)?(?:\s+de\s+calcul)?(?:\s+t_\{?exec\}?)?"
+             r"|t_\{?exec\}?"),
+    "cost": (r"co[ûu]t(?:\s+(?:final|initial|global|total|[ée]nerg[ée]tique))?"
+             r"(?:\s+J(?:\s*\(\s*x\s*\*?\s*\)|_\{?0\}?)?)?"
+             r"|[ée]nergie(?:\s+finale|\s+initiale)?|J\s*\(\s*x\s*\*?\s*\)|J_\{?0\}?"),
+}
+_METRIC_ALTERNATION = "|".join(f"(?P<{name}>{pattern})"
+                               for name, pattern in _METRIC_PATTERNS.items())
+_CLAIM_SEPARATOR = (r"(?:=|:|\bde\b|\bvaut\b|\best\s+de\b|\best\b|\batteint\b|\baffiche\b"
+                    r"|\bobtient\b|\benregistre\b|\bs['’][ée]l[èe]ve\s+[àa]"
+                    r"|\bs['’][ée]tablit\s+[àa])")
+# Métrique, séparateur, valeur ; la méthode est résolue autour du motif
+_METRIC_CLAIM = re.compile(
+    rf"(?<!\w)(?:{_METRIC_ALTERNATION})(?P<between>[^.\n;=\d]{{0,30}}?)\s*{_CLAIM_SEPARATOR}"
+    r"\s*(?:d['’]environ\s+|environ\s+|seulement\s+)?"
+    r"(?P<value>-?\d+(?:[.,]\d+)?)(?!\d|[.,]\d)(?!\s*%)",
+    re.IGNORECASE)
+_METHOD_AFTER_VALUE = re.compile(
+    r"\s*(?:ms|s)?\s*\)?\s*,?\s*\(?\s*(?:pour|du|de|chez|avec|par|obtenu\s+par|atteint\s+par)\s+"
+    r"(?:la\s+m[ée]thode\s+|l['’]heuristique\s+|l['’]algorithme\s+|le\s+solveur\s+)?"
+    rf"({_METHOD_ALTERNATION})(?![\w-])", re.IGNORECASE)
+METHOD_WINDOW_WORDS = 6
+_CLAIM_SENTENCE_BREAK = re.compile(r"[.!?;](?=\s|$)|\n")
+
+
+def _sentence_bounds(text: str, position: int) -> tuple:
+    start = 0
+    for brk in _CLAIM_SENTENCE_BREAK.finditer(text, 0, position):
+        start = brk.end()
+    end_match = _CLAIM_SENTENCE_BREAK.search(text, position)
+    return start, (end_match.start() if end_match else len(text))
+
+
+def _resolve_method(text, match, sentence_start, window_start, sentence_end):
+    """
+    Ordre de priorité : méthode interne au motif (« coût du BD-CeNN »), puis
+    introduite après la valeur (« = 26 pour Greedy »), puis dernière méthode
+    des METHOD_WINDOW_WORDS mots précédents, enfin sujet unique de la phrase.
+    """
+    inside = _METHOD_TOKEN.search(match.group("between") or "")
+    if inside:
+        return _CANONICAL_METHOD[inside.group(1).lower()]
+    after = _METHOD_AFTER_VALUE.match(text, match.end(), sentence_end)
+    if after:
+        return _CANONICAL_METHOD[after.group(1).lower()]
+    words = text[window_start:match.start()].split()[-METHOD_WINDOW_WORDS:]
+    before = _METHOD_TOKEN.findall(" ".join(words))
+    if before:
+        return _CANONICAL_METHOD[before[-1].lower()]
+    subjects = {m.lower() for m in _METHOD_TOKEN.findall(text[sentence_start:match.start()])}
+    return _CANONICAL_METHOD[subjects.pop()] if len(subjects) == 1 else None
+
+
+def extract_metric_claims(text: str) -> list:
+    """Revendications (méthode, métrique, valeur) ; sans méthode identifiable, rien n'est retenu."""
+    claims = []
+    previous_end, previous_sentence = 0, None
+    for match in _METRIC_CLAIM.finditer(text):
+        sentence_start, sentence_end = _sentence_bounds(text, match.start())
+        # La fenêtre avant ne remonte pas au-delà de la revendication précédente
+        window_start = (max(sentence_start, previous_end)
+                        if previous_sentence == sentence_start else sentence_start)
+        method = _resolve_method(text, match, sentence_start, window_start, sentence_end)
+        previous_end, previous_sentence = match.end(), sentence_start
+        if method is None:
+            continue
+        metric = next(name for name in _METRIC_PATTERNS if match.group(name))
+        claims.append({
+            "method": method,
+            "metric": metric,
+            "value": float(match.group("value").replace(",", ".")),
+            "raw": match.group(0),
+            "start": match.start(),
+        })
+    return claims
+
+
+_CELL_MENTION = re.compile(r"(?<!\w)cellule\s+(\d+)(?!\d)", re.IGNORECASE)
+_CHANNEL_MENTION = re.compile(r"(?<!\w)canal\s+(\d+)(?!\d|[.,]\d)", re.IGNORECASE)
+_SEGMENT_STOP = re.compile(r"[!?;\n]|\.(?!\d)|cellule|canaux|voisin", re.IGNORECASE)
+_ASSIGNMENT_VERB = re.compile(r"attribu|affect|allou|assign", re.IGNORECASE)
+CHANNEL_SEARCH_CHARS = 45
+
+
+def _channel_after(text, cell_match):
+    """« cellule i ... canal c », sans autre cellule ni fin de phrase entre les deux."""
+    end = min(len(text), cell_match.end() + CHANNEL_SEARCH_CHARS)
+    stop = _SEGMENT_STOP.search(text, cell_match.end(), end)
+    if stop:
+        end = stop.start()
+    found = _CHANNEL_MENTION.search(text, cell_match.end())
+    return found if found and found.start() < end else None
+
+
+def _channel_before(text, cell_match):
+    """« canal c attribué à la cellule i » : verbe d'affectation obligatoire."""
+    segment_start = max(0, cell_match.start() - CHANNEL_SEARCH_CHARS)
+    for stop in _SEGMENT_STOP.finditer(text, segment_start, cell_match.start()):
+        segment_start = stop.end()
+    if not _ASSIGNMENT_VERB.search(text, segment_start, cell_match.start()):
+        return None
+    found = list(_CHANNEL_MENTION.finditer(text, segment_start, cell_match.start()))
+    return found[-1] if found else None
+
+
+def check_channel_claims(text: str, allocations: dict, scenario: str = "") -> list:
+    """
+    Confronte chaque attribution « cellule i / canal c » au vecteur de la méthode
+    nommée dans la phrase (BD-CeNN si aucune). Une attribution fausse ou une
+    cellule hors réseau donne un quadruplet invalide.
+    """
+    claims = []
+    for cell_match in _CELL_MENTION.finditer(text):
+        channel_match = _channel_after(text, cell_match) or _channel_before(text, cell_match)
+        if channel_match is None:
+            continue
+        cell, channel = int(cell_match.group(1)), int(channel_match.group(1))
+        sentence_start, sentence_end = _sentence_bounds(text, cell_match.start())
+        named = list(dict.fromkeys(
+            _CANONICAL_METHOD[m.lower()]
+            for m in _METHOD_TOKEN.findall(text[sentence_start:sentence_end])))
+        candidates = named or ["BD-CeNN"]
+        matched = [m for m in candidates
+                   if cell < len(allocations.get(m, []))
+                   and int(allocations[m][cell]) == channel]
+        start = min(cell_match.start(), channel_match.start())
+        end = max(cell_match.end(), channel_match.end())
+        claims.append({
+            "scenario": scenario,
+            "method": matched[0] if matched else candidates[0],
+            "metric": f"canal[cellule {cell}]",
+            "value": float(channel),
+            "raw": text[start:end],
+            "start": start,
+            "valid": bool(matched),
+        })
+    return claims
+
 
 class ResponseVerifier:
     """
