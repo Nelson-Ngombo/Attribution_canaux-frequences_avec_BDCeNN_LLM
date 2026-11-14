@@ -408,7 +408,7 @@ def render():
             "Générer le rapport LLM",
             type="primary",
             use_container_width=True,
-            disabled=(not is_llm_available()),
+            disabled=(not is_llm_available() or is_model_locked()),
             key="btn_gen_llm",
         ):
             _generate_llm_report(mode)

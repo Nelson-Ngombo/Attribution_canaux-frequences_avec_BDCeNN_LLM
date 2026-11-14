@@ -52,7 +52,8 @@ from metrics import (
 )
 from llm_assistant import (audit_case, get_llm_inference_params, make_audit_record,
                            seconds_until_quota_reset, format_duration,
-                           _get_mode_folders, AUDIT_RECORD_SUFFIX)
+                           _get_mode_folders, AUDIT_RECORD_SUFFIX,
+                           lock_campaign_model, CAMPAIGN_STOP_ERROR_CODES)
 
 # --- Database Scenario Initialization ---
 try:
@@ -2447,12 +2448,15 @@ def _load_reusable_e10_records(model_csv_dir, model_label):
     if not {"Case", "Status", "Directive Version", "Code Version"}.issubset(df_prev.columns):
         return {}
     df_solver_prev = pd.read_csv(solver_path)
-    directive = get_llm_inference_params()["directive_version"]
+    params = get_llm_inference_params()
+    directive, current_model = params["directive_version"], params["model"]
     raw_dir, _ = _get_mode_folders(model_label)
     reusable = {}
     for _, row in df_prev.iterrows():
+        # Un rapport n'est réutilisable que pour le même modèle, la même directive et le même code
         if (row["Status"] != "OK" or row["Directive Version"] != directive
-                or row["Code Version"] != str(config.CODE_VERSION)):
+                or row["Code Version"] != str(config.CODE_VERSION)
+                or row.get("LLM Model") != current_model):
             continue
         record_path = raw_dir / f"{row['Case']}{AUDIT_RECORD_SUFFIX}"
         solver_rows = df_solver_prev[df_solver_prev["case_id"].astype(str) == row["Case"]]
@@ -2466,18 +2470,33 @@ def _load_reusable_e10_records(model_csv_dir, model_label):
 
 
 def _e10_not_run_record(case, model_label, quota_state):
-    """Cas non tenté après un QUOTA_DAILY : aucun appel API, aucune valeur fabriquée."""
+    """Cas non tenté après un arrêt de campagne : aucun appel API, aucune valeur fabriquée."""
+    stop_code = quota_state.get("error_code") or "QUOTA_DAILY"
     case_info = dict(case, model_label=model_label,
                      context=case["context"] + f" [{model_label}]")
     return make_audit_record(
-        case_info, "NOT_RUN", error_code="QUOTA_DAILY",
-        error_message=(f"Non tente : quota journalier epuise au cas "
+        case_info, "NOT_RUN", error_code=stop_code,
+        error_message=(f"Non tente : arret de campagne ({stop_code}) au cas "
                        f"{quota_state['case_id']} ({quota_state['regime']})"),
         code_version=config.CODE_VERSION)
 
 
+def _previous_e10_model(model_csv_dir):
+    """Modèle de la campagne précédente du régime, lu dans e10_campaign_summary.json."""
+    try:
+        with open(model_csv_dir / "e10_campaign_summary.json", encoding="utf-8") as f:
+            return json.load(f).get("llm_model")
+    except (OSError, ValueError):
+        return None
+
+
 def _report_quota_stop(quota_state):
     """Arrêt de campagne et délai estimé avant la réinitialisation du quota gratuit."""
+    if quota_state.get("error_code") == "CREDIT_EXHAUSTED":
+        print(f"[CREDIT] Credit API epuise au cas {quota_state['case_id']} "
+              f"({quota_state['regime']}). Aucun nouvel appel : cas restants marques NOT_RUN. "
+              f"Recharger le compte puis relancer run_experiment_E10(resume=True).")
+        return
     reset_s = quota_state.get("reset_s")
     if reset_s is None:
         reset_s = seconds_until_quota_reset()
@@ -2578,6 +2597,7 @@ def _write_e10_campaign_summary(model_csv_dir, model_label, records, quota_state
         "n_reused_without_api_call": n_reused,
         "cases_to_rerun": [rec["case_id"] for rec in records if rec["status"] != "OK"],
         "quota_exhausted": quota_state["exhausted"],
+        "stop_error_code": quota_state.get("error_code"),
         "quota_exhausted_at_case": quota_state.get("case_id"),
         "quota_reset_estimate_local": quota_state.get("reset_at"),
     }
@@ -2588,6 +2608,15 @@ def _write_e10_campaign_summary(model_csv_dir, model_label, records, quota_state
 
 
 def run_experiment_E10(verbose=False, resume=True):
+    # Modèle gelé pendant toute la campagne : le sélecteur du dashboard est désactivé
+    lock_campaign_model(True)
+    try:
+        return _run_experiment_E10_locked(verbose=verbose, resume=resume)
+    finally:
+        lock_campaign_model(False)
+
+
+def _run_experiment_E10_locked(verbose=False, resume=True):
     e10_csv_dir = config.CSV_DIR / "E10"
     os.makedirs(e10_csv_dir, exist_ok=True)
     _warmup_solvers()
@@ -2623,8 +2652,10 @@ def run_experiment_E10(verbose=False, resume=True):
     all_results = {}
     # État partagé par les deux régimes : aucun appel API après un QUOTA_DAILY
     quota_state = {"exhausted": False, "case_id": None, "regime": None,
-                   "reset_s": None, "reset_at": None}
+                   "error_code": None, "reset_s": None, "reset_at": None}
     campaign_date = datetime.now().isoformat(timespec="seconds")
+    campaign_model = get_llm_inference_params()["campaign_model"]
+    print(f"[E10] Modele de campagne : {campaign_model}")
 
     for model in models:
         model_name = model["name"]
@@ -2642,7 +2673,14 @@ def run_experiment_E10(verbose=False, resume=True):
         model_label = "CCI-only" if model_name == "cochannel" else "CCI+ACI"
         raw_dir_llm, _ = _get_mode_folders(model_label)
         # Reprise : cas OK réutilisés sans appel API ; sinon, résidus archivés
-        if resume:
+        previous_model = _previous_e10_model(model_csv_dir)
+        if resume and previous_model and previous_model != campaign_model:
+            # Changement de modèle : aucun rapport réutilisable, résidus de l'autre modèle archivés
+            reusable = {}
+            n_moved = _archive_e10_artifacts(model_label)
+            print(f"[ARCHIVE] E10/{folder} : modele {previous_model} remplace par "
+                  f"{campaign_model}, {n_moved} fichier(s) archive(s).")
+        elif resume:
             reusable = _load_reusable_e10_records(model_csv_dir, model_label)
             print(f"[RESUME] E10/{folder} : {len(reusable)} cas valides reutilises sans appel API.")
         else:
@@ -2933,10 +2971,12 @@ def run_experiment_E10(verbose=False, resume=True):
                 (raw_dir_llm / f"{case['case_id']}_error.txt").unlink(missing_ok=True)
             else:
                 print(f"[LLM_FAILED] Case {case['case_id']} : {audit_result['error_code']}")
-            if "QUOTA_DAILY" in (audit_result.get("error_code"),
-                                 audit_result.get("correction_error_code")):
+            stop_code = next((code for code in (audit_result.get("error_code"),
+                                                audit_result.get("correction_error_code"))
+                              if code in CAMPAIGN_STOP_ERROR_CODES), None)
+            if stop_code:
                 quota_state.update(exhausted=True, case_id=case["case_id"],
-                                   regime=model_label,
+                                   regime=model_label, error_code=stop_code,
                                    reset_s=audit_result.get("quota_reset_s"))
                 _report_quota_stop(quota_state)
 

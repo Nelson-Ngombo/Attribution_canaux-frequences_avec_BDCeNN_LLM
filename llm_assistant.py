@@ -36,10 +36,44 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip().strip('"').strip("'")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip().strip('"').strip("'")
 
 # Modèle unique recommandé par l'encadreur : aucune substitution, ni en dashboard ni en E10
 GOOGLE_MODEL_PREFERRED = "models/gemini-3.6-flash"
 GOOGLE_MODEL_FALLBACKS = []
+
+# Catalogue du sélecteur : (identifiant API, fournisseur, libellé). Seuls les modèles
+# qui rédigent du texte (generateContent ou Messages API) sont proposés.
+LLM_MODEL_CATALOG = [
+    ("claude-haiku-5-5", "anthropic", "Claude Haiku 5.5 (Anthropic)"),
+    ("claude-sonnet-5-5", "anthropic", "Claude Sonnet 5.5 (Anthropic)"),
+    ("models/gemini-4-argon", "google", "Gemini 4 Argon (experimental)"),
+    ("models/gemini-3.8-flash", "google", "Gemini 3.8 Flash"),
+    ("models/gemini-3.7-flash", "google", "Gemini 3.7 Flash"),
+    ("models/gemini-3.6-flash", "google", "Gemini 3.6 Flash"),
+    ("models/gemini-3.5-flash", "google", "Gemini 3.5 Flash"),
+    ("models/gemini-3.5-flash-lite", "google", "Gemini 3.5 Flash-Lite"),
+    ("models/gemini-3.1-pro-preview", "google", "Gemini 3.1 Pro (preview)"),
+    ("models/gemini-3.1-pro-preview-customtools", "google", "Gemini 3.1 Pro custom tools (preview)"),
+    ("models/gemini-3.1-flash-lite", "google", "Gemini 3.1 Flash-Lite"),
+    ("models/gemini-3.1-flash-lite-preview", "google", "Gemini 3.1 Flash-Lite (preview)"),
+    ("models/gemini-3-flash-preview", "google", "Gemini 3 Flash (preview)"),
+    ("models/gemini-2.5-pro", "google", "Gemini 2.5 Pro"),
+    ("models/gemini-2.5-flash", "google", "Gemini 2.5 Flash"),
+    ("models/gemini-2.5-flash-lite", "google", "Gemini 2.5 Flash-Lite"),
+    # Alias mobiles : version réelle non figée, à éviter pour une campagne E10
+    ("models/gemini-pro-latest", "google", "Gemini Pro latest (alias)"),
+    ("models/gemini-flash-latest", "google", "Gemini Flash latest (alias)"),
+    ("models/gemini-flash-lite-latest", "google", "Gemini Flash-Lite latest (alias)"),
+    ("models/gemma-4-31b-it", "google", "Gemma 4 31B"),
+    ("models/gemma-4-26b-a4b-it", "google", "Gemma 4 26B A4B"),
+]
+LLM_MODEL_PROVIDERS = {model_id: provider for model_id, provider, _ in LLM_MODEL_CATALOG}
+# Codes d'échec qui interrompent une campagne E10 : plus aucun appel ne peut aboutir
+CAMPAIGN_STOP_ERROR_CODES = ("QUOTA_DAILY", "CREDIT_EXHAUSTED")
+# Messages API : stop_reason ramené au vocabulaire finish_reason déjà audité
+_ANTHROPIC_STOP_REASONS = {"end_turn": "STOP", "stop_sequence": "STOP",
+                           "max_tokens": "MAX_TOKENS", "refusal": "SAFETY"}
 
 INTER_REQUEST_DELAY = 3.0
 LLM_TIMEOUT_SECONDS = 45
@@ -60,8 +94,8 @@ LLM_CAMPAIGN_MODEL = GOOGLE_MODEL_PREFERRED
 # Version de la directive, archivée hors prompt pour ne pas polluer la whitelist
 ZERO_HALLUCINATION_DIRECTIVE_VERSION = "ZH-1.3"
 # Typologie des échecs d'appel, reportée telle quelle dans le CSV E10
-LLM_ERROR_CODES = ("QUOTA_DAILY", "RATE_LIMIT", "UNAVAILABLE", "TIMEOUT",
-                   "EMPTY_RESPONSE", "TRUNCATED", "OTHER")
+LLM_ERROR_CODES = ("QUOTA_DAILY", "CREDIT_EXHAUSTED", "RATE_LIMIT", "UNAVAILABLE",
+                   "TIMEOUT", "EMPTY_RESPONSE", "TRUNCATED", "OTHER")
 # Quota gratuit Gemini réinitialisé à minuit, heure du Pacifique
 QUOTA_RESET_TIMEZONE = "America/Los_Angeles"
 # Résumé JSON d'un cas E10, relu lors d'une reprise de campagne
@@ -76,6 +110,8 @@ LLM_REPORTS_DIR = LLM_LOGS_DIR / "reports_pdf"
 LLM_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 LLM_RAW_DIR = LLM_LOGS_DIR / "raw_responses"
 LLM_RAW_DIR.mkdir(parents=True, exist_ok=True)
+# Dernier modèle choisi dans le dashboard, relu au redémarrage
+LLM_SELECTED_MODEL_FILE = LLM_LOGS_DIR / "selected_model.json"
 
 
 # -----------------------------------------------------------------------------
@@ -100,6 +136,13 @@ _state = {
     "error_message": "",
     "probe_progress": "",
     "init_thread_started": False,
+    "anthropic_client": None,
+    # Incrémenté à chaque changement de modèle : une sonde périmée ne publie rien
+    "init_generation": 0,
+    # Vrai pendant une campagne E10 : le sélecteur ne peut plus changer de modèle
+    "model_locked": False,
+    # Compteur de verrous (campagne et enveloppe E10) : le modèle n'est libéré qu'à zéro
+    "model_lock_depth": 0,
 }
 
 
@@ -142,16 +185,112 @@ def _get_active_model_internal() -> str:
         return _state["active_model"] or ""
 
 
-def _probe_single_model(client, model_name: str, types_module) -> bool:
-    """
-    Envoie un ping réseau léger pour vérifier l'accès au modèle.
-    """
+def get_model_provider(model_name: str) -> str:
+    """Fournisseur d'un identifiant ; un nom hors catalogue suit son préfixe."""
+    if model_name in LLM_MODEL_PROVIDERS:
+        return LLM_MODEL_PROVIDERS[model_name]
+    return "anthropic" if (model_name or "").startswith("claude") else "google"
+
+
+def get_model_catalog() -> list:
+    return [{"id": model_id, "provider": provider, "label": label}
+            for model_id, provider, label in LLM_MODEL_CATALOG]
+
+
+def _load_selected_model() -> str:
+    try:
+        model = json.loads(LLM_SELECTED_MODEL_FILE.read_text(encoding="utf-8")).get("model")
+    except (OSError, ValueError, AttributeError):
+        model = None
+    return model if model in LLM_MODEL_PROVIDERS else GOOGLE_MODEL_PREFERRED
+
+
+_state["active_model"] = _load_selected_model()
+
+
+def set_active_model(model_name: str) -> bool:
+    """Change le modèle de session et relance la sonde ; refusé pendant une campagne E10."""
+    if model_name not in LLM_MODEL_PROVIDERS:
+        return False
+    with _state_lock:
+        if _state["model_locked"]:
+            return False
+        if (_state["active_model"] == model_name
+                and _state["status"] != LLMStatus.UNAVAILABLE):
+            return True
+        _state.update(active_model=model_name, last_successful_model=None,
+                      error_message="", status=LLMStatus.NOT_STARTED,
+                      init_thread_started=False)
+        _state["init_generation"] += 1
+    try:
+        LLM_SELECTED_MODEL_FILE.write_text(json.dumps({"model": model_name}), encoding="utf-8")
+    except OSError:
+        pass
+    ensure_init_started()
+    return True
+
+
+def lock_campaign_model(locked: bool) -> str:
+    """Gèle ou libère le modèle actif ; renvoie l'identifiant concerné."""
+    with _state_lock:
+        if locked:
+            _state["model_lock_depth"] += 1
+        else:
+            _state["model_lock_depth"] = max(0, _state["model_lock_depth"] - 1)
+        _state["model_locked"] = _state["model_lock_depth"] > 0
+        return _state["active_model"] or ""
+
+
+def is_model_locked() -> bool:
+    with _state_lock:
+        return _state["model_locked"]
+
+
+def _init_provider_client(provider: str):
+    """Client du fournisseur, créé une seule fois puis réutilisé : (client, erreur)."""
+    key = "anthropic_client" if provider == "anthropic" else "client"
+    with _state_lock:
+        if _state[key] is not None:
+            return _state[key], ""
+    if provider == "anthropic":
+        try:
+            import anthropic
+        except ImportError:
+            return None, "Le package 'anthropic' est requis (pip install anthropic)."
+        if not ANTHROPIC_API_KEY:
+            return None, "La variable ANTHROPIC_API_KEY est manquante dans .env"
+        try:
+            # Relances gérées par ask_llm_detailed : le SDK ne doit pas les masquer
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=0)
+        except Exception as e:
+            return None, f"Erreur d'initialisation du client Anthropic : {e}"
+    else:
+        try:
+            from google import genai
+        except ImportError:
+            return None, "Le package 'google-genai' est requis pour ce module."
+        if not GOOGLE_API_KEY:
+            return None, "La variable GOOGLE_API_KEY est manquante dans .env"
+        try:
+            client = genai.Client(api_key=GOOGLE_API_KEY)
+        except Exception as e:
+            return None, f"Erreur d'initialisation du client : {e}"
+    with _state_lock:
+        _state[key] = client
+    return client, ""
+
+
+def _probe_single_model(client, model_name: str, types_module,
+                        provider: str = "google") -> bool:
+    """Ping léger : lecture des métadonnées du modèle, sans consommer de quota de génération."""
     result = {"ok": False}
 
     def _ping():
         try:
-            # Lecture des métadonnées du modèle : vérifie l'accès sans consommer le quota de génération
-            client.models.get(model=model_name)
+            if provider == "anthropic":
+                client.models.retrieve(model_name)
+            else:
+                client.models.get(model=model_name)
             result["ok"] = True
         except Exception:
             result["ok"] = False
@@ -165,72 +304,44 @@ def _probe_single_model(client, model_name: str, types_module) -> bool:
 
 def _background_init():
     """
-    Moteur de validation de connectivité s'exécutant de manière asynchrone.
+    Sonde asynchrone du modèle actif (Gemini ou Claude). Une sonde rendue
+    obsolète par un changement de modèle ne publie aucun statut.
     """
-    _set_status(LLMStatus.INITIALIZING)
-    _set_progress("Chargement du package google-genai...")
+    with _state_lock:
+        generation = _state["init_generation"]
+        model_name = _state["active_model"] or GOOGLE_MODEL_PREFERRED
+        _state["active_model"] = model_name
 
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError:
-        _set_status(
-            LLMStatus.UNAVAILABLE,
-            error="Le package 'google-genai' est requis pour ce module."
-        )
-        return
-
-    if not GOOGLE_API_KEY:
-        _set_status(
-            LLMStatus.UNAVAILABLE,
-            error="La variable GOOGLE_API_KEY est manquante dans .env"
-        )
-        return
-
-    _set_progress("Instanciation de l'API...")
-
-    try:
-        client = genai.Client(api_key=GOOGLE_API_KEY)
-        _set_client(client)
-    except Exception as e:
-        _set_status(
-            LLMStatus.UNAVAILABLE,
-            error=f"Erreur d'initialisation du client : {e}"
-        )
-        return
-
-    candidates = [GOOGLE_MODEL_PREFERRED] + [
-        m for m in GOOGLE_MODEL_FALLBACKS if m != GOOGLE_MODEL_PREFERRED
-    ]
-
-    errors_collected = []
-
-    for i, model_name in enumerate(candidates, start=1):
-        display_name = model_name.replace("models/", "")
-        _set_progress(f"Vérification {i}/{len(candidates)} : {display_name}")
-
-        try:
-            probe_ok = False
-            for probe_attempt in range(PROBE_ATTEMPTS):
-                if _probe_single_model(client, model_name, types):
-                    probe_ok = True
-                    break
-                time.sleep(PROBE_RETRY_DELAY_SECONDS * (probe_attempt + 1))
-            if probe_ok:
-                with _state_lock:
-                    _state["last_successful_model"] = model_name
-                _set_status(LLMStatus.AVAILABLE, model=model_name)
-                _set_progress("")
+    def publish(status, error=""):
+        with _state_lock:
+            if _state["init_generation"] != generation:
                 return
-            else:
-                errors_collected.append(f"{display_name} : hors-ligne")
-        except Exception as e:
-            errors_collected.append(f"{display_name} : {type(e).__name__}")
+            _state["status"] = status
+            _state["error_message"] = error
+            if status == LLMStatus.AVAILABLE:
+                _state["last_successful_model"] = model_name
 
-    _set_status(
-        LLMStatus.UNAVAILABLE,
-        error="Tous les pings API ont échoué : " + "; ".join(errors_collected[:3])
-    )
+    publish(LLMStatus.INITIALIZING)
+    provider = get_model_provider(model_name)
+    display_name = model_name.replace("models/", "")
+    _set_progress(f"Connexion au fournisseur {provider}...")
+
+    client, error = _init_provider_client(provider)
+    if client is None:
+        publish(LLMStatus.UNAVAILABLE, error)
+        _set_progress("")
+        return
+
+    _set_progress(f"Vérification : {display_name}")
+    for probe_attempt in range(PROBE_ATTEMPTS):
+        if _probe_single_model(client, model_name, None, provider=provider):
+            publish(LLMStatus.AVAILABLE)
+            _set_progress("")
+            return
+        time.sleep(PROBE_RETRY_DELAY_SECONDS * (probe_attempt + 1))
+
+    publish(LLMStatus.UNAVAILABLE,
+            f"{display_name} : modele inaccessible (cle API, nom du modele ou reseau)")
     _set_progress("")
 
 
@@ -275,15 +386,20 @@ def get_llm_inference_params() -> dict:
     model = (get_last_responding_model()
              or _get_active_model_internal().replace("models/", "")
              or GOOGLE_MODEL_PREFERRED.replace("models/", ""))
+    provider = get_model_provider(_get_active_model_internal() or model)
+    # Messages API : temperature seule transmise (refus si top_p l'accompagne), aucun seed
+    is_anthropic = provider == "anthropic"
     return {
         "model": model,
-        "campaign_model": LLM_CAMPAIGN_MODEL.replace("models/", ""),
+        "provider": provider,
+        "campaign_model": (_get_active_model_internal()
+                           or LLM_CAMPAIGN_MODEL).replace("models/", ""),
         "fixed_model_for_campaign": LLM_CAMPAIGN_FIXED_MODEL,
         "temperature": LLM_TEMPERATURE,
-        "top_p": LLM_TOP_P,
-        "top_k": LLM_TOP_K,
+        "top_p": "N/A" if is_anthropic else LLM_TOP_P,
+        "top_k": "N/A" if is_anthropic else LLM_TOP_K,
         "max_output_tokens": LLM_MAX_OUTPUT_TOKENS,
-        "seed": LLM_SEED,
+        "seed": "N/A" if is_anthropic else LLM_SEED,
         "directive_version": ZERO_HALLUCINATION_DIRECTIVE_VERSION,
         "semantic_audit_version": SEMANTIC_AUDIT_VERSION,
     }
@@ -599,19 +715,29 @@ E) Formule des recommandations pour eviter les pieges des minima locaux (modific
 
 def _call_with_timeout(model_to_try: str, prompt: str,
                        max_tokens: int, timeout_seconds: float):
-    client = _get_client()
+    provider = get_model_provider(model_to_try)
+    client, init_error = _init_provider_client(provider)
     if client is None:
-        return None, "SDK_ERROR", "Client non initialise"
+        return None, "SDK_ERROR", init_error or "Client non initialise"
 
-    try:
-        from google.genai import types
-    except ImportError:
-        return None, "SDK_ERROR", "Module google-genai absent"
+    if provider == "google":
+        try:
+            from google.genai import types
+        except ImportError:
+            return None, "SDK_ERROR", "Module google-genai absent"
 
     result = {"response": None, "error": None, "done": False}
 
     def _worker():
         try:
+            if provider == "anthropic":
+                result["response"] = client.messages.create(
+                    model=model_to_try,
+                    max_tokens=max_tokens,
+                    temperature=LLM_TEMPERATURE,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return
             resp = client.models.generate_content(
                 model=model_to_try,
                 contents=prompt,
@@ -648,6 +774,12 @@ def _extract_text_from_response(response) -> str:
     if response is None:
         return ""
 
+    # Messages API : blocs typés, seuls les blocs texte forment le rapport
+    content = getattr(response, "content", None)
+    if isinstance(content, list):
+        return "".join(getattr(block, "text", "") for block in content
+                       if getattr(block, "type", "") == "text").strip()
+
     if hasattr(response, "candidates") and response.candidates:
         cand = response.candidates[0]
         if hasattr(cand, "content") and cand.content and hasattr(cand.content, "parts"):
@@ -674,6 +806,11 @@ def _classify_sdk_error(error_msg: str) -> str:
     upper = (error_msg or "").upper()
     if "PERDAY" in upper or "PER_DAY" in upper:
         return "QUOTA_DAILY"
+    # Anthropic : crédit prépayé épuisé (erreur 400 « credit balance is too low »)
+    if "CREDIT BALANCE" in upper or "BILLING" in upper:
+        return "CREDIT_EXHAUSTED"
+    if "529" in upper:
+        return "UNAVAILABLE"
     if "429" in upper or "RESOURCE_EXHAUSTED" in upper:
         return "RATE_LIMIT"
     if "503" in upper or "UNAVAILABLE" in upper or "OVERLOADED" in upper:
@@ -720,6 +857,9 @@ def format_duration(seconds) -> str:
 
 def _extract_finish_reason(response):
     """finish_reason du premier candidat (STOP, MAX_TOKENS, SAFETY...), ou None."""
+    stop_reason = getattr(response, "stop_reason", None)
+    if isinstance(stop_reason, str):
+        return _ANTHROPIC_STOP_REASONS.get(stop_reason, stop_reason.upper())
     try:
         reason = response.candidates[0].finish_reason
     except (AttributeError, IndexError, TypeError):
@@ -773,7 +913,7 @@ def ask_llm_detailed(prompt: str, timeout: int = 180, max_retries: int = 8,
         candidates = all_models
     if not allow_fallback:
         # Modèle unique imposé (campagne E10) : aucune substitution silencieuse
-        candidates = [LLM_CAMPAIGN_MODEL]
+        candidates = [_get_active_model_internal() or LLM_CAMPAIGN_MODEL]
 
     tried_models = set()
     last_code, last_error = "OTHER", None
@@ -801,6 +941,10 @@ def ask_llm_detailed(prompt: str, timeout: int = 180, max_retries: int = 8,
                     f"Quota journalier gratuit du modele {result['model']} epuise. "
                     f"Reinitialisation estimee dans {format_duration(reset_s)}.",
                     retry_after_s=retry_after, quota_reset_s=reset_s)
+            if last_code == "CREDIT_EXHAUSTED":
+                return _fail("CREDIT_EXHAUSTED",
+                             "Credit API Anthropic epuise. Recharger le compte sur "
+                             "console.anthropic.com puis relancer en reprise.")
             tried_models.add(model_to_try)
             if attempt < max_retries:
                 if last_code == "RATE_LIMIT" and retry_after:
@@ -818,7 +962,9 @@ def ask_llm_detailed(prompt: str, timeout: int = 180, max_retries: int = 8,
         extracted = _extract_text_from_response(response)
         if extracted:
             with _state_lock:
-                _state["last_successful_model"] = model_to_try
+                # Un appel lancé avant un changement de modèle ne doit pas figurer comme modèle répondant
+                if model_to_try == (_state["active_model"] or ""):
+                    _state["last_successful_model"] = model_to_try
             result["text"] = extracted
             return result
 

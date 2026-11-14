@@ -84,6 +84,51 @@ def _run_dashboard():
                 else:
                     st.error(msg)
 
+        # Sélecteur de modèle : Claude (Messages API) et Gemini (generateContent)
+        try:
+            from llm_assistant import (get_model_catalog, get_active_model,
+                                       set_active_model, is_model_locked)
+            catalog = get_model_catalog()
+            model_ids = [entry["id"] for entry in catalog]
+            model_labels = {entry["id"]: entry["label"] for entry in catalog}
+            current_model = get_active_model()
+            model_locked = is_model_locked()
+            def _on_model_change():
+                chosen = st.session_state["llm_model_selector"]
+                if not set_active_model(chosen):
+                    st.session_state["llm_model_selector"] = get_active_model()
+
+            # Le widget suit toujours le modèle réellement actif (rechargement, refus du verrou)
+            if st.session_state.get("llm_model_selector") != current_model:
+                st.session_state["llm_model_selector"] = current_model
+
+            st.markdown("### Modele LLM")
+            st.selectbox(
+                "Modele LLM",
+                options=model_ids,
+                format_func=lambda model_id: model_labels.get(model_id, model_id),
+                key="llm_model_selector",
+                label_visibility="collapsed",
+                disabled=model_locked,
+                on_change=_on_model_change,
+                help="Modele utilise par le rapport LLM et par la campagne E10.",
+            )
+            if model_locked:
+                st.caption(
+                    f"Modele gele jusqu'a la fin de la campagne : "
+                    f"{model_labels.get(current_model, current_model)}."
+                )
+
+                # Rétablit le menu dès la fin de la campagne, quel que soit l'onglet actif
+                @st.fragment(run_every=2.0)
+                def _watch_model_lock():
+                    if not is_model_locked():
+                        st.rerun()
+
+                _watch_model_lock()
+        except Exception as e:
+            st.caption(f"Selecteur de modele indisponible ({type(e).__name__}).")
+
         # Carte LLM et paramètres : sondage isolé dans un fragment, sans réexécution globale
         try:
             from llm_assistant import (

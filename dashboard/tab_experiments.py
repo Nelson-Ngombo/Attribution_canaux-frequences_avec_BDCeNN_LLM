@@ -157,7 +157,9 @@ def _render_launch_bar(campaign_running: bool):
     launch_cols = st.columns([1, 1, 3])
 
     with launch_cols[0]:
-        launch_disabled = campaign_running or len(selected) == 0
+        from llm_assistant import is_llm_available
+        e10_blocked = "E10" in selected and not is_llm_available()
+        launch_disabled = campaign_running or len(selected) == 0 or e10_blocked
         if st.button(
             "Lancer la campagne selectionnee",
             type="primary",
@@ -188,7 +190,11 @@ def _render_launch_bar(campaign_running: bool):
 
     with launch_cols[2]:
         if launch_disabled and not campaign_running:
-            st.caption("Selectionnez au moins une experience pour activer le bouton.")
+            if not selected:
+                st.caption("Selectionnez au moins une experience pour activer le bouton.")
+            else:
+                st.caption("E10 est selectionnee mais le modele LLM n'est pas disponible. "
+                           "Verifiez l'etat du modele et la cle API dans la barre laterale.")
 
 
 def _render_monitoring_panel():
@@ -210,7 +216,8 @@ def _render_monitoring_panel():
         st.metric("Duree ecoulee", _format_duration(snapshot["elapsed_seconds"]))
     with header_cols[2]:
         codes_str = ", ".join(snapshot["codes"])
-        st.caption(f"**Experiences** : {codes_str}")
+        model_note = f" | **Modele LLM** : {snapshot['llm_model']}" if snapshot.get("llm_model") else ""
+        st.caption(f"**Experiences** : {codes_str}{model_note}")
 
     # Summary if finished
     summary = snapshot.get("summary")
@@ -349,11 +356,22 @@ def render():
     campaign_running = campaign is not None and campaign.is_running()
 
     # Warning for E10 (needs LLM)
-    from llm_assistant import is_llm_available
+    from llm_assistant import (is_llm_available, get_active_model,
+                               get_model_catalog, get_model_provider)
+    active_model = get_active_model()
+    model_label = next((m["label"] for m in get_model_catalog()
+                        if m["id"] == active_model), active_model)
     if not is_llm_available():
+        key_name = ("ANTHROPIC_API_KEY" if get_model_provider(active_model) == "anthropic"
+                    else "GOOGLE_API_KEY")
         st.info(
-            "L'experience E10 (audit LLM) necessite une cle GOOGLE_API_KEY valide. "
-            "Les autres experiences (E1-E9) fonctionnent sans LLM."
+            f"L'experience E10 (audit LLM) utilisera le modele {model_label} et necessite "
+            f"une cle {key_name} valide. Les autres experiences (E1-E9) fonctionnent sans LLM."
+        )
+    else:
+        st.caption(
+            f"E10 utilisera uniquement le modele {model_label}. Il reste gele jusqu'a la "
+            "fin de la campagne ; pour en changer, attendez la fin ou choisissez-le avant le lancement."
         )
 
     # Section 1: Selection panel

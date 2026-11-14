@@ -12,6 +12,7 @@ from typing import Optional, List
 
 from dashboard.log_capture import ThreadSafeLogBuffer
 from dashboard.experiment_wrappers import run_multiple_experiments
+from llm_assistant import lock_campaign_model
 
 
 class Campaign:
@@ -32,6 +33,15 @@ class Campaign:
         self._summary: Optional[dict] = None
         self._current_experiment: Optional[str] = None
         self._error: Optional[str] = None
+        self.llm_model: Optional[str] = None
+        self._model_locked = False
+
+    def _release_model(self):
+        """Libère le verrou une seule fois, quelle que soit l'issue de la campagne."""
+        with self._lock:
+            held, self._model_locked = self._model_locked, False
+        if held:
+            lock_campaign_model(False)
 
     def start(self):
         """Starts the campaign in a background thread."""
@@ -45,8 +55,19 @@ class Campaign:
             self.stop_flag.clear()
             self.log_buffer.clear()
 
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        # Verrou posé avant le thread : aucun changement de modèle possible dès le lancement
+        if "E10" in self.codes:
+            self.llm_model = lock_campaign_model(True)
+            with self._lock:
+                self._model_locked = True
+            self.log_buffer.write(f"[E10] Modele LLM verrouille : {self.llm_model}\n")
+
+        try:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        except Exception:
+            self._release_model()
+            raise
 
     def _run(self):
         """Internal thread target."""
@@ -83,6 +104,8 @@ class Campaign:
                     "fatal_error": self._error,
                     "traceback": traceback.format_exc(),
                 }
+        finally:
+            self._release_model()
 
     def request_stop(self):
         """Requests cancellation. Current experiment finishes; subsequent ones abort."""
@@ -105,6 +128,7 @@ class Campaign:
                 "error": self._error,
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
+                "llm_model": self.llm_model,
             }
 
     def get_logs(self, tail: Optional[int] = None) -> List[str]:

@@ -167,8 +167,9 @@ EXPERIMENTS_METADATA = {
         "description": (
             "Applique le pipeline LLM sur 20 cas types (couvrant S1-S7, bruit, "
             "dynamique, minima). Genere des PDF individuels avec badge de "
-            "certification et un CSV recapitulatif. NECESSITE UNE CLE API "
-            "GOOGLE_API_KEY. Duree variable selon la latence LLM."
+            "certification et un CSV recapitulatif. Utilise uniquement le modele "
+            "choisi dans la barre laterale, gele jusqu'a la fin de la campagne, "
+            "et necessite la cle API de son fournisseur. Duree variable selon la latence LLM."
         ),
         "scenario": "20 cas mixtes",
         "seeds_used": "Varie selon le cas",
