@@ -163,7 +163,7 @@ SCENARIOS = build_scenarios()
 # ============================================================================
 # 10. TRAÇABILITÉ (recommandation C : métadonnées de reproductibilité)
 # ============================================================================
-CODE_VERSION = "1.1.0"
+CODE_VERSION = "1.2.0"
 SPEC_VERSION = "1.0"
 
 INTERFERENCE_MODE_LABELS = {

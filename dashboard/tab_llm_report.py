@@ -374,7 +374,7 @@ def render():
     )
 
     # Vérification d'initialisation du LLM
-    from llm_assistant import is_llm_available, get_initialization_error
+    from llm_assistant import is_llm_available, get_initialization_error, is_model_locked
     if not is_llm_available():
         info_banner(
             "Le LLM n'est pas initialise. "
