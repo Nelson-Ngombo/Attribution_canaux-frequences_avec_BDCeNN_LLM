@@ -246,6 +246,40 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     border-color: #4a9eff;
 }
 
+/* ============ Sidebar model selector (fond sombre, texte lisible) ============ */
+section[data-testid="stSidebar"] [data-baseweb="select"] > div {
+    background: #0f172a !important;
+    border: 1px solid #334155 !important;
+    border-radius: 8px !important;
+    min-height: 2.6rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+section[data-testid="stSidebar"] [data-baseweb="select"] > div:hover {
+    border-color: #4a9eff !important;
+}
+section[data-testid="stSidebar"] [data-baseweb="select"] > div:focus-within {
+    border-color: #4a9eff !important;
+    box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.25);
+}
+section[data-testid="stSidebar"] [data-baseweb="select"] div,
+section[data-testid="stSidebar"] [data-baseweb="select"] span,
+section[data-testid="stSidebar"] [data-baseweb="select"] input {
+    color: #f8fafc !important;
+    -webkit-text-fill-color: #f8fafc !important;
+    font-size: 0.92rem !important;
+    font-weight: 600;
+}
+section[data-testid="stSidebar"] [data-baseweb="select"] svg {
+    fill: #94a3b8 !important;
+    color: #94a3b8 !important;
+}
+/* Menu gelé pendant E10 : lisible mais visiblement inactif */
+section[data-testid="stSidebar"] [data-baseweb="select"][aria-disabled="true"] > div {
+    opacity: 0.75;
+    cursor: not-allowed;
+    border-style: dashed !important;
+}
+
 /* ============ Sidebar system status cards ============ */
 .sidebar-status-card {
     background: #334155;
@@ -809,9 +843,8 @@ def render_sidebar_llm_params(params: dict):
         for icon, label, value in tiles
     )
     campaign_note = (
-        f'<div class="llm-note">Modèle unique (dashboard et E10) : '
+        f'<div class="llm-note">Modèle de la campagne E10 : '
         f'{params.get("campaign_model", params["model"])}</div>'
-        if params.get("fixed_model_for_campaign") else ""
     )
     # HTML sans indentation : quatre espaces en tête de ligne produisent un bloc de code Markdown
     html = (
