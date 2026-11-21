@@ -109,6 +109,32 @@ def perturbation_seed(topology_seed: int, level: float) -> int:
 RESTART_EXPERIMENT_VALUES = [1, 5, 10, 20]
 
 # ============================================================================
+# 7 bis. CAS DE L'EXPÉRIENCE E10 (audit LLM), sélectionnables dans le dashboard
+# ============================================================================
+E10_CASES = (
+    {"case_id": "#1",  "scenario": "S1", "N": 8,   "K": 3, "seed": 1, "context": "Visual verification simple layout"},
+    {"case_id": "#2",  "scenario": "S1", "N": 8,   "K": 3, "seed": 2, "context": "Secondary baseline layout"},
+    {"case_id": "#3",  "scenario": "S2", "N": 30,  "K": 4, "seed": 1, "context": "Nominal standard load"},
+    {"case_id": "#4",  "scenario": "S2", "N": 30,  "K": 4, "seed": 2, "context": "Medium network load profile"},
+    {"case_id": "#5",  "scenario": "S2", "N": 30,  "K": 6, "seed": 1, "context": "Abundant spectral channels"},
+    {"case_id": "#6",  "scenario": "S3", "N": 50,  "K": 6, "seed": 1, "context": "Highly congested cell environment"},
+    {"case_id": "#7",  "scenario": "S3", "N": 50,  "K": 6, "seed": 2, "context": "Secondary dense topology layout"},
+    {"case_id": "#8",  "scenario": "S3", "N": 50,  "K": 6, "seed": 3, "context": "Dense congested topology variant"},
+    {"case_id": "#9",  "scenario": "S4", "N": 50,  "K": 2, "seed": 1, "context": "Severe spectral bottleneck"},
+    {"case_id": "#10", "scenario": "S4", "N": 50,  "K": 2, "seed": 2, "context": "Secondary severe bottleneck"},
+    {"case_id": "#11", "scenario": "S4", "N": 50,  "K": 3, "seed": 1, "context": "Moderate constraint layout"},
+    {"case_id": "#12", "scenario": "S5", "N": 100, "K": 8, "seed": 1, "context": "Large standard cell layout"},
+    {"case_id": "#13", "scenario": "S5", "N": 200, "K": 8, "seed": 1, "context": "Extreme scale validation"},
+    {"case_id": "#14", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Measurement noise variance level 5%"},
+    {"case_id": "#15", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Measurement noise variance level 10%"},
+    {"case_id": "#16", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Extreme measurement variance 20%"},
+    {"case_id": "#17", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Low dynamic perturbation warm run"},
+    {"case_id": "#18", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Moderate dynamic perturbation run"},
+    {"case_id": "#19", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "High dynamic perturbation run"},
+    {"case_id": "#20", "scenario": "S4", "N": 50,  "K": 2, "seed": 1, "context": "Stagnant local minimum (no restarts)"},
+)
+
+# ============================================================================
 # 8. CRÉATION DES DOSSIERS
 # ============================================================================
 def ensure_dirs():

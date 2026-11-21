@@ -2414,6 +2414,8 @@ def run_experiment_E9(verbose=False):
 # ============================================================================
 # Statuts d'un cas E10 ; seuls les cas OK sont réutilisés lors d'une reprise
 E10_STATUSES = ("OK", "TRONQUE", "LLM_FAILED", "NOT_RUN")
+# Cas hors sélection du dashboard : statuts conservés tels quels dans les CSV
+E10_CARRIED_STATUSES = ("OK", "TRONQUE", "LLM_FAILED")
 # Résidus d'une campagne LLM dans raw_responses/<régime> et reports_pdf/<régime>
 E10_ARTIFACT_PATTERNS = ("*_prompt.txt", "*_raw_response.txt", "*_corrected_v*.txt",
                          "*_error.txt", f"*{AUDIT_RECORD_SUFFIX}", "*.pdf")
@@ -2434,11 +2436,12 @@ def _archive_e10_artifacts(model_label):
     return moved
 
 
-def _load_reusable_e10_records(model_csv_dir, model_label):
+def _load_reusable_e10_records(model_csv_dir, model_label, statuses=("OK",)):
     """
-    resume=True : cas déjà audités avec Status OK, même directive et même
-    version du code, dont le JSON d'audit et la ligne solveur sont archivés.
-    La ligne solveur est reprise pour que les temps restent ceux cités par le rapport.
+    resume=True : cas déjà audités avec un statut de `statuses` (OK par défaut),
+    même modèle, même directive et même version du code, dont le JSON d'audit
+    est archivé. La ligne solveur est reprise pour que les temps restent ceux
+    cités par le rapport ; elle est exigée pour un cas OK.
     """
     eval_path = model_csv_dir / "llm_fidelity_evaluation.csv"
     solver_path = model_csv_dir / "solver_metrics_e10.csv"
@@ -2454,18 +2457,19 @@ def _load_reusable_e10_records(model_csv_dir, model_label):
     reusable = {}
     for _, row in df_prev.iterrows():
         # Un rapport n'est réutilisable que pour le même modèle, la même directive et le même code
-        if (row["Status"] != "OK" or row["Directive Version"] != directive
+        if (row["Status"] not in statuses or row["Directive Version"] != directive
                 or row["Code Version"] != str(config.CODE_VERSION)
                 or row.get("LLM Model") != current_model):
             continue
         record_path = raw_dir / f"{row['Case']}{AUDIT_RECORD_SUFFIX}"
         solver_rows = df_solver_prev[df_solver_prev["case_id"].astype(str) == row["Case"]]
-        if not record_path.exists() or solver_rows.empty:
+        if not record_path.exists() or (solver_rows.empty and row["Status"] == "OK"):
             continue
         with open(record_path, encoding="utf-8") as f:
             record = json.load(f)
-        if record.get("status") == "OK":
-            reusable[row["Case"]] = (record, solver_rows.iloc[0].to_dict())
+        if record.get("status") == row["Status"]:
+            reusable[row["Case"]] = (record, None if solver_rows.empty
+                                     else solver_rows.iloc[0].to_dict())
     return reusable
 
 
@@ -2478,6 +2482,16 @@ def _e10_not_run_record(case, model_label, quota_state):
         case_info, "NOT_RUN", error_code=stop_code,
         error_message=(f"Non tente : arret de campagne ({stop_code}) au cas "
                        f"{quota_state['case_id']} ({quota_state['regime']})"),
+        code_version=config.CODE_VERSION)
+
+
+def _e10_not_selected_record(case, model_label):
+    """Cas hors sélection sans résultat antérieur compatible : aucun appel API."""
+    case_info = dict(case, model_label=model_label,
+                     context=case["context"] + f" [{model_label}]")
+    return make_audit_record(
+        case_info, "NOT_RUN", error_code="NOT_SELECTED",
+        error_message="Non tente : cas hors selection de la campagne",
         code_version=config.CODE_VERSION)
 
 
@@ -2578,7 +2592,7 @@ def _e10_fidelity_row(record):
 
 
 def _write_e10_campaign_summary(model_csv_dir, model_label, records, quota_state,
-                                n_reused, campaign_date):
+                                n_reused, campaign_date, selected_cases=None):
     """Bilan e10_campaign_summary.json du régime : comptes par statut et cas à relancer."""
     counts = {status: 0 for status in E10_STATUSES}
     for rec in records:
@@ -2595,6 +2609,9 @@ def _write_e10_campaign_summary(model_csv_dir, model_label, records, quota_state
         "n_cases": len(records),
         "counts": counts,
         "n_reused_without_api_call": n_reused,
+        # Sélection du dashboard : cas retenus pour cette campagne
+        "selected_cases": selected_cases or "ALL",
+        "n_not_selected": sum(rec.get("error_code") == "NOT_SELECTED" for rec in records),
         "cases_to_rerun": [rec["case_id"] for rec in records if rec["status"] != "OK"],
         "quota_exhausted": quota_state["exhausted"],
         "stop_error_code": quota_state.get("error_code"),
@@ -2607,42 +2624,32 @@ def _write_e10_campaign_summary(model_csv_dir, model_label, records, quota_state
           + ", ".join(f"{k} = {v}" for k, v in counts.items()))
 
 
-def run_experiment_E10(verbose=False, resume=True):
+def run_experiment_E10(verbose=False, resume=True, case_ids=None):
     # Modèle gelé pendant toute la campagne : le sélecteur du dashboard est désactivé
     lock_campaign_model(True)
     try:
-        return _run_experiment_E10_locked(verbose=verbose, resume=resume)
+        return _run_experiment_E10_locked(verbose=verbose, resume=resume, case_ids=case_ids)
     finally:
         lock_campaign_model(False)
 
 
-def _run_experiment_E10_locked(verbose=False, resume=True):
+def _run_experiment_E10_locked(verbose=False, resume=True, case_ids=None):
     e10_csv_dir = config.CSV_DIR / "E10"
     os.makedirs(e10_csv_dir, exist_ok=True)
     _warmup_solvers()
 
-    cases_def = [
-        {"case_id": "#1",  "scenario": "S1", "N": 8,   "K": 3, "seed": 1, "context": "Visual verification simple layout"},
-        {"case_id": "#2",  "scenario": "S1", "N": 8,   "K": 3, "seed": 2, "context": "Secondary baseline layout"},
-        {"case_id": "#3",  "scenario": "S2", "N": 30,  "K": 4, "seed": 1, "context": "Nominal standard load"},
-        {"case_id": "#4",  "scenario": "S2", "N": 30,  "K": 4, "seed": 2, "context": "Medium network load profile"},
-        {"case_id": "#5",  "scenario": "S2", "N": 30,  "K": 6, "seed": 1, "context": "Abundant spectral channels"},
-        {"case_id": "#6",  "scenario": "S3", "N": 50,  "K": 6, "seed": 1, "context": "Highly congested cell environment"},
-        {"case_id": "#7",  "scenario": "S3", "N": 50,  "K": 6, "seed": 2, "context": "Secondary dense topology layout"},
-        {"case_id": "#8",  "scenario": "S3", "N": 50,  "K": 6, "seed": 3, "context": "Dense congested topology variant"},
-        {"case_id": "#9",  "scenario": "S4", "N": 50,  "K": 2, "seed": 1, "context": "Severe spectral bottleneck"},
-        {"case_id": "#10", "scenario": "S4", "N": 50,  "K": 2, "seed": 2, "context": "Secondary severe bottleneck"},
-        {"case_id": "#11", "scenario": "S4", "N": 50,  "K": 3, "seed": 1, "context": "Moderate constraint layout"},
-        {"case_id": "#12", "scenario": "S5", "N": 100, "K": 8, "seed": 1, "context": "Large standard cell layout"},
-        {"case_id": "#13", "scenario": "S5", "N": 200, "K": 8, "seed": 1, "context": "Extreme scale validation"},
-        {"case_id": "#14", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Measurement noise variance level 5%"},
-        {"case_id": "#15", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Measurement noise variance level 10%"},
-        {"case_id": "#16", "scenario": "S6", "N": 50,  "K": 4, "seed": 1, "context": "Extreme measurement variance 20%"},
-        {"case_id": "#17", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Low dynamic perturbation warm run"},
-        {"case_id": "#18", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "Moderate dynamic perturbation run"},
-        {"case_id": "#19", "scenario": "S7", "N": 45,  "K": 5, "seed": 1, "context": "High dynamic perturbation run"},
-        {"case_id": "#20", "scenario": "S4", "N": 50,  "K": 2, "seed": 1, "context": "Stagnant local minimum (no restarts)"},
-    ]
+    # Vingt cas définis dans config.E10_CASES, partagés avec le menu du dashboard
+    cases_def = [dict(case) for case in config.E10_CASES]
+    # case_ids : sous-ensemble choisi dans le dashboard ; None pour les vingt cas
+    selected_ids = None
+    if case_ids is not None:
+        known_ids = [case["case_id"] for case in cases_def]
+        unknown = sorted(set(case_ids) - set(known_ids))
+        if unknown or not case_ids:
+            raise ValueError(f"Selection E10 invalide : {', '.join(unknown) or 'aucun cas'}")
+        selected_ids = set(case_ids)
+        print(f"[E10] Cas selectionnes ({len(selected_ids)}/{len(known_ids)}) : "
+              + ", ".join(cid for cid in known_ids if cid in selected_ids))
 
     models = [
         {"name": "cochannel", "M": None, "folder": "cochannel"},
@@ -2688,12 +2695,29 @@ def _run_experiment_E10_locked(verbose=False, resume=True):
             n_moved = _archive_e10_artifacts(model_label)
             print(f"[ARCHIVE] E10/{folder} : {n_moved} fichier(s) de la campagne precedente archive(s).")
         audit_records = []
+        n_reused = 0
+        # Cas hors sélection : dernier résultat du même modèle repris sans appel API
+        carried = (_load_reusable_e10_records(model_csv_dir, model_label,
+                                              statuses=E10_CARRIED_STATUSES)
+                   if selected_ids is not None and resume else {})
 
         for case in cases_def:
+            if selected_ids is not None and case["case_id"] not in selected_ids:
+                # Hors sélection : aucun appel API, dernier résultat compatible ou NOT_RUN
+                if case["case_id"] in carried:
+                    record, solver_row = carried[case["case_id"]]
+                    audit_records.append(record)
+                    if solver_row is not None:
+                        solver_metrics_rows.append(solver_row)
+                    n_reused += 1
+                else:
+                    audit_records.append(_e10_not_selected_record(case, model_label))
+                continue
             if case["case_id"] in reusable:
                 record, solver_row = reusable[case["case_id"]]
                 audit_records.append(record)
                 solver_metrics_rows.append(solver_row)
+                n_reused += 1
                 print(f"[RESUME] Case {case['case_id']} ({model_name}) : rapport du "
                       f"{record['run_date']} reutilise.")
                 continue
@@ -3011,7 +3035,10 @@ def _run_experiment_E10_locked(verbose=False, resume=True):
                        float_format="%.2f")
         print(f"[SUCCESS] CSV E10/{folder}/llm_fidelity_evaluation.csv saved.")
         _write_e10_campaign_summary(model_csv_dir, model_label, audit_records, quota_state,
-                                    len(reusable), campaign_date)
+                                    n_reused, campaign_date,
+                                    selected_cases=(None if selected_ids is None else
+                                                    [c["case_id"] for c in cases_def
+                                                     if c["case_id"] in selected_ids]))
 
     _validate_if_available("E10")
     print("\n" + "=" * 80)

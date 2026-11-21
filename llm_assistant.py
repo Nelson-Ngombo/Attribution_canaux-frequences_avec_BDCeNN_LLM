@@ -387,7 +387,7 @@ def get_llm_inference_params() -> dict:
              or _get_active_model_internal().replace("models/", "")
              or GOOGLE_MODEL_PREFERRED.replace("models/", ""))
     provider = get_model_provider(_get_active_model_internal() or model)
-    # Messages API : temperature seule transmise (refus si top_p l'accompagne), aucun seed
+    # Messages API (Claude 5.5) : aucun paramètre d'échantillonnage transmis, aucun seed
     is_anthropic = provider == "anthropic"
     return {
         "model": model,
@@ -395,7 +395,7 @@ def get_llm_inference_params() -> dict:
         "campaign_model": (_get_active_model_internal()
                            or LLM_CAMPAIGN_MODEL).replace("models/", ""),
         "fixed_model_for_campaign": LLM_CAMPAIGN_FIXED_MODEL,
-        "temperature": LLM_TEMPERATURE,
+        "temperature": "N/A" if is_anthropic else LLM_TEMPERATURE,
         "top_p": "N/A" if is_anthropic else LLM_TOP_P,
         "top_k": "N/A" if is_anthropic else LLM_TOP_K,
         "max_output_tokens": LLM_MAX_OUTPUT_TOKENS,
@@ -731,10 +731,11 @@ def _call_with_timeout(model_to_try: str, prompt: str,
     def _worker():
         try:
             if provider == "anthropic":
+                # Claude 5.5 : temperature, top_p et top_k sont refusés (erreur 400),
+                # l'échantillonnage reste celui fixé par l'API
                 result["response"] = client.messages.create(
                     model=model_to_try,
                     max_tokens=max_tokens,
-                    temperature=LLM_TEMPERATURE,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 return

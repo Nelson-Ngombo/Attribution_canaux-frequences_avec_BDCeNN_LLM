@@ -24,6 +24,7 @@ from dashboard import toast
 from dashboard.experiment_wrappers import (
     list_experiments,
     get_experiment_metadata,
+    list_e10_cases,
 )
 from dashboard import campaign_manager as cm
 
@@ -66,6 +67,65 @@ def _get_selected_codes() -> list:
         code for code in list_experiments()
         if st.session_state.get(f"exp_selected_{code}", False)
     ]
+
+
+# Clés de session du menu des cas E10
+_E10_SCOPE_KEY = "e10_case_scope"
+_E10_CASES_KEY = "e10_case_ids"
+
+
+def _get_e10_case_ids():
+    """None : tous les cas E10 ; sinon les cas choisis (liste éventuellement vide), triés."""
+    if st.session_state.get(_E10_SCOPE_KEY, "all") == "all":
+        return None
+    chosen = st.session_state.get(_E10_CASES_KEY) or []
+    return sorted(chosen, key=lambda case_id: int(case_id.lstrip("#")))
+
+
+def _render_e10_case_selector(disabled: bool):
+    """Menu affiché sous la carte E10 : les vingt cas, ou une sélection."""
+    try:
+        cases = list_e10_cases()
+    except Exception as e:
+        st.caption(f"Liste des cas E10 indisponible ({type(e).__name__}).")
+        return
+    labels = {case["case_id"]: (f"{case['case_id']} | {case['scenario']} "
+                                f"(N={case['N']}, K={case['K']}, seed={case['seed']}) | "
+                                f"{case['context']}")
+              for case in cases}
+    # Valeurs initiales posées une seule fois : widgets créés sans value ni index
+    if _E10_SCOPE_KEY not in st.session_state:
+        st.session_state[_E10_SCOPE_KEY] = "all"
+    if _E10_CASES_KEY not in st.session_state:
+        st.session_state[_E10_CASES_KEY] = []
+
+    with st.container(border=True):
+        st.markdown("**Cas E10 a auditer**")
+        st.radio(
+            "Portee de l'audit E10",
+            options=["all", "subset"],
+            format_func=lambda scope: (f"Tous les cas ({len(cases)})" if scope == "all"
+                                       else "Choisir des cas"),
+            key=_E10_SCOPE_KEY,
+            horizontal=True,
+            disabled=disabled,
+            label_visibility="collapsed",
+        )
+        if st.session_state[_E10_SCOPE_KEY] == "subset":
+            st.multiselect(
+                "Cas a auditer",
+                options=list(labels),
+                format_func=lambda case_id: labels.get(case_id, case_id),
+                key=_E10_CASES_KEY,
+                disabled=disabled,
+                placeholder="Choisir un ou plusieurs cas",
+            )
+            st.caption(
+                f"{len(st.session_state[_E10_CASES_KEY])} cas selectionne(s), chacun audite "
+                "sous les deux regimes. Un cas deja OK avec le meme modele est repris sans "
+                "appel API ; les cas non selectionnes gardent leur dernier resultat du meme "
+                "modele dans les CSV (sinon NOT_RUN)."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +219,11 @@ def _render_launch_bar(campaign_running: bool):
     with launch_cols[0]:
         from llm_assistant import is_llm_available
         e10_blocked = "E10" in selected and not is_llm_available()
-        launch_disabled = campaign_running or len(selected) == 0 or e10_blocked
+        # None : les vingt cas E10 ; liste vide : sélection incomplète, lancement bloqué
+        e10_case_ids = _get_e10_case_ids() if "E10" in selected else None
+        e10_empty = e10_case_ids is not None and not e10_case_ids
+        launch_disabled = (campaign_running or len(selected) == 0
+                           or e10_blocked or e10_empty)
         if st.button(
             "Lancer la campagne selectionnee",
             type="primary",
@@ -167,8 +231,10 @@ def _render_launch_bar(campaign_running: bool):
             disabled=launch_disabled,
         ):
             try:
-                cm.start_new_campaign(selected)
-                toast.success(f"Campagne lancee : {', '.join(selected)}")
+                options = {"E10": {"case_ids": e10_case_ids}} if e10_case_ids else None
+                cm.start_new_campaign(selected, options_by_code=options)
+                cases_note = f" (E10 : {', '.join(e10_case_ids)})" if e10_case_ids else ""
+                toast.success(f"Campagne lancee : {', '.join(selected)}{cases_note}")
                 time.sleep(0.5)
                 st.rerun()
             except RuntimeError as e:
@@ -192,6 +258,8 @@ def _render_launch_bar(campaign_running: bool):
         if launch_disabled and not campaign_running:
             if not selected:
                 st.caption("Selectionnez au moins une experience pour activer le bouton.")
+            elif e10_empty:
+                st.caption("Choisissez au moins un cas E10, ou revenez a Tous les cas.")
             else:
                 st.caption("E10 est selectionnee mais le modele LLM n'est pas disponible. "
                            "Verifiez l'etat du modele et la cle API dans la barre laterale.")
@@ -217,7 +285,9 @@ def _render_monitoring_panel():
     with header_cols[2]:
         codes_str = ", ".join(snapshot["codes"])
         model_note = f" | **Modele LLM** : {snapshot['llm_model']}" if snapshot.get("llm_model") else ""
-        st.caption(f"**Experiences** : {codes_str}{model_note}")
+        e10_ids = (snapshot.get("options_by_code") or {}).get("E10", {}).get("case_ids")
+        cases_note = f" | **Cas E10** : {', '.join(e10_ids)}" if e10_ids else ""
+        st.caption(f"**Experiences** : {codes_str}{model_note}{cases_note}")
 
     # Summary if finished
     summary = snapshot.get("summary")
@@ -382,6 +452,9 @@ def render():
     for code in list_experiments():
         meta = get_experiment_metadata(code)
         _render_experiment_card(code, meta, disabled=campaign_running)
+        # Menu des cas, visible uniquement lorsque E10 est cochée
+        if code == "E10" and st.session_state.get("exp_selected_E10", False):
+            _render_e10_case_selector(disabled=campaign_running)
 
     # Section 3: Launch bar
     _render_launch_bar(campaign_running)

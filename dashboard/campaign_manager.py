@@ -20,8 +20,10 @@ class Campaign:
     Represents a single campaign (one or more experiments run serially).
     """
 
-    def __init__(self, codes: List[str]):
+    def __init__(self, codes: List[str], options_by_code: Optional[dict] = None):
         self.codes = list(codes)
+        # Paramètres propres à une expérience, par exemple {"E10": {"case_ids": [...]}}
+        self.options_by_code = {code: dict(opts) for code, opts in (options_by_code or {}).items()}
         self.log_buffer = ThreadSafeLogBuffer(max_lines=5000)
         self.stop_flag = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -77,6 +79,7 @@ class Campaign:
                 self.log_buffer,
                 stop_flag=self.stop_flag,
                 also_print=False,
+                options_by_code=self.options_by_code,
             )
             with self._lock:
                 self._summary = summary
@@ -129,6 +132,8 @@ class Campaign:
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
                 "llm_model": self.llm_model,
+                "options_by_code": {code: dict(opts)
+                                    for code, opts in self.options_by_code.items()},
             }
 
     def get_logs(self, tail: Optional[int] = None) -> List[str]:
@@ -156,7 +161,7 @@ def get_current_campaign() -> Optional[Campaign]:
         return _current_campaign
 
 
-def start_new_campaign(codes: List[str]) -> Campaign:
+def start_new_campaign(codes: List[str], options_by_code: Optional[dict] = None) -> Campaign:
     """
     Starts a new campaign. If one is already running, raises RuntimeError.
     """
@@ -167,7 +172,7 @@ def start_new_campaign(codes: List[str]) -> Campaign:
                 "Une campagne est deja en cours d'execution. "
                 "Attendez qu'elle se termine ou annulez-la."
             )
-        _current_campaign = Campaign(codes)
+        _current_campaign = Campaign(codes, options_by_code)
     _current_campaign.start()
     return _current_campaign
 

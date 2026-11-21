@@ -191,6 +191,12 @@ def list_experiments() -> list:
     return list(EXPERIMENTS_METADATA.keys())
 
 
+def list_e10_cases() -> list:
+    """Cas de l'expérience E10 (identifiant, scénario, N, K, seed, contexte)."""
+    import config
+    return [dict(case) for case in config.E10_CASES]
+
+
 # ---------------------------------------------------------------------------
 # Lazy import of experiments module
 # ---------------------------------------------------------------------------
@@ -230,7 +236,7 @@ def _load_experiments_module():
 # ---------------------------------------------------------------------------
 
 def run_experiment(code: str, log_buffer: ThreadSafeLogBuffer,
-                    also_print: bool = True) -> dict:
+                    also_print: bool = True, options: Optional[dict] = None) -> dict:
     """
     Runs a single experiment by code (E1..E10) with stdout capture.
 
@@ -238,6 +244,7 @@ def run_experiment(code: str, log_buffer: ThreadSafeLogBuffer,
         code: Experiment identifier (e.g., "E3")
         log_buffer: Buffer to capture stdout into
         also_print: If True, also prints to real stdout for debugging
+        options: Keyword arguments forwarded to run_experiment_<code> (case_ids for E10)
 
     Returns:
         Result dict with keys: code, success, error, duration_seconds
@@ -262,7 +269,7 @@ def run_experiment(code: str, log_buffer: ThreadSafeLogBuffer,
 
         with capture_stdout(log_buffer, also_print=also_print):
             print(f"===== Debut {code} =====")
-            func(verbose=False)
+            func(verbose=False, **(options or {}))
             print(f"===== Fin {code} =====")
 
         result["success"] = True
@@ -278,7 +285,8 @@ def run_experiment(code: str, log_buffer: ThreadSafeLogBuffer,
 
 
 def run_multiple_experiments(codes: list, log_buffer: ThreadSafeLogBuffer,
-                              stop_flag=None, also_print: bool = True) -> dict:
+                              stop_flag=None, also_print: bool = True,
+                              options_by_code: Optional[dict] = None) -> dict:
     """
     Runs a sequence of experiments serially (never in parallel to preserve
     reproducibility of np.random.seed calls).
@@ -315,7 +323,8 @@ def run_multiple_experiments(codes: list, log_buffer: ThreadSafeLogBuffer,
         log_buffer.write(f"EXPERIENCE {i+1}/{len(codes)} : {code}\n")
         log_buffer.write(f"{'='*70}\n")
 
-        res = run_experiment(code, log_buffer, also_print=also_print)
+        res = run_experiment(code, log_buffer, also_print=also_print,
+                             options=(options_by_code or {}).get(code))
         summary["per_experiment"].append(res)
         summary["completed"] += 1
         if res["success"]:
